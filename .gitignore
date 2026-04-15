@@ -1,0 +1,36 @@
+# Environment & secrets
+.env
+*.env
+.env.*
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+backend/venv/
+backend/.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+backend/lint_cache.json
+hitl_queue.json
+
+# Node
+node_modules/
+frontend/node_modules/
+
+# Build output
+frontend/dist/
+
+# macOS
+.DS_Store
+**/.DS_Store
+
+# Logs
+*.log
+nohup.out
+
+# IDE
+.vscode/
+.idea/
