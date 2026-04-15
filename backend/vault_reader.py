@@ -74,6 +74,104 @@ def list_concept_pages() -> list[dict]:
     return list_pages_in_folder("concepts")
 
 
+def build_backlinks_index() -> dict[str, list[str]]:
+    """
+    Scan all concept pages for [[wikilinks]] and build a reverse index.
+    Returns {page_name: [list of page_names that link TO it]}.
+    """
+    concepts_dir = _vault() / "_wiki" / "concepts"
+    if not concepts_dir.exists():
+        return {}
+
+    # First pass: collect all outbound links per page
+    outbound: dict[str, list[str]] = {}
+    for md_file in concepts_dir.glob("*.md"):
+        try:
+            content = md_file.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        links = re.findall(r"\[\[([^\]]+)\]\]", content)
+        # Normalise: lowercase, spaces→hyphens
+        outbound[md_file.stem] = [l.lower().replace(" ", "-") for l in links]
+
+    # Second pass: invert to backlinks
+    backlinks: dict[str, list[str]] = {}
+    for source, targets in outbound.items():
+        for target in targets:
+            backlinks.setdefault(target, [])
+            if source not in backlinks[target]:
+                backlinks[target].append(source)
+
+    return backlinks
+
+
+def get_review_queue(days: int = 30) -> list[dict]:
+    """
+    Return concept pages not updated in more than `days` days,
+    sorted by most stale first. Zero LLM — pure date math.
+    """
+    from datetime import date, timedelta
+    cutoff = date.today() - timedelta(days=days)
+    pages = list_concept_pages()
+    stale = []
+    for p in pages:
+        last = p.get("last_updated", "")
+        if not last:
+            stale.append({**p, "days_since_update": 9999})
+            continue
+        try:
+            last_date = date.fromisoformat(last)
+            delta = (date.today() - last_date).days
+            if delta >= days:
+                stale.append({**p, "days_since_update": delta})
+        except ValueError:
+            stale.append({**p, "days_since_update": 9999})
+    stale.sort(key=lambda x: x["days_since_update"], reverse=True)
+    return stale
+
+
+def build_graph() -> dict:
+    """
+    Build a knowledge graph: nodes are concept pages, edges are wikilinks.
+    Returns {nodes: [{id, title, tags, entry_count}], edges: [{source, target}]}.
+    Edges are deduplicated and bidirectional (A→B and B→A both appear if both link).
+    """
+    concepts_dir = _vault() / "_wiki" / "concepts"
+    if not concepts_dir.exists():
+        return {"nodes": [], "edges": []}
+
+    pages = list_concept_pages()
+    page_set = {p["name"] for p in pages}
+
+    nodes = []
+    for p in pages:
+        nodes.append({
+            "id": p["name"],
+            "title": p["title"],
+            "tags": p["tags"],
+            "entry_count": p["entry_count"],
+            "last_updated": p["last_updated"],
+        })
+
+    # Collect edges from wikilinks — only between known pages
+    edge_set: set[tuple] = set()
+    for md_file in concepts_dir.glob("*.md"):
+        try:
+            content = md_file.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        source = md_file.stem
+        links = re.findall(r"\[\[([^\]]+)\]\]", content)
+        for link in links:
+            target = link.lower().replace(" ", "-")
+            if target in page_set and target != source:
+                # Store as sorted tuple to deduplicate A↔B
+                edge_set.add(tuple(sorted([source, target])))
+
+    edges = [{"source": s, "target": t} for s, t in edge_set]
+    return {"nodes": nodes, "edges": edges}
+
+
 def read_page(page_name: str) -> Optional[str]:
     """Return full content of a page, searching all vault folders."""
     for folder_dir in _dirs().values():

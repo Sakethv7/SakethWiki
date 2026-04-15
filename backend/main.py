@@ -1021,7 +1021,9 @@ async def get_page(page_name: str):
     if content is None:
         raise HTTPException(404, f"Page '{page_name}' not found")
     parsed = vault_reader.parse_concept_page(page_name)
-    return {"name": page_name, "content": content, "parsed": parsed}
+    backlinks_index = vault_reader.build_backlinks_index()
+    backlinks = backlinks_index.get(page_name, [])
+    return {"name": page_name, "content": content, "parsed": parsed, "backlinks": backlinks}
 
 
 # ── /analyze-traces ──────────────────────────────────────────────────────────
@@ -1212,6 +1214,125 @@ async def get_system_insights():
         "sections": sections,
         "content": content,
     }
+
+
+# ── /graph ───────────────────────────────────────────────────────────────────
+
+@app.get("/graph")
+async def get_graph():
+    """Return knowledge graph nodes + edges for visualization."""
+    return vault_reader.build_graph()
+
+
+# ── /backlinks/{page_name} ────────────────────────────────────────────────────
+
+@app.get("/backlinks/{page_name}")
+async def get_backlinks(page_name: str):
+    """Return all pages that link to the given page."""
+    index = vault_reader.build_backlinks_index()
+    return {"page": page_name, "backlinks": index.get(page_name, [])}
+
+
+# ── /review-queue ─────────────────────────────────────────────────────────────
+
+@app.get("/review-queue")
+async def review_queue(days: int = 30):
+    """Return concept pages not updated in more than `days` days."""
+    return {"pages": vault_reader.get_review_queue(days)}
+
+
+# ── /quick-note ───────────────────────────────────────────────────────────────
+
+class QuickNoteRequest(BaseModel):
+    page: str          # concept page slug to append to
+    note: str          # the thought/note text
+    create_if_missing: bool = False
+
+
+@app.post("/quick-note")
+async def quick_note(req: QuickNoteRequest):
+    """
+    Append a quick thought to an existing concept page, skipping the
+    full ingest pipeline. No LLM — pure file append.
+    """
+    if not req.note.strip():
+        raise HTTPException(400, "note cannot be empty")
+
+    vault_path = Path(os.environ.get("VAULT_PATH", "/Users/sakethv7/SakethVault"))
+    concepts_dir = vault_path / "_wiki" / "concepts"
+
+    # Find page (case-insensitive)
+    page_path = None
+    for f in concepts_dir.glob("*.md"):
+        if f.stem.lower() == req.page.lower():
+            page_path = f
+            break
+
+    if page_path is None:
+        if not req.create_if_missing:
+            raise HTTPException(404, f"Page '{req.page}' not found")
+        # Create minimal stub
+        page_path = concepts_dir / f"{req.page}.md"
+        today = datetime.now().strftime("%Y-%m-%d")
+        stub = f"""---
+title: "{req.page.replace('-', ' ').title()}"
+tags: []
+entry_count: 0
+last_updated: {today}
+understanding_version: 1
+---
+
+> **Current understanding** 🔵
+> (No entries yet — built from quick notes)
+"""
+        page_path.parent.mkdir(parents=True, exist_ok=True)
+        page_path.write_text(stub, encoding="utf-8")
+
+    today = datetime.now().strftime("%Y-%m-%d")
+    now = datetime.now().strftime("%Y-%m-%d %H:%M")
+
+    # Append a note section
+    note_section = f"""
+## 💭 Quick note · {now}
+{req.note.strip()}
+"""
+
+    content = page_path.read_text(encoding="utf-8")
+    content = content.rstrip() + "\n" + note_section
+
+    # Update last_updated in frontmatter
+    content = re.sub(r"(last_updated:\s*)[\d-]+", f"\\g<1>{today}", content)
+
+    # Bump entry_count
+    def bump(m):
+        return m.group(1) + str(int(m.group(2)) + 1)
+    content = re.sub(r"(entry_count:\s*)(\d+)", bump, content)
+
+    _atomic_write_path(page_path, content)
+
+    # Append trace
+    try:
+        _append_trace({
+            "ts": datetime.now().isoformat(),
+            "url": "",
+            "source_type": "quick-note",
+            "approved": True,
+            "title": f"Quick note on {req.page}",
+            "suggested_page": req.page,
+            "final_page": req.page,
+            "page_corrected": False,
+            "evolution_type": "extends",
+            "was_duplicate": False,
+            "tags_suggested": [],
+            "tags_final": [],
+            "tags_corrected": False,
+            "wikilinks_suggested": [],
+            "deep_dive": False,
+        })
+    except Exception:
+        pass
+
+    return {"success": True, "file_written": str(page_path.relative_to(vault_path))}
 
 
 # ── /open-thread ─────────────────────────────────────────────────────────────

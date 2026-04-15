@@ -1049,6 +1049,70 @@ function ConceptPageView({ page }) {
           </div>
         </details>
       )}
+
+      {/* Backlinks */}
+      {page.backlinks?.length > 0 && (
+        <div className="pt-3 mt-3 border-t border-stone-100">
+          <p className="text-[10px] font-semibold text-stone-400 uppercase tracking-wider mb-1.5">Referenced by</p>
+          <div className="flex flex-wrap gap-1">
+            {page.backlinks.map(bl => (
+              <span key={bl} className="text-[11px] px-2 py-0.5 rounded-lg bg-indigo-50 text-indigo-600 border border-indigo-100">[[{bl}]]</span>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* Quick note */}
+      <QuickNoteInline pageName={page.name} />
+    </div>
+  );
+}
+
+function QuickNoteInline({ pageName }) {
+  const [open, setOpen] = useState(false);
+  const [note, setNote] = useState("");
+  const [saving, setSaving] = useState(false);
+
+  async function save() {
+    if (!note.trim()) return;
+    setSaving(true);
+    try {
+      await api("/quick-note", { method: "POST", body: JSON.stringify({ page: pageName, note }) });
+      setNote(""); setOpen(false);
+    } catch (e) { alert(e.message); }
+    finally { setSaving(false); }
+  }
+
+  return (
+    <div className="pt-3 mt-3 border-t border-stone-100">
+      {!open ? (
+        <button onClick={() => setOpen(true)}
+          className="text-xs text-stone-400 hover:text-stone-600 flex items-center gap-1.5 transition-colors">
+          <span className="text-base leading-none">💭</span> Add a quick thought
+        </button>
+      ) : (
+        <div className="space-y-2">
+          <textarea
+            autoFocus
+            className="w-full text-sm border border-stone-200 rounded-xl px-3 py-2 resize-none focus:outline-none focus:ring-2 focus:ring-orange-200 focus:border-orange-300 bg-white"
+            rows={3}
+            placeholder="Something you realised, a connection, a question…"
+            value={note}
+            onChange={e => setNote(e.target.value)}
+            onKeyDown={e => { if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) save(); }}
+          />
+          <div className="flex gap-2">
+            <button onClick={save} disabled={saving || !note.trim()}
+              className="text-xs px-3 py-1.5 bg-stone-900 text-white rounded-lg hover:bg-stone-800 disabled:opacity-40 transition-colors">
+              {saving ? "Saving…" : "Save ⌘↵"}
+            </button>
+            <button onClick={() => { setOpen(false); setNote(""); }}
+              className="text-xs px-3 py-1.5 border border-stone-200 text-stone-500 rounded-lg hover:bg-stone-50 transition-colors">
+              Cancel
+            </button>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -1482,6 +1546,154 @@ function ConsolidateModal({ pages, prefill, onClose, onDone }) {
   );
 }
 
+// ── KNOWLEDGE GRAPH ───────────────────────────────────────────────────────────
+
+const TAG_COLORS_GRAPH = {
+  Agents:"#f97316", Agentic:"#fb923c", LLM:"#8b5cf6", RAG:"#06b6d4",
+  Inference:"#10b981", KVCache:"#0ea5e9", Attention:"#6366f1",
+  Embeddings:"#ec4899", MLOps:"#84cc16", Serving:"#14b8a6",
+  Engineering:"#64748b", Systems:"#94a3b8",
+};
+
+function GraphPanel({ onClose, onOpenPage }) {
+  const canvasRef = useRef(null);
+  const [graphData, setGraphData] = useState(null);
+  const [hovered, setHovered] = useState(null);
+  const simRef = useRef(null);
+
+  useEffect(() => {
+    api("/graph").then(d => setGraphData(d)).catch(() => {});
+  }, []);
+
+  useEffect(() => {
+    if (!graphData || !canvasRef.current) return;
+    const canvas = canvasRef.current;
+    const W = canvas.width = canvas.offsetWidth;
+    const H = canvas.height = canvas.offsetHeight;
+    const ctx = canvas.getContext("2d");
+
+    // Init node positions
+    const nodes = graphData.nodes.map(n => ({
+      ...n,
+      x: W / 2 + (Math.random() - 0.5) * W * 0.6,
+      y: H / 2 + (Math.random() - 0.5) * H * 0.6,
+      vx: 0, vy: 0,
+    }));
+    const nodeMap = Object.fromEntries(nodes.map(n => [n.id, n]));
+    const edges = graphData.edges
+      .map(e => ({ source: nodeMap[e.source], target: nodeMap[e.target] }))
+      .filter(e => e.source && e.target);
+
+    let frame;
+    const REPULSION = 3500, SPRING = 0.04, DAMPING = 0.82, CENTER = 0.012;
+
+    function tick() {
+      // Center gravity
+      nodes.forEach(n => { n.vx += (W/2 - n.x) * CENTER; n.vy += (H/2 - n.y) * CENTER; });
+      // Repulsion
+      for (let i = 0; i < nodes.length; i++) for (let j = i+1; j < nodes.length; j++) {
+        const dx = nodes[j].x - nodes[i].x, dy = nodes[j].y - nodes[i].y;
+        const d2 = Math.max(dx*dx + dy*dy, 100);
+        const f = REPULSION / d2;
+        nodes[i].vx -= dx*f; nodes[i].vy -= dy*f;
+        nodes[j].vx += dx*f; nodes[j].vy += dy*f;
+      }
+      // Spring edges
+      edges.forEach(({ source: s, target: t }) => {
+        const dx = t.x - s.x, dy = t.y - s.y;
+        const d = Math.sqrt(dx*dx + dy*dy) || 1;
+        const f = (d - 120) * SPRING;
+        const fx = (dx/d)*f, fy = (dy/d)*f;
+        s.vx += fx; s.vy += fy; t.vx -= fx; t.vy -= fy;
+      });
+      // Integrate
+      nodes.forEach(n => {
+        n.vx *= DAMPING; n.vy *= DAMPING;
+        n.x = Math.max(30, Math.min(W-30, n.x + n.vx));
+        n.y = Math.max(30, Math.min(H-30, n.y + n.vy));
+      });
+    }
+
+    function draw() {
+      ctx.clearRect(0, 0, W, H);
+      // Edges
+      edges.forEach(({ source: s, target: t }) => {
+        ctx.beginPath(); ctx.moveTo(s.x, s.y); ctx.lineTo(t.x, t.y);
+        ctx.strokeStyle = "rgba(148,163,184,0.35)"; ctx.lineWidth = 1.5; ctx.stroke();
+      });
+      // Nodes
+      nodes.forEach(n => {
+        const r = Math.max(8, Math.min(18, 6 + n.entry_count * 2));
+        const color = TAG_COLORS_GRAPH[n.tags?.[0]] || "#94a3b8";
+        const isHov = hovered?.id === n.id;
+        ctx.beginPath(); ctx.arc(n.x, n.y, r + (isHov ? 3 : 0), 0, Math.PI*2);
+        ctx.fillStyle = isHov ? color : color + "cc";
+        ctx.fill();
+        ctx.strokeStyle = "#fff"; ctx.lineWidth = 2; ctx.stroke();
+        // Label
+        ctx.font = isHov ? "bold 10px system-ui" : "10px system-ui";
+        ctx.fillStyle = isHov ? "#1e293b" : "#475569";
+        ctx.textAlign = "center";
+        const label = n.title.length > 16 ? n.title.slice(0,15)+"…" : n.title;
+        ctx.fillText(label, n.x, n.y + r + 12);
+      });
+    }
+
+    let iter = 0;
+    function loop() {
+      if (iter++ < 200) tick(); // settle
+      draw();
+      frame = requestAnimationFrame(loop);
+    }
+    frame = requestAnimationFrame(loop);
+    simRef.current = { nodes, loop };
+
+    // Mouse hover + click
+    function getNode(mx, my) {
+      return simRef.current?.nodes.find(n => {
+        const r = Math.max(8, Math.min(18, 6 + n.entry_count * 2)) + 4;
+        return (mx-n.x)**2 + (my-n.y)**2 < r*r;
+      });
+    }
+    function onMove(e) {
+      const rect = canvas.getBoundingClientRect();
+      const n = getNode(e.clientX - rect.left, e.clientY - rect.top);
+      setHovered(n || null);
+      canvas.style.cursor = n ? "pointer" : "default";
+    }
+    function onClick(e) {
+      const rect = canvas.getBoundingClientRect();
+      const n = getNode(e.clientX - rect.left, e.clientY - rect.top);
+      if (n) onOpenPage(n.id);
+    }
+    canvas.addEventListener("mousemove", onMove);
+    canvas.addEventListener("click", onClick);
+    return () => { cancelAnimationFrame(frame); canvas.removeEventListener("mousemove", onMove); canvas.removeEventListener("click", onClick); };
+  }, [graphData, hovered]);
+
+  return (
+    <div className="mb-4 bg-white border border-violet-100 rounded-2xl overflow-hidden shadow-sm">
+      <div className="flex items-center justify-between px-4 py-3 bg-violet-50 border-b border-violet-100">
+        <span className="text-sm font-semibold text-violet-900">🕸 Knowledge Graph</span>
+        <div className="flex items-center gap-3">
+          <span className="text-xs text-violet-400">{graphData?.nodes.length ?? 0} pages · {graphData?.edges.length ?? 0} connections</span>
+          <button onClick={onClose} className="text-violet-400 hover:text-violet-700 text-lg leading-none">×</button>
+        </div>
+      </div>
+      <div className="relative">
+        {!graphData && <div className="h-72 flex items-center justify-center text-sm text-stone-400">Loading graph…</div>}
+        {graphData && <canvas ref={canvasRef} className="w-full h-72 block" style={{ height: 288 }} />}
+        {hovered && (
+          <div className="absolute bottom-3 left-3 bg-white/95 border border-stone-200 rounded-xl px-3 py-2 shadow-sm pointer-events-none">
+            <p className="text-xs font-semibold text-stone-800">{hovered.title}</p>
+            <p className="text-[10px] text-stone-400">{hovered.entry_count} source{hovered.entry_count !== 1 ? "s" : ""} · {hovered.tags?.join(", ")}</p>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
 // ── INSIGHTS PANEL ────────────────────────────────────────────────────────────
 
 function InsightsPanel({ onClose }) {
@@ -1599,6 +1811,9 @@ function BrowseTab() {
   const [pageLoading, setPageLoading] = useState(false);
   const [showLint, setShowLint] = useState(false);
   const [showInsights, setShowInsights] = useState(false);
+  const [showGraph, setShowGraph] = useState(false);
+  const [reviewFilter, setReviewFilter] = useState(false);
+  const [reviewPages, setReviewPages] = useState([]);
   const [consolidateModal, setConsolidateModal] = useState(null);
   const [fixing, setFixing] = useState({});
   const [deleting, setDeleting] = useState(null);
@@ -1608,7 +1823,14 @@ function BrowseTab() {
   }
 
   function switchFolder(f) {
-    setFolder(f); setSelected(null); setSearch(""); setDeepDiveFilter(false); reloadPages(f);
+    setFolder(f); setSelected(null); setSearch(""); setDeepDiveFilter(false); setReviewFilter(false); reloadPages(f);
+  }
+
+  async function toggleReview() {
+    if (reviewFilter) { setReviewFilter(false); return; }
+    const d = await api("/review-queue?days=30").catch(() => ({ pages: [] }));
+    setReviewPages(d.pages || []);
+    setReviewFilter(true);
   }
 
   useEffect(() => {
@@ -1639,7 +1861,8 @@ function BrowseTab() {
     try {
       const data = await api(`/page/${name}`);
       setPageContent(data.content);
-      setParsedPage(data.parsed || null);
+      const parsed = data.parsed ? { ...data.parsed, backlinks: data.backlinks || [] } : null;
+      setParsedPage(parsed);
       setSelected(name);
     } catch { setPageContent("Failed to load page."); setParsedPage(null); setSelected(name); }
     finally { setPageLoading(false); }
@@ -1664,7 +1887,8 @@ function BrowseTab() {
     finally { setFixing(p => ({ ...p, [name]: false })); }
   }
 
-  const filtered = pages
+  const reviewPageNames = new Set(reviewPages.map(p => p.name));
+  const filtered = (reviewFilter ? reviewPages : pages)
     .filter(p => !(folder === "insights" && p.name.includes("lint-report")))
     .filter(p => !deepDiveFilter || (p.tags || []).some(t => t.toLowerCase() === "deep-dive"))
     .filter(p => {
@@ -1750,20 +1974,30 @@ function BrowseTab() {
       <div className="flex items-center justify-between mb-4">
         <div>
           <h2 className="text-base font-semibold text-stone-900">Knowledge Base</h2>
-          <p className="text-xs text-stone-400 mt-0.5">{filtered.length} page{filtered.length !== 1 ? "s" : ""}{deepDiveFilter ? " flagged for deeper research" : ` in ${folder}`}</p>
+          <p className="text-xs text-stone-400 mt-0.5">{filtered.length} page{filtered.length !== 1 ? "s" : ""}{deepDiveFilter ? " flagged for deeper research" : reviewFilter ? " not reviewed in 30+ days" : ` in ${folder}`}</p>
         </div>
         <div className="flex gap-1.5">
           {folder === "concepts" && (
-            <button onClick={() => setDeepDiveFilter(v => !v)}
-              className={`text-xs px-3 py-1.5 rounded-xl border transition-colors ${deepDiveFilter ? "bg-orange-500 text-white border-orange-500" : "border-orange-200 text-orange-500 hover:bg-orange-50"}`}>
-              🔍 Want more
-            </button>
+            <>
+              <button onClick={() => setDeepDiveFilter(v => !v)}
+                className={`text-xs px-3 py-1.5 rounded-xl border transition-colors ${deepDiveFilter ? "bg-orange-500 text-white border-orange-500" : "border-orange-200 text-orange-500 hover:bg-orange-50"}`}>
+                🔍 Want more
+              </button>
+              <button onClick={toggleReview}
+                className={`text-xs px-3 py-1.5 rounded-xl border transition-colors ${reviewFilter ? "bg-amber-500 text-white border-amber-500" : "border-amber-200 text-amber-600 hover:bg-amber-50"}`}>
+                🕰 Review
+              </button>
+              <button onClick={() => { setShowGraph(v => !v); setShowInsights(false); setShowLint(false); }}
+                className={`text-xs px-3 py-1.5 rounded-xl border transition-colors ${showGraph ? "bg-violet-600 text-white border-violet-600" : "border-violet-200 text-violet-600 hover:bg-violet-50"}`}>
+                🕸 Graph
+              </button>
+            </>
           )}
-          <button onClick={() => { setShowInsights(v => !v); setShowLint(false); }}
+          <button onClick={() => { setShowInsights(v => !v); setShowLint(false); setShowGraph(false); }}
             className={`text-xs px-3 py-1.5 rounded-xl border transition-colors ${showInsights ? "bg-indigo-600 text-white border-indigo-600" : "border-indigo-200 text-indigo-500 hover:bg-indigo-50"}`}>
             🧠 Learn
           </button>
-          <button onClick={() => { setShowLint(v => !v); setShowInsights(false); }}
+          <button onClick={() => { setShowLint(v => !v); setShowInsights(false); setShowGraph(false); }}
             className={`text-xs px-3 py-1.5 rounded-xl border transition-colors ${showLint ? "bg-stone-900 text-white border-stone-900" : "border-stone-200 text-stone-500 hover:bg-stone-50"}`}>
             Health
           </button>
@@ -1772,6 +2006,10 @@ function BrowseTab() {
 
       {showInsights && (
         <InsightsPanel onClose={() => setShowInsights(false)} />
+      )}
+
+      {showGraph && (
+        <GraphPanel onClose={() => setShowGraph(false)} onOpenPage={name => { setShowGraph(false); openPage(name); }} />
       )}
 
       {showLint && (
@@ -1847,7 +2085,12 @@ function BrowseTab() {
                   </div>
                 )}
                 {page.last_updated && (
-                  <p className="text-xs text-stone-400 mt-1.5">{page.last_updated}</p>
+                  <p className="text-xs text-stone-400 mt-1.5">
+                    {page.last_updated}
+                    {reviewFilter && page.days_since_update && (
+                      <span className="ml-2 text-amber-500 font-medium">{page.days_since_update}d ago</span>
+                    )}
+                  </p>
                 )}
               </div>
 
