@@ -1482,6 +1482,107 @@ function ConsolidateModal({ pages, prefill, onClose, onDone }) {
   );
 }
 
+// ── INSIGHTS PANEL ────────────────────────────────────────────────────────────
+
+function InsightsPanel({ onClose }) {
+  const [data, setData] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [analyzing, setAnalyzing] = useState(false);
+  const [error, setError] = useState("");
+
+  async function load() {
+    setLoading(true);
+    try {
+      const d = await api("/system-insights");
+      setData(d);
+    } catch (e) { setError(e.message); }
+    finally { setLoading(false); }
+  }
+
+  useEffect(() => { load(); }, []);
+
+  async function runAnalysis() {
+    setAnalyzing(true); setError("");
+    try {
+      const d = await api("/analyze-traces", { method: "POST" });
+      await load();
+    } catch (e) { setError(e.message); }
+    finally { setAnalyzing(false); }
+  }
+
+  const SECTION_ICONS = {
+    "Extraction Patterns": "📊",
+    "Tag Confusion": "🏷️",
+    "Duplicate Signals": "🔁",
+    "Rejection Patterns": "🚫",
+    "Prompt Hints": "💡",
+    "Routing Recommendations": "🔀",
+    "Architecture Recommendations": "🏗️",
+  };
+
+  return (
+    <div className="mb-4 bg-white border border-indigo-100 rounded-2xl overflow-hidden shadow-sm">
+      <div className="flex items-center justify-between px-4 py-3 bg-indigo-50 border-b border-indigo-100">
+        <div>
+          <span className="text-sm font-semibold text-indigo-900">🧠 System Learnings</span>
+          {data?.last_analyzed && (
+            <span className="ml-2 text-xs text-indigo-400">Last analyzed {data.last_analyzed}</span>
+          )}
+        </div>
+        <div className="flex items-center gap-2">
+          <span className="text-xs text-indigo-400">{data?.traces_count ?? 0} traces</span>
+          <button onClick={runAnalysis} disabled={analyzing || (data?.traces_count ?? 0) < 3}
+            className="text-xs px-3 py-1 bg-indigo-600 text-white rounded-lg hover:bg-indigo-700 disabled:opacity-40 transition-colors">
+            {analyzing ? "Analyzing…" : "Run analysis"}
+          </button>
+          <button onClick={onClose} className="text-indigo-400 hover:text-indigo-700 text-lg leading-none">×</button>
+        </div>
+      </div>
+
+      <div className="p-4">
+        {loading && <p className="text-sm text-stone-400 text-center py-4">Loading…</p>}
+        {error && <p className="text-xs text-red-500 mb-3">{error}</p>}
+
+        {!loading && !data?.exists && (
+          <div className="text-center py-6 space-y-2">
+            <p className="text-sm text-stone-500">No analysis yet.</p>
+            <p className="text-xs text-stone-400">
+              {(data?.traces_count ?? 0) < 3
+                ? `Need at least 3 traces — approve ${3 - (data?.traces_count ?? 0)} more item${3 - (data?.traces_count ?? 0) !== 1 ? "s" : ""} first`
+                : "Click Run analysis to generate insights from your traces"}
+            </p>
+          </div>
+        )}
+
+        {!loading && data?.exists && data.sections && (
+          <div className="space-y-4">
+            {Object.entries(data.sections)
+              .filter(([, items]) => items.length > 0)
+              .map(([section, items]) => (
+                <div key={section}>
+                  <p className="text-xs font-semibold text-stone-500 uppercase tracking-wider mb-1.5">
+                    {SECTION_ICONS[section] || "•"} {section}
+                  </p>
+                  <ul className="space-y-1">
+                    {items.map((item, i) => (
+                      <li key={i} className={`text-xs rounded-lg px-3 py-2 ${
+                        section === "Prompt Hints" ? "bg-amber-50 text-amber-800 border border-amber-100" :
+                        section === "Architecture Recommendations" ? "bg-indigo-50 text-indigo-800 border border-indigo-100" :
+                        "bg-stone-50 text-stone-700"
+                      }`}>
+                        {item}
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              ))}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
 const FOLDERS = [
   { key: "concepts", label: "Concepts" },
   { key: "sources", label: "Sources" },
@@ -1497,6 +1598,7 @@ function BrowseTab() {
   const [pageContent, setPageContent] = useState("");
   const [pageLoading, setPageLoading] = useState(false);
   const [showLint, setShowLint] = useState(false);
+  const [showInsights, setShowInsights] = useState(false);
   const [consolidateModal, setConsolidateModal] = useState(null);
   const [fixing, setFixing] = useState({});
   const [deleting, setDeleting] = useState(null);
@@ -1657,12 +1759,20 @@ function BrowseTab() {
               🔍 Want more
             </button>
           )}
-          <button onClick={() => setShowLint(v => !v)}
+          <button onClick={() => { setShowInsights(v => !v); setShowLint(false); }}
+            className={`text-xs px-3 py-1.5 rounded-xl border transition-colors ${showInsights ? "bg-indigo-600 text-white border-indigo-600" : "border-indigo-200 text-indigo-500 hover:bg-indigo-50"}`}>
+            🧠 Learn
+          </button>
+          <button onClick={() => { setShowLint(v => !v); setShowInsights(false); }}
             className={`text-xs px-3 py-1.5 rounded-xl border transition-colors ${showLint ? "bg-stone-900 text-white border-stone-900" : "border-stone-200 text-stone-500 hover:bg-stone-50"}`}>
             Health
           </button>
         </div>
       </div>
+
+      {showInsights && (
+        <InsightsPanel onClose={() => setShowInsights(false)} />
+      )}
 
       {showLint && (
         <LintPanel onClose={() => setShowLint(false)}

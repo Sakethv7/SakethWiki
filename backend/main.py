@@ -42,7 +42,16 @@ import wiki_writer
 
 # ── app setup ────────────────────────────────────────────────────────────────
 
-app = FastAPI(title="SakethWiki API", version="1.0.0")
+import asyncio
+from contextlib import asynccontextmanager
+
+@asynccontextmanager
+async def lifespan(app):
+    """Start background weekly analysis scheduler on app startup."""
+    asyncio.create_task(_weekly_analysis_scheduler())
+    yield
+
+app = FastAPI(title="SakethWiki API", version="1.0.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -442,6 +451,10 @@ def _extract_with_sonnet(text: str, images: Optional[list], source_url: str,
     wiki_standards = _load_wiki_standards("For Ingest")
     standards_block = f"\nCuration standards to follow:\n{wiki_standards}\n" if wiki_standards else ""
 
+    # Inject learned hints from system-insights.md (self-improvement loop)
+    hints = _load_extraction_hints()
+    hints_block = f"\nLearned extraction hints (from past corrections — follow these):\n{hints}\n" if hints else ""
+
     user_content: list = []
 
     # Add all images (multiple supported)
@@ -488,7 +501,7 @@ This wiki covers anything educational: tech, ML/AI, finance, self-improvement, p
 
 Source URL: {source_url}
 Content depth: {depth} ({content_len} chars)
-{standards_block}
+{standards_block}{hints_block}
 {pages_hint}
 
 Content:
@@ -753,6 +766,26 @@ async def approve(item_id: str, req: ApproveRequest):
 
     if not req.approved:
         queue_manager.remove(item_id)
+        try:
+            _append_trace({
+                "ts": datetime.now().isoformat(),
+                "url": item.get("url", ""),
+                "source_type": "tweet" if _is_tweet_url(item.get("url", "")) else ("text" if not item.get("url") else "url"),
+                "approved": False,
+                "title": item.get("title", ""),
+                "suggested_page": item.get("suggested_page", ""),
+                "final_page": None,
+                "page_corrected": False,
+                "evolution_type": None,
+                "was_duplicate": False,
+                "tags_suggested": item.get("tags", []),
+                "tags_final": [],
+                "tags_corrected": False,
+                "wikilinks_suggested": item.get("suggested_wikilinks", []),
+                "deep_dive": False,
+            })
+        except Exception:
+            pass
         return {"success": True, "action": "rejected", "file_written": None}
 
     # If queued via Share Sheet (pending_extraction=True), run extraction now
@@ -774,6 +807,10 @@ async def approve(item_id: str, req: ApproveRequest):
             })
         except Exception:
             pass  # if extraction fails, write with placeholder content
+
+    # Snapshot original values before edits (for trace logging)
+    item["_original_suggested_page"] = item.get("suggested_page", "")
+    item["_original_tags"] = list(item.get("tags", []))
 
     # Merge any human edits onto the item before writing
     if req.edits:
@@ -815,6 +852,29 @@ async def approve(item_id: str, req: ApproveRequest):
             pass  # non-critical
 
     evolution = item.get("_evolution", {})
+
+    # Append trace for self-learning loop
+    try:
+        _append_trace({
+            "ts": datetime.now().isoformat(),
+            "url": item.get("url", ""),
+            "source_type": "tweet" if _is_tweet_url(item.get("url", "")) else ("text" if not item.get("url") else "url"),
+            "approved": True,
+            "title": item.get("title", ""),
+            "suggested_page": item.get("_original_suggested_page", item.get("suggested_page", "")),
+            "final_page": item.get("suggested_page", ""),
+            "page_corrected": item.get("_original_suggested_page", item.get("suggested_page", "")) != item.get("suggested_page", ""),
+            "evolution_type": evolution.get("evolution_type", "extends"),
+            "was_duplicate": evolution.get("evolution_type") == "duplicates",
+            "tags_suggested": item.get("_original_tags", item.get("tags", [])),
+            "tags_final": item.get("tags", []),
+            "tags_corrected": item.get("_original_tags", item.get("tags", [])) != item.get("tags", []),
+            "wikilinks_suggested": item.get("suggested_wikilinks", []),
+            "deep_dive": deep_dive_tagged,
+        })
+    except Exception:
+        pass  # non-critical
+
     return {
         "success": True,
         "action": "approved",
@@ -962,6 +1022,196 @@ async def get_page(page_name: str):
         raise HTTPException(404, f"Page '{page_name}' not found")
     parsed = vault_reader.parse_concept_page(page_name)
     return {"name": page_name, "content": content, "parsed": parsed}
+
+
+# ── /analyze-traces ──────────────────────────────────────────────────────────
+
+@app.post("/analyze-traces")
+async def analyze_traces():
+    """
+    Read traces.jsonl, send to Sonnet, write findings + prompt hints to
+    _wiki/meta/system-insights.md. Returns the written insights.
+    """
+    vault_path = Path(os.environ.get("VAULT_PATH", "/Users/sakethv7/SakethVault"))
+    traces_path = vault_path / "_wiki" / "meta" / "traces.jsonl"
+    if not traces_path.exists():
+        raise HTTPException(404, "No traces recorded yet — approve some items first")
+
+    lines = [l for l in traces_path.read_text().splitlines() if l.strip()]
+    if not lines:
+        raise HTTPException(404, "traces.jsonl is empty")
+
+    traces = []
+    for line in lines:
+        try:
+            traces.append(json.loads(line))
+        except Exception:
+            continue
+
+    if len(traces) < 3:
+        raise HTTPException(400, f"Need at least 3 traces to analyze (have {len(traces)})")
+
+    # Build compact trace summary for the prompt
+    trace_summary = json.dumps(traces[-100:], indent=2)  # last 100 max
+
+    prompt = f"""You are analyzing usage traces from a personal knowledge wiki system to find patterns and suggest improvements.
+
+Here are {len(traces)} traces (each is one approve/reject event):
+
+{trace_summary}
+
+Fields:
+- approved: was the item approved (True) or rejected (False)
+- suggested_page / final_page: what the AI suggested vs what the user chose
+- page_corrected: True if user changed the suggested page
+- evolution_type: extends/refines/supersedes/duplicates/contradicts
+- was_duplicate: True if classified as duplicate
+- tags_suggested / tags_final: AI-suggested vs user-approved tags
+- tags_corrected: True if user changed tags
+- source_type: tweet / url / text
+
+Analyze these traces and write a structured insights report. Be specific — name actual page slugs, actual tags, actual patterns you see in the data.
+
+Respond with a JSON object (no markdown fences):
+{{
+  "patterns": [
+    "pattern description 1",
+    "pattern description 2"
+  ],
+  "tag_confusion": [
+    "specific tag confusion observed"
+  ],
+  "duplicate_signals": [
+    "topics or sources that frequently produce duplicates"
+  ],
+  "rejection_patterns": [
+    "what types of content gets rejected"
+  ],
+  "prompt_hints": [
+    "Concrete one-line hint to inject into the extraction prompt to fix a specific observed problem",
+    "Another hint"
+  ],
+  "routing_recommendations": [
+    "Specific change to model routing or tag vocabulary"
+  ],
+  "architecture_recommendations": [
+    "Larger structural change worth considering"
+  ],
+  "summary": "2-3 sentence overall summary of system health"
+}}
+
+prompt_hints must be actionable, specific, and short — they will be directly injected into the extraction system prompt. E.g.:
+- "Twitter content about agent tooling maps to existing pages more often than it needs a new page — prefer existing slugs"
+- "The tag Agentic is frequently corrected to Agents — use Agents for tool-use and orchestration content"
+"""
+
+    message = client.messages.create(
+        model="claude-sonnet-4-6",
+        max_tokens=2000,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    raw = message.content[0].text.strip()
+    if raw.startswith("```"):
+        raw = raw.split("```")[1]
+        if raw.startswith("json"):
+            raw = raw[4:]
+        raw = raw.strip()
+
+    try:
+        insights = json.loads(raw)
+    except json.JSONDecodeError as e:
+        raise HTTPException(500, f"Analysis returned invalid JSON: {e}")
+
+    # Write to system-insights.md
+    today = datetime.now().strftime("%Y-%m-%d")
+    hints_md = "\n".join(f"- {h}" for h in insights.get("prompt_hints", []))
+    patterns_md = "\n".join(f"- {p}" for p in insights.get("patterns", []))
+    tag_md = "\n".join(f"- {t}" for t in insights.get("tag_confusion", []))
+    dup_md = "\n".join(f"- {d}" for d in insights.get("duplicate_signals", []))
+    reject_md = "\n".join(f"- {r}" for r in insights.get("rejection_patterns", []))
+    routing_md = "\n".join(f"- {r}" for r in insights.get("routing_recommendations", []))
+    arch_md = "\n".join(f"- {a}" for a in insights.get("architecture_recommendations", []))
+
+    content = f"""---
+last_analyzed: {today}
+traces_analyzed: {len(traces)}
+---
+
+# System Insights
+
+> {insights.get("summary", "")}
+
+## Extraction Patterns
+{patterns_md or "- No patterns found yet"}
+
+## Tag Confusion
+{tag_md or "- None observed"}
+
+## Duplicate Signals
+{dup_md or "- None observed"}
+
+## Rejection Patterns
+{reject_md or "- None observed"}
+
+## Prompt Hints
+<!-- Auto-injected into extraction prompt on every ingest -->
+{hints_md or "- None yet"}
+
+## Routing Recommendations
+{routing_md or "- None yet"}
+
+## Architecture Recommendations
+{arch_md or "- None yet"}
+"""
+
+    insights_path = vault_path / "_wiki" / "meta" / "system-insights.md"
+    insights_path.parent.mkdir(parents=True, exist_ok=True)
+    _atomic_write_path(insights_path, content)
+
+    return {
+        "success": True,
+        "traces_analyzed": len(traces),
+        "insights": insights,
+        "file_written": str(insights_path.relative_to(vault_path)),
+    }
+
+
+@app.get("/system-insights")
+async def get_system_insights():
+    """Return current system-insights.md content."""
+    vault_path = Path(os.environ.get("VAULT_PATH", "/Users/sakethv7/SakethVault"))
+    insights_path = vault_path / "_wiki" / "meta" / "system-insights.md"
+    if not insights_path.exists():
+        return {"exists": False, "content": None, "traces_count": 0}
+
+    traces_path = vault_path / "_wiki" / "meta" / "traces.jsonl"
+    traces_count = 0
+    if traces_path.exists():
+        traces_count = sum(1 for l in traces_path.read_text().splitlines() if l.strip())
+
+    content = insights_path.read_text(encoding="utf-8")
+
+    # Parse out sections for structured frontend display
+    from vault_reader import _parse_frontmatter
+    meta = _parse_frontmatter(content)
+
+    sections = {}
+    current = None
+    for line in content.splitlines():
+        if line.startswith("## "):
+            current = line[3:].strip()
+            sections[current] = []
+        elif current and line.startswith("- ") and not line.startswith("<!-- "):
+            sections[current].append(line[2:].strip())
+
+    return {
+        "exists": True,
+        "last_analyzed": meta.get("last_analyzed", ""),
+        "traces_analyzed": int(meta.get("traces_analyzed", 0)),
+        "traces_count": traces_count,
+        "sections": sections,
+        "content": content,
+    }
 
 
 # ── /open-thread ─────────────────────────────────────────────────────────────
@@ -1433,6 +1683,83 @@ async def fix_page(page_name: str):
 
 
 # ── utilities ─────────────────────────────────────────────────────────────────
+
+async def _weekly_analysis_scheduler():
+    """
+    Background task: runs trace analysis automatically once a week.
+    Checks every hour if a week has passed since last analysis.
+    """
+    while True:
+        try:
+            vault_path = Path(os.environ.get("VAULT_PATH", "/Users/sakethv7/SakethVault"))
+            insights_path = vault_path / "_wiki" / "meta" / "system-insights.md"
+            traces_path = vault_path / "_wiki" / "meta" / "traces.jsonl"
+
+            should_run = False
+            if insights_path.exists():
+                from vault_reader import _parse_frontmatter
+                meta = _parse_frontmatter(insights_path.read_text(encoding="utf-8"))
+                last = meta.get("last_analyzed", "")
+                if last:
+                    from datetime import date
+                    last_date = date.fromisoformat(last)
+                    if (date.today() - last_date).days >= 7:
+                        should_run = True
+            elif traces_path.exists():
+                # Never run before — run if we have at least 5 traces
+                count = sum(1 for l in traces_path.read_text().splitlines() if l.strip())
+                if count >= 5:
+                    should_run = True
+
+            if should_run:
+                try:
+                    # Import httpx to call our own endpoint internally
+                    import httpx as _httpx
+                    _httpx.post("http://localhost:8001/analyze-traces", timeout=60)
+                except Exception:
+                    pass  # non-critical
+
+        except Exception:
+            pass
+
+        await asyncio.sleep(3600)  # check every hour
+
+
+def _append_trace(trace: dict) -> None:
+    """Append one trace record to _wiki/meta/traces.jsonl (one JSON line per event)."""
+    vault_path = Path(os.environ.get("VAULT_PATH", "/Users/sakethv7/SakethVault"))
+    traces_path = vault_path / "_wiki" / "meta" / "traces.jsonl"
+    traces_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(traces_path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(trace) + "\n")
+
+
+def _load_extraction_hints() -> str:
+    """
+    Read the ## Prompt Hints section from system-insights.md.
+    Returns a newline-joined string of hints, or "" if none exist.
+    """
+    vault_path = Path(os.environ.get("VAULT_PATH", "/Users/sakethv7/SakethVault"))
+    insights_path = vault_path / "_wiki" / "meta" / "system-insights.md"
+    if not insights_path.exists():
+        return ""
+    try:
+        content = insights_path.read_text(encoding="utf-8")
+        in_hints = False
+        hints = []
+        for line in content.splitlines():
+            if line.startswith("## Prompt Hints"):
+                in_hints = True
+                continue
+            if in_hints:
+                if line.startswith("## "):
+                    break  # next section
+                if line.startswith("- ") and not line.startswith("<!-- "):
+                    hints.append(line[2:].strip())
+        return "\n".join(hints)
+    except Exception:
+        return ""
+
 
 def _append_log(log_path: Path, text: str) -> None:
     """Append to log.md — never crashes caller even if file is locked/missing."""

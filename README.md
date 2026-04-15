@@ -102,6 +102,8 @@ cd frontend && npm run build
 | POST | `/health-check` | Analyse vault for issues and suggest fixes |
 | POST | `/consolidate` | Merge two concept pages into one |
 | POST | `/ingest-text` | Ingest plain text directly (no URL fetch) |
+| POST | `/analyze-traces` | Run weekly self-learning analysis on approval traces |
+| GET | `/system-insights` | Return current system insights and prompt hints |
 
 ### POST /ingest
 
@@ -151,6 +153,18 @@ Asking "what do I know about X" returns a structured `knowledge_card` alongside 
 ```
 
 ---
+
+## Self-Learning System
+
+Every approve/reject event writes a trace to `_wiki/meta/traces.jsonl`. Once a week (auto) or on demand via the 🧠 Learn button in Browse, Claude Sonnet analyzes the traces and writes structured findings to `_wiki/meta/system-insights.md`:
+
+- Which page suggestions were wrong most often
+- Tag confusion patterns (e.g. `Agentic` vs `Agents`)
+- Sources of duplicates and rejection patterns
+- **Prompt hints** — auto-injected into the next extraction prompt so corrections propagate automatically
+- Routing and architecture recommendations surfaced to you
+
+The loop: approve → trace → weekly analysis → insights → extraction prompt → better next extraction.
 
 ## Running Tests
 

@@ -4,6 +4,16 @@
 
 ```mermaid
 graph TB
+    subgraph SelfLearning["Self-Learning Loop"]
+        SL1[traces.jsonl] --> SL2[Weekly analysis\nclaude-sonnet-4-5]
+        SL2 --> SL3[system-insights.md\nPatterns + Prompt Hints]
+        SL3 --> SL4[Pre-extraction\nhints injected]
+        SL4 --> SL1
+    end
+```
+
+```mermaid
+graph TB
     subgraph Input
         A[URL] --> B[httpx fetch]
         C[Text / Tweet] --> D[Direct]
@@ -34,6 +44,7 @@ graph TB
         T --> U[_wiki/concepts/*.md]
         T --> V[_wiki/sources/*.md]
         T --> W[_wiki/index.md]
+        T --> TR[_wiki/meta/traces.jsonl\nappend trace]
     end
 
     subgraph Chat["Chat (POST /chat)"]
@@ -138,6 +149,59 @@ The understanding block is **rewritten** on each approval (not appended to), so 
 
 ---
 
+---
+
+## Self-Learning Trace System
+
+### How it works
+
+Every approve/reject event appends one JSON line to `_wiki/meta/traces.jsonl`:
+
+```json
+{
+  "ts": "2026-04-15T10:00:00",
+  "url": "https://x.com/...",
+  "source_type": "tweet",
+  "approved": true,
+  "suggested_page": "learning-agent-infrastructure",
+  "final_page": "harness-hill-climbing",
+  "page_corrected": true,
+  "evolution_type": "extends",
+  "tags_suggested": ["Agentic", "MLOps"],
+  "tags_final": ["Agents", "MLOps"],
+  "tags_corrected": true,
+  "was_duplicate": false
+}
+```
+
+### Weekly analysis
+
+Once a week (or on demand via 🧠 Learn in Browse), Claude Sonnet reads the last 100 traces and writes structured findings to `_wiki/meta/system-insights.md`:
+
+- **Extraction Patterns** — which types of content Claude gets right/wrong
+- **Tag Confusion** — tags that are frequently corrected
+- **Duplicate Signals** — topics that often produce duplicates
+- **Rejection Patterns** — what content keeps getting skipped
+- **Prompt Hints** — specific one-line corrections auto-injected into next extraction
+- **Routing Recommendations** — tag vocabulary or model changes
+- **Architecture Recommendations** — larger structural changes to consider
+
+### Pre-extraction priming
+
+On every `/ingest`, the `## Prompt Hints` section from `system-insights.md` is read and injected into the extraction system prompt. This means corrections propagate automatically without touching any code.
+
+### The loop
+
+```
+approve item → trace logged → weekly analysis → prompt hints written
+      ↑                                                    ↓
+next extraction ←────────── hints injected into prompt ───┘
+```
+
+Cost: one Sonnet call per week (~$0.10-0.30). Trace logging is zero cost (file append). Hint injection adds ~300 tokens per extraction (negligible).
+
+---
+
 ## Key Design Decisions
 
 ### Vault in `~/` not `~/Documents/`
@@ -151,6 +215,9 @@ Keyword match + LLM routing is sufficient for a personal wiki of this scale. No 
 
 ### Living Understanding Block (not append-only)
 Old design: every new source just appended a `##` section. Problem: understanding never compounded — it just stacked. New design: the `> Current understanding` block at the top is rewritten on each approval to reflect the most evolved synthesis. Source sections below it are the immutable evidence trail.
+
+### Self-Learning via Traces (not hardcoded rules)
+Rather than manually tuning the extraction prompt when it gets something wrong, every correction is logged as a trace. Weekly analysis finds patterns across corrections and writes prompt hints that auto-inject on the next ingest. This means the system improves from your behavior without requiring code changes. Inspired by Motus's "agent learning in production" thesis.
 
 ### deep-dive Tag (not a separate folder)
 Old design had an `open-threads/` folder for topics to research more. Removed because it created a second concept-like object that confused the mental model. Replaced with a `deep-dive` tag on the concept page itself. The 🔍 Want more filter in Browse surfaces all flagged pages. One page type, one place.
