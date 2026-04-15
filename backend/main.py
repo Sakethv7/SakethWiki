@@ -1216,6 +1216,110 @@ async def get_system_insights():
     }
 
 
+# ── /follow-up/{page_name} ───────────────────────────────────────────────────
+
+@app.get("/follow-up/{page_name}")
+async def follow_up(page_name: str, recently_read: str = ""):
+    """
+    Return follow-up page suggestions for a given page.
+    Pure regex scoring — zero LLM.
+
+    Scoring:
+      +3  candidate is a direct wikilink in current page
+      +3  current page is a direct wikilink in candidate (mutual link)
+      +2  per shared tag
+      +1  candidate appears in wikilinks of recently-read pages
+      -5  candidate was recently read (don't repeat)
+    """
+    vault_path = Path(os.environ.get("VAULT_PATH", "/Users/sakethv7/SakethVault"))
+    concepts_dir = vault_path / "_wiki" / "concepts"
+    if not concepts_dir.exists():
+        return {"suggestions": []}
+
+    recent = [r.strip() for r in recently_read.split(",") if r.strip()] if recently_read else []
+    recent_set = set(recent)
+
+    # Read current page
+    current_path = concepts_dir / f"{page_name}.md"
+    if not current_path.exists():
+        return {"suggestions": []}
+
+    current_content = current_path.read_text(encoding="utf-8")
+    current_links = set(l.lower().replace(" ", "-") for l in _re.findall(r"\[\[([^\]]+)\]\]", current_content))
+    current_meta = vault_reader._parse_frontmatter(current_content)
+    current_tags = set(t.lower() for t in (current_meta.get("tags", []) if isinstance(current_meta.get("tags"), list) else []))
+
+    # Build wikilinks for recently-read pages
+    recent_links: set[str] = set()
+    for rp in recent:
+        rpath = concepts_dir / f"{rp}.md"
+        if rpath.exists():
+            try:
+                rc = rpath.read_text(encoding="utf-8")
+                for l in _re.findall(r"\[\[([^\]]+)\]\]", rc):
+                    recent_links.add(l.lower().replace(" ", "-"))
+            except OSError:
+                pass
+
+    # Score all other concept pages
+    scores: list[tuple[float, dict]] = []
+    for md_file in concepts_dir.glob("*.md"):
+        cname = md_file.stem
+        if cname == page_name:
+            continue
+        try:
+            content = md_file.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        meta = vault_reader._parse_frontmatter(content)
+        candidate_links = set(l.lower().replace(" ", "-") for l in _re.findall(r"\[\[([^\]]+)\]\]", content))
+        candidate_tags = set(t.lower() for t in (meta.get("tags", []) if isinstance(meta.get("tags"), list) else []))
+
+        score: float = 0
+        reasons: list[str] = []
+
+        # Direct wikilink from current page to candidate
+        if cname in current_links:
+            score += 3
+            reasons.append("linked from this page")
+
+        # Mutual link (candidate links back to current)
+        if page_name in candidate_links:
+            score += 3
+            if "linked from this page" not in reasons:
+                reasons.append("links back here")
+            else:
+                reasons[0] = "mutual link"
+
+        # Shared tags
+        shared = current_tags & candidate_tags
+        if shared:
+            score += len(shared) * 2
+            reasons.append(f"shares {', '.join(sorted(shared)[:2])}")
+
+        # Appears in recently-read wikilinks
+        if cname in recent_links:
+            score += 1
+
+        # Penalty for recently read
+        if cname in recent_set:
+            score -= 5
+
+        if score > 0:
+            scores.append((score, {
+                "name": cname,
+                "title": meta.get("title", cname.replace("-", " ").title()),
+                "tags": meta.get("tags", []) if isinstance(meta.get("tags"), list) else [],
+                "entry_count": int(meta.get("entry_count", 1)),
+                "last_updated": meta.get("last_updated", ""),
+                "reason": reasons[0] if reasons else "",
+                "score": score,
+            }))
+
+    scores.sort(key=lambda x: x[0], reverse=True)
+    return {"suggestions": [s for _, s in scores[:5]]}
+
+
 # ── /graph ───────────────────────────────────────────────────────────────────
 
 @app.get("/graph")

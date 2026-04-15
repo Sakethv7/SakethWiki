@@ -1064,6 +1064,9 @@ function ConceptPageView({ page }) {
 
       {/* Quick note */}
       <QuickNoteInline pageName={page.name} />
+
+      {/* Follow-up reads */}
+      <FollowUpReads pageName={page.name || page.pageName} onOpenPage={page._onOpenPage} />
     </div>
   );
 }
@@ -1113,6 +1116,45 @@ function QuickNoteInline({ pageName }) {
           </div>
         </div>
       )}
+    </div>
+  );
+}
+
+function FollowUpReads({ pageName, onOpenPage }) {
+  const [suggestions, setSuggestions] = useState(null);
+
+  useEffect(() => {
+    if (!pageName) return;
+    const history = JSON.parse(localStorage.getItem("sw_read_history") || "[]")
+      .filter(n => n !== pageName).slice(0, 5);
+    const qs = history.length ? `?recently_read=${history.join(",")}` : "";
+    api(`/follow-up/${pageName}${qs}`)
+      .then(d => setSuggestions(d.suggestions || []))
+      .catch(() => setSuggestions([]));
+  }, [pageName]);
+
+  if (!suggestions || suggestions.length === 0) return null;
+
+  return (
+    <div className="pt-4 mt-4 border-t border-stone-100">
+      <p className="text-[10px] font-semibold text-stone-400 uppercase tracking-wider mb-2.5">Continue reading</p>
+      <div className="space-y-1.5">
+        {suggestions.map(s => (
+          <button key={s.name} onClick={() => onOpenPage?.(s.name)}
+            className="w-full text-left flex items-center justify-between gap-3 px-3 py-2.5 rounded-xl border border-stone-100 hover:border-orange-200 hover:bg-orange-50/40 transition-all group">
+            <div className="flex-1 min-w-0">
+              <div className="flex items-center gap-2">
+                <span className="text-sm font-medium text-stone-800 truncate group-hover:text-orange-700">{s.title}</span>
+                <span className="shrink-0 text-[10px] text-stone-400 bg-stone-100 px-1.5 py-0.5 rounded-full">{s.entry_count}</span>
+              </div>
+              <p className="text-[10px] text-stone-400 mt-0.5">{s.reason}</p>
+            </div>
+            <svg className="w-3.5 h-3.5 text-stone-300 group-hover:text-orange-400 shrink-0 transition-colors" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7"/>
+            </svg>
+          </button>
+        ))}
+      </div>
     </div>
   );
 }
@@ -1858,10 +1900,16 @@ function BrowseTab() {
 
   async function openPage(name) {
     setPageLoading(true);
+    // Track reading history in localStorage (last 8 pages)
+    const history = JSON.parse(localStorage.getItem("sw_read_history") || "[]")
+      .filter(n => n !== name).slice(0, 7);
+    history.unshift(name);
+    localStorage.setItem("sw_read_history", JSON.stringify(history));
+
     try {
       const data = await api(`/page/${name}`);
       setPageContent(data.content);
-      const parsed = data.parsed ? { ...data.parsed, backlinks: data.backlinks || [] } : null;
+      const parsed = data.parsed ? { ...data.parsed, backlinks: data.backlinks || [], pageName: name } : null;
       setParsedPage(parsed);
       setSelected(name);
     } catch { setPageContent("Failed to load page."); setParsedPage(null); setSelected(name); }
@@ -1946,7 +1994,7 @@ function BrowseTab() {
               Loading…
             </div>
           ) : parsedPage && folder === "concepts" ? (
-            <ConceptPageView page={parsedPage} />
+            <ConceptPageView page={{ ...parsedPage, _onOpenPage: openPage }} />
           ) : (
             <div className="space-y-3">
               {parseContentChunks(pageContent).map((chunk, i) =>
