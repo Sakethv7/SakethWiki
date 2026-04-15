@@ -1,7 +1,10 @@
 # Environment & secrets
 .env
-*.env
-.env.*
+.env.local
+.env.*.local
+# Keep .env.example files (they have no real secrets)
+!.env.example
+!**/.env.*.example
 
 # Python
 __pycache__/
