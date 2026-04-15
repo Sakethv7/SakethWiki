@@ -1,8 +1,8 @@
 # SakethWiki
 
-A personal knowledge system for capturing things learned in the wild — X/Twitter bookmarks, blogs, course snippets, Instagram tech content — and building a compounding Obsidian vault.
+A personal knowledge system for capturing things learned in the wild — X/Twitter bookmarks, blogs, course snippets, screenshots — and building a compounding, evolving Obsidian vault.
 
-**Vault location:** `/Users/sakethv7/Documents/SakethWiki/`
+**Vault location:** `~/SakethVault` (home dir — avoids macOS TCC restrictions for dock-launched apps)
 
 ---
 
@@ -10,46 +10,80 @@ A personal knowledge system for capturing things learned in the wild — X/Twitt
 
 - **Backend:** FastAPI + Python, running on port 8001
 - **Frontend:** React + Vite, Tailwind CSS (CDN), running on port 5173
-- **LLMs:** claude-sonnet-4-6 (extraction) + claude-haiku-4-5 (formatting + chat)
+- **LLMs:** `claude-sonnet-4-5` (extraction) · `claude-haiku-4-5` (evolution analysis, chat, formatting)
 - **Storage:** Flat Markdown files — no database, no embeddings
 
 ---
 
 ## Setup
 
-### 1. Install Python dependencies
+### 1. Clone and install Python dependencies
 
 ```bash
-cd /Users/sakethv7/Sakethwiki
-pip install -r requirements.txt
+git clone https://github.com/Sakethv7/SakethWiki.git
+cd SakethWiki
+cd backend && python3 -m venv venv && source venv/bin/activate
+pip install -r ../requirements.txt
 ```
 
-### 2. Set environment variable
+### 2. Configure environment
 
 ```bash
-export ANTHROPIC_API_KEY=your_key_here
-export VAULT_PATH=/Users/sakethv7/Documents/SakethWiki
+cp .env.example .env
+# Edit .env — set ANTHROPIC_API_KEY and VAULT_PATH
 ```
 
-Or add both to your shell profile (`~/.zshrc`).
-
-### 3. Start the backend
+### 3. Create the vault structure
 
 ```bash
-cd /Users/sakethv7/Sakethwiki/backend
-python main.py
-# or: uvicorn main:app --host 0.0.0.0 --port 8001 --reload
+mkdir -p ~/SakethVault/_wiki/{concepts,sources,insights,meta}
 ```
 
-### 4. Install frontend dependencies and start
+### 4. Start the backend
 
 ```bash
-cd /Users/sakethv7/Sakethwiki/frontend
+cd backend
+source venv/bin/activate
+uvicorn main:app --host 0.0.0.0 --port 8001
+```
+
+### 5. Start the frontend
+
+```bash
+cd frontend
 npm install
 npm run dev
 ```
 
-Frontend will be at: http://localhost:5173
+Frontend at: http://localhost:5173
+
+---
+
+## macOS Dock App
+
+An `.applescript` launcher is included. It starts the backend via uvicorn, serves the frontend build, and opens the app in a frameless browser window.
+
+```bash
+# Build frontend first
+cd frontend && npm run build
+
+# Then open SakethWiki.applescript in Script Editor and export as Application
+```
+
+> **Note:** The vault must live in `~/` (not `~/Documents/`) to avoid macOS TCC permission blocks when launching from the dock.
+
+---
+
+## iPhone Access via Tailscale
+
+1. Install [Tailscale](https://tailscale.com) on your Mac and iPhone, log in with the same account
+2. Find your Mac's Tailscale IP: `tailscale ip -4` (e.g. `100.x.y.z`)
+3. Create `frontend/.env.local`:
+   ```
+   VITE_API_URL=http://100.x.y.z:8001
+   ```
+4. Rebuild: `cd frontend && npm run build`
+5. Access on iPhone: `http://100.x.y.z:5173`
 
 ---
 
@@ -58,19 +92,24 @@ Frontend will be at: http://localhost:5173
 | Method | Path | Description |
 |--------|------|-------------|
 | POST | `/ingest` | Fetch URL or accept text/image, extract metadata, stage to queue |
-| GET | `/queue` | List all pending HITL items |
+| GET | `/queue` | List all pending review items |
 | POST | `/approve/{id}` | Approve or reject a queued item |
-| POST | `/chat` | Chat with your wiki (keyword-matched RAG) |
-| GET | `/pages` | List all concept pages with metadata |
-| GET | `/page/{name}` | Full content of a concept page |
+| POST | `/chat` | Chat with your wiki (keyword-matched context + Claude) |
+| GET | `/pages?folder=` | List pages in a folder (concepts, sources, insights, meta) |
+| GET | `/page/{name}` | Full content + parsed structured data for a page |
+| DELETE | `/page/{name}` | Delete a page |
+| POST | `/fix-page/{name}` | Normalise wikilinks and update entry count |
+| POST | `/health-check` | Analyse vault for issues and suggest fixes |
+| POST | `/consolidate` | Merge two concept pages into one |
+| POST | `/ingest-text` | Ingest plain text directly (no URL fetch) |
 
 ### POST /ingest
 
 ```json
 {
   "url": "https://example.com/article",
-  "text": "optional extra text",
-  "image_base64": "optional base64 PNG"
+  "text": "optional extra context",
+  "images": [{ "data": "<base64>", "mediaType": "image/png" }]
 }
 ```
 
@@ -79,9 +118,12 @@ Frontend will be at: http://localhost:5173
 ```json
 {
   "approved": true,
-  "redirect_note": "optional note"
+  "open_thread": false,
+  "edits": { "title": "...", "summary": [], "tags": [], "suggested_page": "..." }
 }
 ```
+
+Set `open_thread: true` to add a `deep-dive` tag to the saved concept page — marks it for deeper research and surfaces it under the 🔍 Want more filter in Browse.
 
 ### POST /chat
 
@@ -92,56 +134,28 @@ Frontend will be at: http://localhost:5173
 }
 ```
 
----
-
-## iPhone Access via Tailscale
-
-1. Install [Tailscale](https://tailscale.com) on your Mac and iPhone
-2. Log in with the same account on both devices
-3. Find your Mac's Tailscale IP: `tailscale ip -4` (e.g. `100.x.y.z`)
-4. Edit `frontend/src/App.jsx`, line 3:
-   ```js
-   const API = "http://100.x.y.z:8001";  // your Mac's Tailscale IP
-   ```
-5. Rebuild the frontend: `npm run build && npm run preview`
-6. Access on iPhone: `http://100.x.y.z:4173`
-
-The backend (`0.0.0.0:8001`) is already bound to all interfaces and will be reachable on Tailscale.
-
----
-
-## Running the End-to-End Test
-
-```bash
-cd /Users/sakethv7/Sakethwiki
-# Make sure backend is running first
-python test_ingest.py
-```
-
-The test will:
-1. Ingest Lilian Weng's AI Agents blog post
-2. Show the diff preview
-3. Auto-approve and write to vault
-4. Confirm the `.md` file exists and print its content
-5. Chat: "what do I know about AI agents?"
+Asking "what do I know about X" returns a structured `knowledge_card` alongside the answer.
 
 ---
 
 ## Vault Structure
 
 ```
-/Users/sakethv7/Documents/SakethWiki/
+~/SakethVault/
 └── _wiki/
-    ├── concepts/       ← RAG.md, agents.md, kv-cache.md ...
-    ├── sources/        ← one .md per URL ingested
-    ├── index.md        ← auto-maintained index
-    └── log.md          ← append-only operation log
+    ├── concepts/     ← One .md per concept — evolves over time
+    ├── sources/      ← One .md per URL ingested (immutable record)
+    ├── insights/     ← Synthesised insight pages
+    ├── meta/         ← System pages (index, log)
+    └── index.md      ← Auto-rebuilt on every write
 ```
-
-Concept pages compound — each new ingest for the same concept **appends** a new `##` section. Pages are never overwritten.
 
 ---
 
-## Architecture
+## Running Tests
 
-See [CONCEPTS.md](CONCEPTS.md) for full architecture diagram, data flow, model assignment rationale, and design decisions.
+```bash
+cd backend
+source venv/bin/activate
+pytest tests/
+```
