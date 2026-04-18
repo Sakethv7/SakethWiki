@@ -1,6 +1,7 @@
 {
   "DevTools": "ops",
   "Engineering": "ops",
+  "Learning": "training",
   "Product": "meta",
   "Systems": "ops"
 }

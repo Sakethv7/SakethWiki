@@ -151,6 +151,63 @@ The understanding block is **rewritten** on each approval (not appended to), so 
 
 ---
 
+## Health Check & Vault Automation
+
+The system can autonomously scan the vault for structural issues and suggest (or directly apply) fixes:
+
+### Issues Detected
+
+| Issue Type | Detection | Automation |
+|-----------|-----------|-----------|
+| **Inconsistencies** | Semantic contradictions between 2+ pages (e.g., conflicting definitions) | Auto-merge via `/consolidate` if 2-page match; manual fix + "Mark done" otherwise |
+| **Missing Connections** | Page A discusses topic B but doesn't link to it (contextual gap analysis) | Auto-insert wikilink via `/add-link` |
+| **Suggested Articles** | Concept mentioned but no dedicated page exists | Auto-create stub via `/create-stub` for manual fill-in |
+| **Orphaned Pages** | Page exists but nothing links to it | Mark done after manual investigation |
+| **Quick Wins** | Wikilink normalization, sorting by date | Auto-apply via `Apply` button |
+
+### Health Check Workflow
+
+```
+GET /lint
+  ↓
+Returns: health_score (0-100), category_scores, {inconsistencies, missing_connections, suggested_articles, orphaned_pages}
+  ↓
+Frontend loads ackedMap from localStorage (persists across sessions)
+  ↓
+buildActions() generates three automation types:
+  • add-link: from_page → to_page (missing connections)
+  • create-stub: slug + reason (suggested articles)
+  • consolidate: primary_page, duplicate_page (inconsistencies)
+  ↓
+User selects checkboxes → clicks "Apply"
+  ↓
+applySelected() calls backend endpoints:
+  • POST /add-link { from_page, to_page }
+  • POST /create-stub { slug, reason }
+  • POST /consolidate { primary_page, duplicate_page }
+  ↓
+Files modified, ackedMap updated with timestamp + status badge
+  ↓
+Persistence: localStorage survives refresh + re-runs (content-keyed hashing)
+```
+
+### State Persistence
+
+Health check item state persists via `ackedMap` (localStorage):
+- **Key:** `_healthKey(text)` — content-based SHA1 hash (survives re-runs)
+- **Value:** `{status: "applied"|"noted", timestamp, action_type}`
+- **Lifecycle:** Generated on health check run → marked as "applied" or "noted" → persists across sessions
+
+This allows items to be dismissed even if the health check re-identifies them (e.g., "I manually fixed this orphan page" → "Mark done" → badge persists).
+
+### Automation Levels
+
+- **Level 1 (Fully Automatic):** Quick wins + missing connections + suggested articles + 2-page inconsistencies
+- **Level 2 (Semi-Automatic):** User clicks "Mark done" on items they've manually addressed
+- **Level 3 (Manual Review):** Orphaned pages, non-paired inconsistencies, edge cases requiring judgment
+
+---
+
 ## Self-Learning Trace System
 
 ### How it works

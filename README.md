@@ -99,7 +99,9 @@ cd frontend && npm run build
 | GET | `/page/{name}` | Full content + parsed structured data for a page |
 | DELETE | `/page/{name}` | Delete a page |
 | POST | `/fix-page/{name}` | Normalise wikilinks and update entry count |
-| POST | `/health-check` | Analyse vault for issues and suggest fixes |
+| **GET** | **`/lint`** | **Scan vault for structural issues (health check) and return report** |
+| **POST** | **`/add-link`** | **Auto-insert wikilink from one page to another** |
+| **POST** | **`/create-stub`** | **Create minimal stub page for missing concept** |
 | POST | `/consolidate` | Merge two concept pages into one |
 | POST | `/ingest-text` | Ingest plain text directly (no URL fetch) |
 | POST | `/analyze-traces` | Run weekly self-learning analysis on approval traces |
@@ -137,6 +139,53 @@ Set `open_thread: true` to add a `deep-dive` tag to the saved concept page — m
 ```
 
 Asking "what do I know about X" returns a structured `knowledge_card` alongside the answer.
+
+### GET /lint
+
+**Health Check — Scans entire vault for structural issues.** Returns report with:
+
+```json
+{
+  "health_score": 61,
+  "category_scores": {...},
+  "inconsistencies": [{"pages": ["page1", "page2"], "issue": "..."}],
+  "missing_connections": [{"from_page": "X", "to_page": "Y", "reason": "..."}],
+  "suggested_articles": [{"title": "...", "reason": "..."}],
+  "orphaned_pages": ["page_name", ...]
+}
+```
+
+**Frontend:** Click "Health" button in Browse tab to run, then use checkboxes to auto-apply fixes via `/add-link`, `/create-stub`, `/consolidate`.
+
+### POST /add-link
+
+**Auto-insert wikilink from one page to another.**
+
+```json
+{
+  "from_page": "inference",
+  "to_page": "cpu-vs-gpu-for-ml"
+}
+```
+
+Response: `{"added": true, "message": "Added [[cpu-vs-gpu-for-ml]] to inference"}`
+
+Appends to existing "See also:" line or creates new section. Idempotent — won't duplicate existing links.
+
+### POST /create-stub
+
+**Create minimal stub page so it can be filled in later via Capture.**
+
+```json
+{
+  "slug": "auto-differentiation",
+  "reason": "Referenced in gradient-descent but no dedicated page"
+}
+```
+
+Response: `{"created": true, "slug": "auto-differentiation", "message": "Created stub page 'Auto Differentiation'"}`
+
+Creates file with frontmatter (`tags: []`, `entry_count: 0`, `understanding_version: 1`) and placeholder text pointing to Capture for content.
 
 ---
 
