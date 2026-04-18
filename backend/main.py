@@ -1907,6 +1907,82 @@ async def fix_page(page_name: str):
     }
 
 
+# ── POST /add-link ────────────────────────────────────────────────────────────
+
+class AddLinkRequest(BaseModel):
+    from_page: str
+    to_page: str
+
+@app.post("/add-link")
+async def add_link(req: AddLinkRequest):
+    """
+    Insert [[to_page]] wikilink into from_page.
+    Appends to an existing 'See also:' line or creates one at the end.
+    Zero LLM — pure string manipulation.
+    """
+    import re
+    vault_path = Path(os.environ.get("VAULT_PATH", "/Users/sakethv7/SakethVault"))
+    concepts_dir = vault_path / "_wiki" / "concepts"
+    from_file = concepts_dir / f"{req.from_page}.md"
+    if not from_file.exists():
+        raise HTTPException(404, f"Page '{req.from_page}' not found")
+
+    content = from_file.read_text(encoding="utf-8")
+    link = f"[[{req.to_page}]]"
+
+    if link in content:
+        return {"added": False, "message": "Link already exists"}
+
+    # Append to existing 'See also:' line if present
+    if re.search(r"^See also:", content, re.MULTILINE):
+        content = re.sub(r"(^See also:.*)", rf"\1 {link}", content, flags=re.MULTILINE)
+    else:
+        content = content.rstrip() + f"\n\nSee also: {link}\n"
+
+    _atomic_write_path(from_file, content)
+    return {"added": True, "message": f"Added {link} to {req.from_page}"}
+
+
+# ── POST /create-stub ─────────────────────────────────────────────────────────
+
+class CreateStubRequest(BaseModel):
+    slug: str
+    reason: str = ""
+
+@app.post("/create-stub")
+async def create_stub(req: CreateStubRequest):
+    """
+    Create a minimal stub concept page so it can be filled later via Capture.
+    Zero LLM — pure template fill.
+    """
+    vault_path = Path(os.environ.get("VAULT_PATH", "/Users/sakethv7/SakethVault"))
+    concepts_dir = vault_path / "_wiki" / "concepts"
+    slug = req.slug.lower().replace(" ", "-")
+    slug = _re.sub(r"[^\w-]", "", slug)
+    file_path = concepts_dir / f"{slug}.md"
+
+    if file_path.exists():
+        raise HTTPException(409, f"Page '{slug}' already exists")
+
+    today = datetime.now().strftime("%Y-%m-%d")
+    title = slug.replace("-", " ").title()
+    reason_line = f"\n> *Created from health check: {req.reason}*" if req.reason else ""
+
+    content = f"""---
+title: "{title}"
+tags: []
+entry_count: 0
+last_updated: {today}
+understanding_version: 1
+---
+
+> **Current understanding** 🔵
+> Stub — no entries yet. Add content via Capture.{reason_line}
+"""
+    _atomic_write_path(file_path, content)
+    return {"created": True, "slug": slug, "message": f"Created stub page '{title}'"}
+
+
 # ── utilities ─────────────────────────────────────────────────────────────────
 
 async def _weekly_analysis_scheduler():

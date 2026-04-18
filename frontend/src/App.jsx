@@ -1265,7 +1265,19 @@ function buildActions(report, onFix, existingPages = new Set()) {
       actions.push({ key: `inc-${i}`, type: "merge", label: `Merge ${pages[0]} + ${pages[1]}: ${inc.issue}`, source: pages[0], target: pages[1] });
     }
   });
-  // missing_connections: read-only — not added here, rendered separately without Apply button
+  // missing_connections: now auto-applicable via /add-link
+  (report.missing_connections || []).forEach((c, i) => {
+    if (pageExists(c.from_page)) {
+      actions.push({ key: `conn-${i}`, type: "add-link", label: `${c.from_page}->${c.to_page}:${c.reason}`, from_page: c.from_page, to_page: c.to_page });
+    }
+  });
+  // suggested_articles: auto-create stub pages via /create-stub
+  (report.suggested_articles || []).forEach((a, i) => {
+    const slug = a.title.toLowerCase().replace(/\s+/g, "-").replace(/[^\w-]/g, "");
+    if (!pageExists(slug)) {
+      actions.push({ key: `art-${i}`, type: "create-stub", label: `article:${a.title}`, slug, reason: a.reason });
+    }
+  });
   return actions;
 }
 
@@ -1360,6 +1372,10 @@ function LintPanel({ onClose, onConsolidate, onFix }) {
           await api("/consolidate", { method: "POST", body: JSON.stringify({ source: action.source, target: action.target }) });
         } else if (action.type === "fix") {
           await api(`/fix-page/${encodeURIComponent(action.page)}`, { method: "POST" });
+        } else if (action.type === "add-link") {
+          await api("/add-link", { method: "POST", body: JSON.stringify({ from_page: action.from_page, to_page: action.to_page }) });
+        } else if (action.type === "create-stub") {
+          await api("/create-stub", { method: "POST", body: JSON.stringify({ slug: action.slug, reason: action.reason }) });
         }
         markAcked(action.label, "applied");
         setSelected(prev => { const n = new Set(prev); n.delete(action.key); return n; });
@@ -1431,8 +1447,8 @@ function LintPanel({ onClose, onConsolidate, onFix }) {
 
             {/* Legend */}
             <div className="flex flex-wrap gap-x-4 gap-y-1 text-[10px] text-stone-400 border-t border-stone-100 pt-2">
-              <span>⚡ <span className="text-stone-500">Quick wins</span> — selectable, auto-applied via Apply button</span>
-              <span>⚠ 🔗 📝 🏝 — read-only insights, mark done manually after you fix them</span>
+              <span>⚡ 🔗 📝 — checkbox = auto-applied via Apply button</span>
+              <span>⚠ 🏝 — mark done after you fix manually</span>
             </div>
 
             {report.quick_wins?.length > 0 && (
@@ -1495,20 +1511,26 @@ function LintPanel({ onClose, onConsolidate, onFix }) {
 
             {report.missing_connections?.length > 0 && (
               <div>
-                <p className="text-xs font-semibold text-stone-600 mb-1.5">🔗 Missing connections <span className="font-normal text-stone-400 ml-1">— add [[wikilinks]] manually, then mark done</span></p>
+                <p className="text-xs font-semibold text-stone-600 mb-1.5">🔗 Missing connections <span className="font-normal text-stone-400 ml-1">— auto-inserts See also: [[link]] into the page</span></p>
                 <ul className="space-y-1.5">
                   {report.missing_connections.map((c, i) => {
+                    const key = `conn-${i}`;
+                    const action = actions.find(a => a.key === key);
                     const itemText = `${c.from_page}->${c.to_page}:${c.reason}`;
-                    const acked = ackedInfo(itemText);
+                    const acked = ackedInfo(action ? action.label : itemText);
                     const isDone = !!acked;
                     return (
                       <li key={i} className={`text-xs flex items-start gap-2 ${isDone ? "opacity-40" : "text-stone-600"}`}>
-                        <span className="w-3.5 shrink-0" />
+                        {action && !isDone ? (
+                          <input type="checkbox" checked={selected.has(key)} onChange={() => toggleAction(key)}
+                            className="mt-0.5 shrink-0 accent-orange-500 cursor-pointer" />
+                        ) : <span className="w-3.5 shrink-0" />}
                         <span className={`flex-1 ${isDone ? "line-through" : ""}`}><span className="font-mono">[[{c.from_page}]]</span> → <span className="font-mono">[[{c.to_page}]]</span>: {c.reason}</span>
                         {isDone
                           ? <span className="shrink-0 text-emerald-600 text-[10px] whitespace-nowrap">✓ {acked.status} {acked.date}</span>
-                          : <button onClick={() => markAcked(itemText, "noted")} className="shrink-0 text-[10px] text-stone-400 hover:text-stone-600 border border-stone-200 rounded px-1">Mark done</button>
+                          : !action && <button onClick={() => markAcked(itemText, "noted")} className="shrink-0 text-[10px] text-stone-400 hover:text-stone-600 border border-stone-200 rounded px-1">Mark done</button>
                         }
+                        {currentKey === key && <span className="shrink-0 text-orange-500 text-[10px]">linking…</span>}
                       </li>
                     );
                   })}
@@ -1518,20 +1540,26 @@ function LintPanel({ onClose, onConsolidate, onFix }) {
 
             {report.suggested_articles?.length > 0 && (
               <div>
-                <p className="text-xs font-semibold text-stone-600 mb-1.5">📝 Suggested articles <span className="font-normal text-stone-400 ml-1">— capture via Capture tab, then mark done</span></p>
+                <p className="text-xs font-semibold text-stone-600 mb-1.5">📝 Suggested articles <span className="font-normal text-stone-400 ml-1">— creates a stub page so the concept exists; fill via Capture later</span></p>
                 <ul className="space-y-1">
                   {report.suggested_articles.map((a, i) => {
+                    const key = `art-${i}`;
+                    const action = actions.find(ac => ac.key === key);
                     const itemText = `article:${a.title}`;
-                    const acked = ackedInfo(itemText);
+                    const acked = ackedInfo(action ? action.label : itemText);
                     const isDone = !!acked;
                     return (
                       <li key={i} className={`text-xs flex items-start gap-2 ${isDone ? "opacity-40" : "text-stone-600"}`}>
-                        <span className="w-3.5 shrink-0" />
+                        {action && !isDone ? (
+                          <input type="checkbox" checked={selected.has(key)} onChange={() => toggleAction(key)}
+                            className="mt-0.5 shrink-0 accent-orange-500 cursor-pointer" />
+                        ) : <span className="w-3.5 shrink-0" />}
                         <span className={`flex-1 ${isDone ? "line-through" : ""}`}><span className="font-medium">{a.title}</span>: {a.reason}</span>
                         {isDone
-                          ? <span className="shrink-0 text-emerald-600 text-[10px] whitespace-nowrap">✓ {acked.date}</span>
-                          : <button onClick={() => markAcked(itemText, "noted")} className="shrink-0 text-[10px] text-stone-400 hover:text-stone-600 border border-stone-200 rounded px-1">Mark done</button>
+                          ? <span className="shrink-0 text-emerald-600 text-[10px] whitespace-nowrap">✓ {acked.status} {acked.date}</span>
+                          : !action && <button onClick={() => markAcked(itemText, "noted")} className="shrink-0 text-[10px] text-stone-400 hover:text-stone-600 border border-stone-200 rounded px-1">Mark done</button>
                         }
+                        {currentKey === key && <span className="shrink-0 text-orange-500 text-[10px]">creating…</span>}
                       </li>
                     );
                   })}
