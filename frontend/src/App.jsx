@@ -1222,6 +1222,24 @@ function KnowledgeCard({ card }) {
 
 // ── BROWSE TAB ────────────────────────────────────────────────────────────────
 
+// Stable key from item text — survives re-runs (same suggestion = same key)
+function _healthKey(text) {
+  let h = 0;
+  for (let i = 0; i < Math.min(text.length, 120); i++) {
+    h = (Math.imul(31, h) + text.charCodeAt(i)) | 0;
+  }
+  return "hk_" + Math.abs(h).toString(36);
+}
+
+// localStorage helpers — persist acked/applied items across sessions
+const LS_HEALTH = "sw_health_acked";
+function loadHealthAcked() {
+  try { return JSON.parse(localStorage.getItem(LS_HEALTH) || "{}"); } catch { return {}; }
+}
+function saveHealthAcked(map) {
+  try { localStorage.setItem(LS_HEALTH, JSON.stringify(map)); } catch {}
+}
+
 // Build a flat list of all AUTO-APPLICABLE actions from a lint report.
 // missing_connections are intentionally excluded — /fix-page can't insert wikilinks,
 // so showing Apply for them was misleading. They display as read-only hints.
@@ -1258,11 +1276,25 @@ function LintPanel({ onClose, onConsolidate, onFix }) {
   const [saved, setSaved] = useState(false);
   const [error, setError] = useState("");
   const [selected, setSelected] = useState(new Set());
-  const [doneKeys, setDoneKeys] = useState(new Set());
+  // ackedMap: { stableKey: { status: "applied"|"noted", date: "YYYY-MM-DD" } }
+  // persisted to localStorage so it survives refreshes and re-runs
+  const [ackedMap, setAckedMap] = useState(() => loadHealthAcked());
   const [applyingAll, setApplyingAll] = useState(false);
   const [applyProgress, setApplyProgress] = useState({ done: 0, total: 0 });
   const [currentKey, setCurrentKey] = useState(null);
   const [existingPages, setExistingPages] = useState(new Set());
+
+  function markAcked(text, status) {
+    const key = _healthKey(text);
+    const date = new Date().toISOString().slice(0, 10);
+    setAckedMap(prev => {
+      const next = { ...prev, [key]: { status, date } };
+      saveHealthAcked(next);
+      return next;
+    });
+  }
+  function isAcked(text) { return !!ackedMap[_healthKey(text)]; }
+  function ackedInfo(text) { return ackedMap[_healthKey(text)] || null; }
 
   // Load cached result immediately on open — no Sonnet call
   useEffect(() => {
@@ -1277,10 +1309,9 @@ function LintPanel({ onClose, onConsolidate, onFix }) {
       .catch(() => {});
   }, []);
 
-  // Reset selections when report changes
+  // Reset selections when report changes (but keep ackedMap — it's content-keyed)
   useEffect(() => {
     setSelected(new Set());
-    setDoneKeys(new Set());
   }, [report]);
 
   async function runLint(save = false) {
@@ -1297,7 +1328,7 @@ function LintPanel({ onClose, onConsolidate, onFix }) {
   const scoreBg = s => s >= 80 ? "bg-emerald-50 border-emerald-100" : s >= 60 ? "bg-amber-50 border-amber-100" : "bg-red-50 border-red-100";
 
   const actions = report ? buildActions(report, onFix, existingPages) : [];
-  const pendingActions = actions.filter(a => !doneKeys.has(a.key));
+  const pendingActions = actions.filter(a => !isAcked(a.label));
   const allSelected = pendingActions.length > 0 && pendingActions.every(a => selected.has(a.key));
 
   function toggleAction(key) {
@@ -1317,7 +1348,7 @@ function LintPanel({ onClose, onConsolidate, onFix }) {
   }
 
   async function applySelected() {
-    const toApply = actions.filter(a => selected.has(a.key) && !doneKeys.has(a.key));
+    const toApply = actions.filter(a => selected.has(a.key) && !isAcked(a.label));
     const total = toApply.length;
     setApplyingAll(true);
     setApplyProgress({ done: 0, total });
@@ -1330,7 +1361,7 @@ function LintPanel({ onClose, onConsolidate, onFix }) {
         } else if (action.type === "fix") {
           await api(`/fix-page/${encodeURIComponent(action.page)}`, { method: "POST" });
         }
-        setDoneKeys(prev => new Set([...prev, action.key]));
+        markAcked(action.label, "applied");
         setSelected(prev => { const n = new Set(prev); n.delete(action.key); return n; });
         setApplyProgress(prev => ({ ...prev, done: prev.done + 1 }));
       } catch (e) {
@@ -1398,22 +1429,32 @@ function LintPanel({ onClose, onConsolidate, onFix }) {
               </div>
             )}
 
+            {/* Legend */}
+            <div className="flex flex-wrap gap-x-4 gap-y-1 text-[10px] text-stone-400 border-t border-stone-100 pt-2">
+              <span>⚡ <span className="text-stone-500">Quick wins</span> — selectable, auto-applied via Apply button</span>
+              <span>⚠ 🔗 📝 🏝 — read-only insights, mark done manually after you fix them</span>
+            </div>
+
             {report.quick_wins?.length > 0 && (
               <div>
-                <p className="text-xs font-semibold text-stone-600 mb-1.5">⚡ Quick wins</p>
+                <p className="text-xs font-semibold text-stone-600 mb-1.5">⚡ Quick wins <span className="font-normal text-stone-400 ml-1">— auto-applicable</span></p>
                 <ul className="space-y-1.5">
                   {report.quick_wins.map((w, i) => {
                     const key = `win-${i}`;
                     const action = actions.find(a => a.key === key);
-                    const isDone = doneKeys.has(key);
+                    const acked = ackedInfo(action ? action.label : w);
+                    const isDone = !!acked;
                     return (
-                      <li key={i} className={`text-xs flex items-start gap-2 ${isDone ? "opacity-40 line-through" : "text-stone-600"}`}>
+                      <li key={i} className={`text-xs flex items-start gap-2 ${isDone ? "opacity-40" : "text-stone-600"}`}>
                         {action && !isDone ? (
                           <input type="checkbox" checked={selected.has(key)} onChange={() => toggleAction(key)}
                             className="mt-0.5 shrink-0 accent-orange-500 cursor-pointer" />
                         ) : <span className="w-3.5 shrink-0" />}
-                        <span className="flex-1">• {w}</span>
-                        {isDone && <span className="shrink-0 text-emerald-600">✓</span>}
+                        <span className={`flex-1 ${isDone ? "line-through" : ""}`}>• {w}</span>
+                        {isDone
+                          ? <span className="shrink-0 text-emerald-600 text-[10px] whitespace-nowrap">✓ {acked.status} {acked.date}</span>
+                          : !action && <button onClick={() => markAcked(w, "noted")} className="shrink-0 text-[10px] text-stone-400 hover:text-stone-600 border border-stone-200 rounded px-1">Mark done</button>
+                        }
                         {currentKey === key && <span className="shrink-0 text-orange-500 text-[10px]">running…</span>}
                       </li>
                     );
@@ -1424,21 +1465,26 @@ function LintPanel({ onClose, onConsolidate, onFix }) {
 
             {report.inconsistencies?.length > 0 && (
               <div>
-                <p className="text-xs font-semibold text-red-600 mb-1.5">⚠ Inconsistencies</p>
+                <p className="text-xs font-semibold text-red-600 mb-1.5">⚠ Inconsistencies <span className="font-normal text-stone-400 ml-1">— edit pages manually, then mark done</span></p>
                 <ul className="space-y-1.5">
                   {report.inconsistencies.map((inc, i) => {
                     const pages = Array.isArray(inc.pages) ? inc.pages : [inc.pages];
                     const key = `inc-${i}`;
                     const action = actions.find(a => a.key === key);
-                    const isDone = doneKeys.has(key);
+                    const itemText = `${pages.join("+")}:${inc.issue}`;
+                    const acked = ackedInfo(action ? action.label : itemText);
+                    const isDone = !!acked;
                     return (
-                      <li key={i} className={`text-xs flex items-start gap-2 ${isDone ? "opacity-40 line-through" : "text-stone-600"}`}>
+                      <li key={i} className={`text-xs flex items-start gap-2 ${isDone ? "opacity-40" : "text-stone-600"}`}>
                         {action && !isDone ? (
                           <input type="checkbox" checked={selected.has(key)} onChange={() => toggleAction(key)}
                             className="mt-0.5 shrink-0 accent-orange-500 cursor-pointer" />
                         ) : <span className="w-3.5 shrink-0" />}
-                        <span className="flex-1"><span className="font-medium not-italic">{pages.join(" + ")}</span>: {inc.issue}</span>
-                        {isDone && <span className="shrink-0 text-emerald-600">✓</span>}
+                        <span className={`flex-1 ${isDone ? "line-through" : ""}`}><span className="font-medium">{pages.join(" + ")}</span>: {inc.issue}</span>
+                        {isDone
+                          ? <span className="shrink-0 text-emerald-600 text-[10px] whitespace-nowrap">✓ {acked.status} {acked.date}</span>
+                          : <button onClick={() => markAcked(action ? action.label : itemText, "noted")} className="shrink-0 text-[10px] text-stone-400 hover:text-stone-600 border border-stone-200 rounded px-1">Mark done</button>
+                        }
                         {currentKey === key && <span className="shrink-0 text-orange-500 text-[10px]">merging…</span>}
                       </li>
                     );
@@ -1449,21 +1495,20 @@ function LintPanel({ onClose, onConsolidate, onFix }) {
 
             {report.missing_connections?.length > 0 && (
               <div>
-                <p className="text-xs font-semibold text-stone-600 mb-1.5">🔗 Missing connections</p>
+                <p className="text-xs font-semibold text-stone-600 mb-1.5">🔗 Missing connections <span className="font-normal text-stone-400 ml-1">— add [[wikilinks]] manually, then mark done</span></p>
                 <ul className="space-y-1.5">
                   {report.missing_connections.map((c, i) => {
-                    const key = `conn-${i}`;
-                    const action = actions.find(a => a.key === key);
-                    const isDone = doneKeys.has(key);
+                    const itemText = `${c.from_page}->${c.to_page}:${c.reason}`;
+                    const acked = ackedInfo(itemText);
+                    const isDone = !!acked;
                     return (
-                      <li key={i} className={`text-xs flex items-start gap-2 ${isDone ? "opacity-40 line-through" : "text-stone-600"}`}>
-                        {action && !isDone ? (
-                          <input type="checkbox" checked={selected.has(key)} onChange={() => toggleAction(key)}
-                            className="mt-0.5 shrink-0 accent-orange-500 cursor-pointer" />
-                        ) : <span className="w-3.5 shrink-0" />}
-                        <span className="flex-1"><span className="font-mono not-italic">[[{c.from_page}]]</span> → <span className="font-mono">[[{c.to_page}]]</span>: {c.reason}</span>
-                        {isDone && <span className="shrink-0 text-emerald-600">✓</span>}
-                        {currentKey === key && <span className="shrink-0 text-orange-500 text-[10px]">fixing…</span>}
+                      <li key={i} className={`text-xs flex items-start gap-2 ${isDone ? "opacity-40" : "text-stone-600"}`}>
+                        <span className="w-3.5 shrink-0" />
+                        <span className={`flex-1 ${isDone ? "line-through" : ""}`}><span className="font-mono">[[{c.from_page}]]</span> → <span className="font-mono">[[{c.to_page}]]</span>: {c.reason}</span>
+                        {isDone
+                          ? <span className="shrink-0 text-emerald-600 text-[10px] whitespace-nowrap">✓ {acked.status} {acked.date}</span>
+                          : <button onClick={() => markAcked(itemText, "noted")} className="shrink-0 text-[10px] text-stone-400 hover:text-stone-600 border border-stone-200 rounded px-1">Mark done</button>
+                        }
                       </li>
                     );
                   })}
@@ -1473,24 +1518,44 @@ function LintPanel({ onClose, onConsolidate, onFix }) {
 
             {report.suggested_articles?.length > 0 && (
               <div>
-                <p className="text-xs font-semibold text-stone-600 mb-1.5">📝 Suggested articles</p>
+                <p className="text-xs font-semibold text-stone-600 mb-1.5">📝 Suggested articles <span className="font-normal text-stone-400 ml-1">— capture via Capture tab, then mark done</span></p>
                 <ul className="space-y-1">
-                  {report.suggested_articles.map((a, i) => (
-                    <li key={i} className="text-xs text-stone-600">
-                      <span className="font-medium">{a.title}</span>: {a.reason}
-                    </li>
-                  ))}
+                  {report.suggested_articles.map((a, i) => {
+                    const itemText = `article:${a.title}`;
+                    const acked = ackedInfo(itemText);
+                    const isDone = !!acked;
+                    return (
+                      <li key={i} className={`text-xs flex items-start gap-2 ${isDone ? "opacity-40" : "text-stone-600"}`}>
+                        <span className="w-3.5 shrink-0" />
+                        <span className={`flex-1 ${isDone ? "line-through" : ""}`}><span className="font-medium">{a.title}</span>: {a.reason}</span>
+                        {isDone
+                          ? <span className="shrink-0 text-emerald-600 text-[10px] whitespace-nowrap">✓ {acked.date}</span>
+                          : <button onClick={() => markAcked(itemText, "noted")} className="shrink-0 text-[10px] text-stone-400 hover:text-stone-600 border border-stone-200 rounded px-1">Mark done</button>
+                        }
+                      </li>
+                    );
+                  })}
                 </ul>
               </div>
             )}
 
             {report.orphaned_pages?.length > 0 && (
               <div>
-                <p className="text-xs font-semibold text-stone-600 mb-1.5">🏝 Orphaned pages</p>
-                <div className="flex flex-wrap gap-1">
-                  {report.orphaned_pages.map((p, i) => (
-                    <span key={i} className="text-xs bg-stone-100 border border-stone-200 rounded-lg px-2 py-0.5 font-mono text-stone-500">{p}</span>
-                  ))}
+                <p className="text-xs font-semibold text-stone-600 mb-1.5">🏝 Orphaned pages <span className="font-normal text-stone-400 ml-1">— add [[links]] to them from other pages</span></p>
+                <div className="flex flex-wrap gap-1.5">
+                  {report.orphaned_pages.map((p, i) => {
+                    const itemText = `orphan:${p}`;
+                    const acked = ackedInfo(itemText);
+                    return acked ? (
+                      <span key={i} className="text-[10px] bg-emerald-50 border border-emerald-200 rounded-lg px-2 py-0.5 font-mono text-emerald-600 line-through opacity-50">{p}</span>
+                    ) : (
+                      <button key={i} onClick={() => markAcked(itemText, "noted")}
+                        className="text-xs bg-stone-100 border border-stone-200 rounded-lg px-2 py-0.5 font-mono text-stone-500 hover:bg-orange-50 hover:border-orange-200 hover:text-orange-700 transition-colors"
+                        title="Click to mark as acknowledged">
+                        {p}
+                      </button>
+                    );
+                  })}
                 </div>
               </div>
             )}
