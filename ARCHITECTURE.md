@@ -42,16 +42,22 @@
 
 **Flow:**
 ```
-URL/Text/Image
+URL/Text/Image/Screenshot
     ↓
-BeautifulSoup parse (URL) + Claude Sonnet extract
-    ↓
-Queue item: { id, title, summary, tags, suggested_page, wikilinks, diagram? }
+iOS User-Agent? → fast path (returns ~20ms)
+    ↓ yes                    ↓ no
+asyncio.create_task()   BeautifulSoup parse + Claude Sonnet extract (sync)
+    ↓                        ↓
+Queue item: { id, title, summary, tags, suggested_page, wikilinks, diagram?, status? }
     ↓
 Human Review (HITL Queue)
     ↓
 Approve → wiki_writer.py → Atomic file write → Vault + Trace
 ```
+
+**iOS fast path:** Detects `CFNetwork`/`Darwin`/`Shortcuts` in User-Agent. Returns HTTP 200 immediately with a "pending" queue item, then fires `_background_extract()` as a background task. When done, calls `queue_manager.update()` to patch the item in-place. On failure, marks `extraction_error`. Frontend polls every 3s and shows an "Extracting…" spinner badge until resolved.
+
+**Image paste & drag-and-drop:** Document-level `paste` listener captures clipboard images anywhere on the page (not just textarea focus). Drag-and-drop onto the capture card shows an orange highlight. Thumbnail click opens full-size. `+` tile adds more images. Images sent as base64 in `/ingest` payload.
 
 **Key design:** Zero LLM for parsing (BeautifulSoup only). Full LLM only for semantic extraction. All writes are atomic (write-to-temp → rename).
 
@@ -80,20 +86,32 @@ Next /ingest → reads Prompt Hints section → injects into extraction prompt
 
 **Cost:** ~$0.10-0.30/week (one Sonnet call). Trace logging is free (file append).
 
-### 3. Vault Health & Automation
+### 3. Vault Health & Automation (with Intelligent Caching)
 
-**Entry point:** `GET /lint` → Frontend Browse tab "Health" button
+**Entry point:** `POST /lint` with optional `force_refresh` → Frontend Browse tab "Health" button
 
 **Architecture:**
 
 ```
-┌─ /lint (GET) ─────────────────────────────────────────┐
-│ Scans entire vault with Claude Sonnet:               │
-│ - semantic inconsistencies (2+ page conflicts)        │
-│ - missing connections (contextual gaps)               │
-│ - suggested articles (concepts with no pages)         │
-│ - orphaned pages (no incoming links)                  │
-│ Returns: health_score, category_scores, issues       │
+┌─ /lint (POST) with cache ──────────────────────────────┐
+│                                                        │
+│ 1. Check cache validity:                              │
+│    - Is cache <24h old?                              │
+│    - MD5(pages_list) matches stored hash?            │
+│    - force_refresh=false?                            │
+│    ↓ YES → Return cached report (~8ms)               │
+│    ↓ NO  → Proceed to Sonnet scan                    │
+│                                                        │
+│ 2. Scans entire vault with Claude Sonnet (40s):       │
+│    - semantic inconsistencies (2+ page conflicts)    │
+│    - missing connections (contextual gaps)           │
+│    - suggested articles (concepts with no pages)     │
+│    - orphaned pages (no incoming links)              │
+│                                                        │
+│ 3. Save cache with metadata:                         │
+│    - Cache file: lint_cache.json                     │
+│    - Metadata: timestamp (ISO), pages_hash (MD5)     │
+│    - Return: report + from_cache: false              │
 └────────────────────────────────────────────────────────┘
      ↓
 ┌─ Frontend Health Check UI ──────────────────────────────┐
@@ -145,6 +163,121 @@ Return: {answer, knowledge_card?, sources}
 
 **Optimization:** Pre-filtered context (keyword search → top 5 pages) before LLM. Haiku is sufficient for Q&A; Sonnet reserved for extraction.
 
+### 5. Learning Dashboard
+
+**Entry point:** `GET /dashboard-stats`
+
+**Flow:**
+```
+GET /dashboard-stats
+    ↓
+Read traces.jsonl (all approval history)
+    ↓
+Filter to last 30 days, approved items only
+    ↓
+Calculate metrics:
+  - Activity timeline (entries by date)
+  - Learning velocity (entries/week, concepts/week)
+  - Tag frequency (top 10)
+  - Source type frequency
+  - New concepts this week
+    ↓
+Return: {
+  period_days: 30,
+  total_approved: number,
+  unique_concepts: number,
+  activity_by_date: {date: count, ...},
+  learning_velocity: {entries_per_week, concepts_per_week},
+  top_tags: [{tag, count}, ...],
+  top_sources: [{source, count}, ...],
+  new_concepts_this_week: number
+}
+```
+
+**Frontend Rendering:**
+- Compact 3-stat row: total approved · unique concepts · new this week
+- Activity heatmap: GitHub-style 16-week × 7-day grid (orange intensity scale)
+- Tag breakdown: Horizontal bars with orange fill, sorted by frequency
+- Source breakdown: Pill chips with emoji indicators
+- "Recently Read" section: last N unique reads (hidden when empty)
+
+**Cost:** $0 (file I/O only; no LLM calls)
+
+### 7. Recently Read
+
+**Entry points:** `POST /log-read`, `GET /recent-reads`
+
+**Flow:**
+```
+User navigates away from concept page (Back button or page switch)
+    ↓
+Frontend fires POST /log-read { page, duration_seconds }
+    ↓
+Backend appends {ts, concept, duration_seconds} to _wiki/meta/reads.jsonl
+    ↓
+GET /recent-reads → deduplicates by concept, returns last N (default 10)
+    ↓
+Dashboard "Recently Read" section renders the list (hidden when empty)
+```
+
+**Cost:** $0 (file append + sequential scan)
+
+### 8. Tag Normalization
+
+**Entry points:** `POST /normalize-tags`, `GET /tag-ontology`
+
+**Flow:**
+```
+Tags array (from queue item or UI)
+    ↓
+POST /normalize-tags { tags: [...] }
+    ↓
+Load _wiki/meta/tag-ontology.json (canonical tags + synonyms)
+    ↓
+Map each tag through synonym table (case-insensitive)
+    ↓
+Return { normalized: [...], mappings: {old: new, ...} }
+```
+
+**Frontend:** Tags auto-normalized before approve. Tag dropdown merges ontology canonical tags with VALID_TAGS. One-off vault cleanup script: `backend/normalize_vault_tags.py --dry-run`.
+
+**One-off script:** `python normalize_vault_tags.py` rewrites frontmatter tags across all concept pages using the ontology.
+
+---
+
+### 6. Understanding Maturity Scoring
+
+**Entry point:** `POST /calculate-maturity/{page}` or bulk `POST /calculate-all-maturity`
+
+**Flow:**
+```
+Concept page
+    ↓
+Calculate components:
+  - Source count (# of sections with entries)
+  - Recency score (days_since_update decay)
+  - Incoming links (backlink count from other pages)
+  - Evolution count (understanding_version)
+  - Contradiction count ([!warning] markers)
+    ↓
+Weighted formula:
+  (source_count / max) * 30 +
+  (recency_score / 100) * 20 +
+  (backlink_count / max) * 25 +
+  (evolution_count / max) * 15 +
+  (1 - contradiction_count / total) * 10
+    ↓
+Score: 0–100 (clamped)
+    ↓
+Update frontmatter: understanding_maturity: <score>
+    ↓
+Return: component breakdown + final score
+```
+
+**Display:** Progress meter on concept page (🟢 green ≥70, 🟡 amber ≥50, 🔴 red <50)
+
+**Cost:** $0 (file I/O only; no LLM calls)
+
 ---
 
 ## File & Data Structures
@@ -164,9 +297,12 @@ Return: {answer, knowledge_card?, sources}
 │   ├── insights/                     ← Synthesized pages
 │   ├── meta/
 │   │   ├── traces.jsonl              ← Approval history
+│   │   ├── reads.jsonl               ← Read log {ts, concept, duration_seconds}
 │   │   ├── system-insights.md        ← Weekly analysis output
 │   │   ├── index.md                  ← Auto-rebuilt vault index
-│   │   └── hitl_queue.json           ← Items awaiting review
+│   │   ├── hitl_queue.json           ← Items awaiting review
+│   │   ├── lint-cache.json           ← Cached health check report (<24h TTL)
+│   │   └── tag-ontology.json         ← Canonical tags + synonym map
 │   └── standards.md                  ← Wiki standards (health check rules)
 └── .obsidian/                        ← Obsidian config (optional)
 ```
@@ -308,11 +444,19 @@ last_evolution: 2026-04-18
 |-----------|------|---------|-------|
 | `/ingest` (URL fetch + extract) | $0.02-0.05 | 5-15s | Sonnet extraction |
 | `/chat` (Q&A) | $0.001-0.003 | 1-3s | Haiku answer |
-| `/lint` (full vault scan) | $0.05-0.10 | 10-30s | Sonnet scanning all pages |
+| `/lint` (full vault scan) | $0.05-0.10 | 30-40s | Sonnet scanning all pages |
+| `/lint` (cached) | $0 | <10ms | Return cached report (<24h old) |
+| `/dashboard-stats` (learning metrics) | $0 | 50-200ms | File I/O + aggregation |
 | `/add-link` (insert wikilink) | $0 | <100ms | File I/O only |
 | `/create-stub` (new page) | $0 | <50ms | File I/O only |
+| `/calculate-maturity` (single page) | $0 | 20-100ms | File I/O + backlink scanning |
+| `/calculate-all-maturity` (bulk) | $0 | 500ms-5s | Processes all pages sequentially |
 | `/analyze-traces` (weekly) | $0.10-0.30 | 30-60s | Weekly Sonnet analysis |
 | Trace logging | $0 | <1ms | File append only |
+| `/log-read` (read tracking) | $0 | <1ms | File append only |
+| `/recent-reads` (recent pages) | $0 | <5ms | Sequential scan of reads.jsonl |
+| `/normalize-tags` (tag map) | $0 | <5ms | Dict lookup against ontology |
+| `/ingest` (iOS fast path) | $0.02-0.05 | ~20ms (sync) | Background extraction fires async |
 
 ---
 

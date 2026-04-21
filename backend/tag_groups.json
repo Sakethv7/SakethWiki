@@ -2,6 +2,7 @@
   "DevTools": "ops",
   "Engineering": "ops",
   "Learning": "training",
+  "Mental-models": "meta",
   "Product": "meta",
   "Systems": "ops"
 }

@@ -133,7 +133,18 @@ function QueueSection({ onApproved, onExtractPreview }) {
 
   useEffect(() => {
     loadQueue();
-    const interval = setInterval(loadQueue, 10000);
+    // Poll every 3s while anything is still extracting, otherwise every 10s
+    let interval = setInterval(async () => {
+      const data = await api("/queue").catch(() => ({ items: [] }));
+      const queued = data.items || [];
+      setItems(queued);
+      setLoaded(true);
+      // Switch to slow poll once nothing is pending
+      if (!queued.some(i => i.pending_extraction)) {
+        clearInterval(interval);
+        interval = setInterval(loadQueue, 10000);
+      }
+    }, 3000);
     return () => clearInterval(interval);
   }, []);
 
@@ -245,7 +256,13 @@ function QueueSection({ onApproved, onExtractPreview }) {
               <div className="flex-1 min-w-0">
                 <div className="flex items-center gap-2 flex-wrap">
                   {isPending && (
-                    <span className="text-[10px] font-medium px-1.5 py-0.5 rounded bg-amber-100 text-amber-700">Share Sheet</span>
+                    <span className="flex items-center gap-1 text-[10px] font-medium px-1.5 py-0.5 rounded bg-amber-100 text-amber-700">
+                      <svg className="w-2.5 h-2.5 animate-spin" fill="none" viewBox="0 0 24 24"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"/><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/></svg>
+                      Extracting…
+                    </span>
+                  )}
+                  {item.extraction_error && !isPending && (
+                    <span className="text-[10px] font-medium px-1.5 py-0.5 rounded bg-red-100 text-red-600">Fetch failed</span>
                   )}
                   <span className="text-sm font-medium text-stone-800 truncate">{title}</span>
                 </div>
@@ -386,6 +403,30 @@ function IngestTab({ onApproved, onSwitchToChat }) {
   const [deepResearch, setDeepResearch] = useState(false);
   const fileRef = useRef();
   const [queueKey, setQueueKey] = useState(0);
+  const [ontologyTags, setOntologyTags] = useState([]);
+  const [dragOver, setDragOver] = useState(false);
+
+  useEffect(() => {
+    api("/tag-ontology").then(d => setOntologyTags(Object.keys(d))).catch(() => {});
+  }, []);
+
+  // Document-level paste: catches Cmd+V even when textarea isn't focused
+  useEffect(() => {
+    async function onDocPaste(e) {
+      const items = Array.from(e.clipboardData?.items || []);
+      const imgItems = items.filter(i => i.type.startsWith("image/"));
+      if (!imgItems.length) return;
+      e.preventDefault();
+      const files = imgItems.map(i => i.getAsFile()).filter(Boolean);
+      const newImgs = await Promise.all(files.map((f, i) =>
+        readFileAsImage(Object.assign(f, { name: f.name || `screenshot-${i + 1}.png` }))
+      ));
+      setImages(prev => [...prev, ...newImgs]);
+    }
+    document.addEventListener("paste", onDocPaste);
+    return () => document.removeEventListener("paste", onDocPaste);
+  }, []);
+
 
   function readFileAsImage(file) {
     return new Promise((resolve) => {
@@ -420,6 +461,34 @@ function IngestTab({ onApproved, onSwitchToChat }) {
     setImages(prev => [...prev, ...newImgs]);
   }
 
+  async function handleClipboardPaste() {
+    try {
+      const items = await navigator.clipboard.read();
+      const imgs = [];
+      for (const item of items) {
+        const imgType = item.types.find(t => t.startsWith("image/"));
+        if (imgType) {
+          const blob = await item.getType(imgType);
+          const file = new File([blob], `screenshot-${Date.now()}.png`, { type: imgType });
+          imgs.push(await readFileAsImage(file));
+        }
+      }
+      if (imgs.length) {
+        setImages(prev => [...prev, ...imgs]);
+      } else {
+        setError("No image in clipboard — copy a screenshot first.");
+        setTimeout(() => setError(""), 3000);
+      }
+    } catch (e) {
+      if (e.name === "NotAllowedError" || e.name === "SecurityError") {
+        fileRef.current?.click();
+      } else {
+        setError("Clipboard read failed — try dragging or attaching a file.");
+        setTimeout(() => setError(""), 3000);
+      }
+    }
+  }
+
   function removeImage(idx) { setImages(prev => prev.filter((_, i) => i !== idx)); }
 
   async function handleProcess() {
@@ -452,7 +521,15 @@ function IngestTab({ onApproved, onSwitchToChat }) {
     setApproving(true); setError("");
     try {
       const body = { approved, open_thread: approved && openThread };
-      if (approved && edits) body.edits = edits;
+      if (approved && edits) {
+        // Normalize tags before saving
+        try {
+          const norm = await api("/normalize-tags", { method: "POST", body: JSON.stringify({ tags: edits.tags }) });
+          body.edits = { ...edits, tags: norm.normalized };
+        } catch {
+          body.edits = edits;
+        }
+      }
       const data = await api(`/approve/${preview.id}`, { method: "POST", body: JSON.stringify(body) });
       const evoLabels = { extends: "🔵 extends understanding", refines: "🟡 refines understanding", supersedes: "🟠 supersedes old info", duplicates: "⚪ duplicate", contradicts: "🔴 contradiction flagged" };
       const evoMsg = data.evolution_type ? ` · ${evoLabels[data.evolution_type] || data.evolution_type}` : "";
@@ -483,7 +560,27 @@ function IngestTab({ onApproved, onSwitchToChat }) {
         </div>
       )}
 
-      <div className="bg-white rounded-2xl border border-stone-200 shadow-sm overflow-hidden">
+      <div
+        className={`bg-white rounded-2xl border shadow-sm overflow-hidden transition-colors ${dragOver ? "border-orange-400 ring-2 ring-orange-200" : "border-stone-200"}`}
+        onDragOver={e => { e.preventDefault(); setDragOver(true); }}
+        onDragLeave={() => setDragOver(false)}
+        onDrop={async e => {
+          e.preventDefault(); setDragOver(false);
+          const files = Array.from(e.dataTransfer.files).filter(f => f.type.startsWith("image/"));
+          if (!files.length) return;
+          const newImgs = await Promise.all(files.map((f, i) =>
+            readFileAsImage(Object.assign(f, { name: f.name || `image-${i + 1}.png` }))
+          ));
+          setImages(prev => [...prev, ...newImgs]);
+        }}
+      >
+        {dragOver && (
+          <div className="flex items-center justify-center gap-2 h-28 text-orange-500 text-sm font-medium pointer-events-none">
+            <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z"/></svg>
+            Drop image to capture
+          </div>
+        )}
+        {!dragOver && (
         <textarea
           className="w-full h-28 px-4 pt-4 text-sm text-stone-800 placeholder-stone-400 resize-none focus:outline-none"
           placeholder="Paste a URL, tweet, article, or notes… or paste a screenshot directly here"
@@ -491,27 +588,40 @@ function IngestTab({ onApproved, onSwitchToChat }) {
           onChange={(e) => setInput(e.target.value)}
           onPaste={handlePaste}
         />
+        )}
 
         {images.length > 0 && (
           <div className="flex flex-wrap gap-2 px-4 pb-3">
             {images.map((img, i) => (
-              <div key={i} className="relative group w-14 h-14 rounded-xl overflow-hidden border border-stone-200">
+              <div key={i} className="relative group w-16 h-16 rounded-xl overflow-hidden border border-stone-200 cursor-pointer"
+                onClick={() => window.open(img.previewUrl, "_blank")}>
                 <img src={img.previewUrl} alt={img.name} className="w-full h-full object-cover" />
-                <button onClick={() => removeImage(i)}
+                <button onClick={e => { e.stopPropagation(); removeImage(i); }}
                   className="absolute top-0.5 right-0.5 bg-stone-900/70 text-white rounded-full w-4 h-4 text-[10px] hidden group-hover:flex items-center justify-center">
                   ×
                 </button>
               </div>
             ))}
+            {/* Paste another via clipboard */}
+            <button onClick={handleClipboardPaste} title="Paste image from clipboard (or click to browse)"
+              className="w-16 h-16 rounded-xl border-2 border-dashed border-stone-200 text-stone-300 hover:border-orange-300 hover:text-orange-400 transition-colors flex items-center justify-center text-xl">
+              +
+            </button>
           </div>
         )}
 
         <div className="flex items-center justify-between gap-3 px-4 py-3 border-t border-stone-100 bg-stone-50/50">
-          <div className="flex items-center gap-3">
-            <button onClick={() => fileRef.current.click()}
-              className="flex items-center gap-1.5 text-xs text-stone-500 hover:text-stone-700 transition-colors">
+          <div className="flex items-center gap-2">
+            {/* Primary: clipboard paste */}
+            <button onClick={handleClipboardPaste}
+              className="flex items-center gap-1.5 text-xs text-stone-500 hover:text-orange-600 transition-colors font-medium">
+              <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2"/></svg>
+              {images.length ? `${images.length} img` : "Paste image"}
+            </button>
+            {/* Secondary: file picker */}
+            <button onClick={() => fileRef.current.click()} title="Browse files"
+              className="text-stone-400 hover:text-stone-600 transition-colors">
               <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M15.172 7l-6.586 6.586a2 2 0 102.828 2.828l6.414-6.586a4 4 0 00-5.656-5.656l-6.415 6.585a6 6 0 108.486 8.486L20.5 13"/></svg>
-              {images.length ? `${images.length} image${images.length > 1 ? "s" : ""} attached` : "Attach"}
             </button>
             <button onClick={() => setDeepResearch(v => !v)}
               title="Deep Research: analyzes content through 6 lenses"
@@ -560,11 +670,11 @@ function IngestTab({ onApproved, onSwitchToChat }) {
       {preview && display && (
         <div className="bg-white rounded-2xl border border-stone-200 shadow-sm overflow-hidden">
 
-          {/* Share Sheet badge */}
+          {/* Share Sheet badge — only shown if background extraction hasn't finished yet */}
           {preview.pending_extraction && (
             <div className="flex items-center gap-2 px-5 py-2.5 bg-amber-50 border-b border-amber-100">
-              <svg className="w-3.5 h-3.5 text-amber-500 shrink-0" fill="currentColor" viewBox="0 0 20 20"><path fillRule="evenodd" d="M8.257 3.099c.765-1.36 2.722-1.36 3.486 0l5.58 9.92c.75 1.334-.213 2.98-1.742 2.98H4.42c-1.53 0-2.493-1.646-1.743-2.98l5.58-9.92zM11 13a1 1 0 11-2 0 1 1 0 012 0zm-1-8a1 1 0 00-1 1v3a1 1 0 002 0V6a1 1 0 00-1-1z" clipRule="evenodd"/></svg>
-              <span className="text-xs text-amber-700 font-medium">Queued from Share Sheet — extraction runs on approve</span>
+              <svg className="w-3 h-3 text-amber-500 animate-spin shrink-0" fill="none" viewBox="0 0 24 24"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"/><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/></svg>
+              <span className="text-xs text-amber-700 font-medium">Extracting in background — check back in a moment</span>
             </div>
           )}
 
@@ -688,7 +798,7 @@ function IngestTab({ onApproved, onSwitchToChat }) {
                     defaultValue=""
                     onChange={e => { const v = e.target.value; if (v && !edits.tags.includes(v)) setEdit("tags", [...edits.tags, v]); e.target.value = ""; }}>
                     <option value="">+ tag</option>
-                    {VALID_TAGS.filter(t => !edits.tags.includes(t)).map(t => <option key={t}>{t}</option>)}
+                    {Array.from(new Set([...ontologyTags, ...VALID_TAGS])).filter(t => !edits.tags.includes(t)).sort().map(t => <option key={t}>{t}</option>)}
                   </select>
                 )}
               </div>
@@ -928,6 +1038,166 @@ const EVO_COLORS = {
 };
 const EVO_LABELS = { "🔵": "extends", "🟡": "refines", "🟠": "supersedes", "🔴": "contradicts", "⚪": "duplicate" };
 
+function SummaryModal({ pageName, onClose }) {
+  const [data, setData] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
+  const [revealed, setRevealed] = useState(new Set());
+
+  useEffect(() => {
+    api(`/generate-summary/${pageName}`, { method: "POST" })
+      .then(d => { setData(d); setLoading(false); })
+      .catch(e => { setError(e.message); setLoading(false); });
+  }, [pageName]);
+
+  function toggleReveal(i) {
+    setRevealed(prev => { const n = new Set(prev); n.has(i) ? n.delete(i) : n.add(i); return n; });
+  }
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-start justify-center bg-black/40 pt-10 px-4 overflow-y-auto">
+      <div className="w-full max-w-2xl bg-white rounded-2xl shadow-2xl flex flex-col max-h-[85vh] mb-10">
+        <div className="flex items-center justify-between px-5 py-3 border-b border-stone-100 shrink-0">
+          <span className="text-sm font-semibold text-stone-700">Study — {pageName}</span>
+          <button onClick={onClose} className="text-stone-400 hover:text-stone-600 transition-colors">
+            <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12"/></svg>
+          </button>
+        </div>
+        <div className="flex-1 overflow-y-auto p-5 space-y-5">
+          {loading && (
+            <div className="flex items-center gap-2 text-sm text-stone-400 py-8 justify-center">
+              <svg className="w-4 h-4 animate-spin" fill="none" viewBox="0 0 24 24"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"/><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/></svg>
+              Generating study summary…
+            </div>
+          )}
+          {error && <p className="text-sm text-red-500">{error}</p>}
+          {data && (
+            <>
+              {/* One-liner */}
+              <div className="bg-emerald-50 border border-emerald-100 rounded-xl px-4 py-3">
+                <p className="text-xs font-semibold uppercase tracking-wide text-emerald-600 mb-1">Core idea</p>
+                <p className="text-sm font-medium text-emerald-900">{data.one_liner}</p>
+              </div>
+              {/* Paragraph */}
+              <div>
+                <p className="text-xs font-semibold uppercase tracking-wide text-stone-400 mb-1.5">In plain terms</p>
+                <p className="text-sm text-stone-700 leading-relaxed">{data.paragraph}</p>
+              </div>
+              {/* Prerequisites */}
+              {data.prerequisites?.length > 0 && (
+                <div>
+                  <p className="text-xs font-semibold uppercase tracking-wide text-stone-400 mb-1.5">Prerequisites</p>
+                  <div className="flex flex-wrap gap-1.5">
+                    {data.prerequisites.map(p => (
+                      <span key={p} className="text-xs px-2.5 py-1 bg-stone-100 text-stone-600 rounded-lg">{p}</span>
+                    ))}
+                  </div>
+                </div>
+              )}
+              {/* Diagram */}
+              {data.diagram && (
+                <div>
+                  <p className="text-xs font-semibold uppercase tracking-wide text-stone-400 mb-1.5">Structure</p>
+                  <MermaidDiagram chart={data.diagram} />
+                </div>
+              )}
+              {/* Self-test */}
+              {data.self_test?.length > 0 && (
+                <div>
+                  <p className="text-xs font-semibold uppercase tracking-wide text-stone-400 mb-2">Self-test</p>
+                  <div className="space-y-2">
+                    {data.self_test.map((qa, i) => (
+                      <div key={i} className="border border-stone-100 rounded-xl overflow-hidden">
+                        <button onClick={() => toggleReveal(i)}
+                          className="w-full flex items-start justify-between gap-3 px-4 py-2.5 text-left hover:bg-stone-50 transition-colors">
+                          <span className="text-sm text-stone-700">{qa.q}</span>
+                          <svg className={`w-4 h-4 text-stone-400 shrink-0 mt-0.5 transition-transform ${revealed.has(i) ? "rotate-180" : ""}`} fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7"/></svg>
+                        </button>
+                        {revealed.has(i) && (
+                          <div className="px-4 py-2.5 bg-stone-50 border-t border-stone-100 text-sm text-stone-600">
+                            {qa.a}
+                          </div>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function EditModal({ pageName, rawContent, onClose, onSaved }) {
+  const [draft, setDraft] = useState(() => {
+    // Strip frontmatter for editing
+    if (rawContent && rawContent.startsWith("---")) {
+      const end = rawContent.indexOf("---", 3);
+      if (end !== -1) return rawContent.slice(end + 3).replace(/^\n/, "");
+    }
+    return rawContent || "";
+  });
+  const [preview, setPreview] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [toast, setToast] = useState("");
+
+  async function handleSave() {
+    setSaving(true);
+    try {
+      await api(`/edit-page/${pageName}`, { method: "POST", body: JSON.stringify({ updated_content: draft }) });
+      setToast("Saved ✓");
+      setTimeout(() => { setToast(""); onSaved(); }, 1000);
+    } catch (e) {
+      setToast(`Error: ${e.message}`);
+      setTimeout(() => setToast(""), 3000);
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-start justify-center bg-black/40 pt-10 px-4">
+      <div className="w-full max-w-2xl bg-white rounded-2xl shadow-2xl flex flex-col max-h-[85vh]">
+        {/* Header */}
+        <div className="flex items-center justify-between px-5 py-3 border-b border-stone-100 shrink-0">
+          <span className="text-sm font-semibold text-stone-700">Edit — {pageName}</span>
+          <div className="flex items-center gap-2">
+            <button onClick={() => setPreview(p => !p)}
+              className={`text-xs px-3 py-1.5 rounded-lg border transition-colors ${preview ? "bg-stone-100 border-stone-300 text-stone-700" : "border-stone-200 text-stone-500 hover:bg-stone-50"}`}>
+              {preview ? "Editor" : "Preview"}
+            </button>
+            <button onClick={handleSave} disabled={saving}
+              className="text-xs px-3 py-1.5 rounded-lg bg-orange-500 text-white hover:bg-orange-600 disabled:opacity-50 transition-colors">
+              {saving ? "Saving…" : "Save"}
+            </button>
+            <button onClick={onClose} className="text-stone-400 hover:text-stone-600 text-lg leading-none px-1">✕</button>
+          </div>
+        </div>
+        {/* Body */}
+        <div className="flex-1 overflow-hidden">
+          {preview ? (
+            <div className="h-full overflow-y-auto p-5 prose prose-sm max-w-none text-stone-800"
+              dangerouslySetInnerHTML={{ __html: marked.parse(draft) }} />
+          ) : (
+            <textarea
+              className="w-full h-full resize-none p-5 font-mono text-xs text-stone-800 focus:outline-none"
+              value={draft}
+              onChange={e => setDraft(e.target.value)}
+              spellCheck={false}
+            />
+          )}
+        </div>
+        {toast && (
+          <div className="px-5 py-2 text-xs text-center border-t border-stone-100 text-emerald-600 font-medium">{toast}</div>
+        )}
+      </div>
+    </div>
+  );
+}
+
 function ConceptPageView({ page }) {
   const [expandedSections, setExpandedSections] = useState(new Set([0]));
   const toggleSection = i => setExpandedSections(prev => {
@@ -950,6 +1220,24 @@ function ConceptPageView({ page }) {
             <span className="text-xs font-semibold uppercase tracking-wide opacity-70">Current understanding</span>
           </div>
           <div className="flex items-center gap-1.5 shrink-0">
+            {page.understanding_maturity !== undefined && (
+              <>
+                <div title="Understanding maturity score" className="flex items-center gap-1 px-2 py-1 bg-white/50 rounded-lg">
+                  <span className="text-xs font-medium text-stone-700">{page.understanding_maturity}</span>
+                  <div className="w-16 h-1.5 bg-stone-200 rounded-full overflow-hidden">
+                    <div
+                      className={`h-full transition-colors ${
+                        page.understanding_maturity >= 70 ? "bg-emerald-500" :
+                        page.understanding_maturity >= 50 ? "bg-amber-500" :
+                        "bg-red-500"
+                      }`}
+                      style={{ width: `${page.understanding_maturity}%` }}
+                    />
+                  </div>
+                </div>
+                <span className="text-xs opacity-50">·</span>
+              </>
+            )}
             <span className="text-xs opacity-60">v{page.understanding_version}</span>
             <span className="text-xs opacity-50">·</span>
             <span className="text-xs opacity-60">{page.entry_count} {page.entry_count === 1 ? "source" : "sources"}</span>
@@ -1326,10 +1614,10 @@ function LintPanel({ onClose, onConsolidate, onFix }) {
     setSelected(new Set());
   }, [report]);
 
-  async function runLint(save = false) {
+  async function runLint(save = false, force_refresh = false) {
     setRunning(true); setError("");
     try {
-      const data = await api("/lint", { method: "POST", body: JSON.stringify({ save }) });
+      const data = await api("/lint", { method: "POST", body: JSON.stringify({ save, force_refresh }) });
       setReport(data);
       if (save) setSaved(true);
     } catch (e) { setError(e.message); }
@@ -1399,12 +1687,15 @@ function LintPanel({ onClose, onConsolidate, onFix }) {
         <div>
           <h3 className="text-sm font-semibold text-stone-800">Wiki Health Check</h3>
           {report?.ran_at && !running && (
-            <p className="text-[10px] text-stone-400 mt-0.5">Last run {report.ran_at}</p>
+            <p className={`text-[10px] mt-0.5 ${report.from_cache ? "text-amber-600" : "text-stone-400"}`}>
+              {report.from_cache && "📦 "} {report.from_cache ? "Cached " : "Last "}run {report.ran_at}
+            </p>
           )}
         </div>
         <div className="flex items-center gap-2">
-          <button onClick={() => runLint(false)} disabled={running}
-            className="text-xs px-2.5 py-1 rounded-lg border border-stone-200 text-stone-500 hover:bg-stone-50 disabled:opacity-40 transition-colors">
+          <button onClick={() => runLint(false, false)} disabled={running}
+            className="text-xs px-2.5 py-1 rounded-lg border border-stone-200 text-stone-500 hover:bg-stone-50 disabled:opacity-40 transition-colors"
+            title={report?.from_cache ? "Use cached report from last 24h" : "Run health check"}>
             {running ? (
               <span className="flex items-center gap-1">
                 <svg className="w-3 h-3 animate-spin" fill="none" viewBox="0 0 24 24"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"/><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/></svg>
@@ -1412,6 +1703,13 @@ function LintPanel({ onClose, onConsolidate, onFix }) {
               </span>
             ) : report ? "Re-run" : "Run"}
           </button>
+          {report?.from_cache && (
+            <button onClick={() => runLint(false, true)} disabled={running}
+              className="text-xs px-2.5 py-1 rounded-lg border border-amber-200 text-amber-600 hover:bg-amber-50 disabled:opacity-40 transition-colors"
+              title="Force refresh: re-run Sonnet scan, bypass cache">
+              🔄 Force
+            </button>
+          )}
           <button onClick={onClose} className="w-6 h-6 flex items-center justify-center text-stone-400 hover:text-stone-600 rounded-lg hover:bg-stone-100 text-xs">✕</button>
         </div>
       </div>
@@ -1952,13 +2250,18 @@ function BrowseTab() {
   const [consolidateModal, setConsolidateModal] = useState(null);
   const [fixing, setFixing] = useState({});
   const [deleting, setDeleting] = useState(null);
+  const [sortBy, setSortBy] = useState("updated"); // "updated", "name", "entry_count"
+  const [selectedTags, setSelectedTags] = useState(new Set()); // for tag filtering
+  const [showTagFilter, setShowTagFilter] = useState(false);
+  const [editModal, setEditModal] = useState(false);
+  const [summaryModal, setSummaryModal] = useState(null); // page name or null
 
   function reloadPages(f = folder) {
     api(`/pages?folder=${f}`).then(d => setPages(d.pages)).catch(() => {});
   }
 
   function switchFolder(f) {
-    setFolder(f); setSelected(null); setSearch(""); setDeepDiveFilter(false); setReviewFilter(false); reloadPages(f);
+    setFolder(f); setSelected(null); setSearch(""); setDeepDiveFilter(false); setReviewFilter(false); setSelectedTags(new Set()); setSortBy("updated"); reloadPages(f);
   }
 
   async function toggleReview() {
@@ -1991,6 +2294,8 @@ function BrowseTab() {
 
   const [parsedPage, setParsedPage] = useState(null);
 
+  const _readStartRef = useRef({});
+
   async function openPage(name) {
     setPageLoading(true);
     // Track reading history in localStorage (last 8 pages)
@@ -1998,6 +2303,15 @@ function BrowseTab() {
       .filter(n => n !== name).slice(0, 7);
     history.unshift(name);
     localStorage.setItem("sw_read_history", JSON.stringify(history));
+
+    // Log previous page's read duration before switching
+    const prev = selected;
+    if (prev && _readStartRef.current[prev]) {
+      const dur = Math.round((Date.now() - _readStartRef.current[prev]) / 1000);
+      api("/log-read", { method: "POST", body: JSON.stringify({ page: prev, duration_seconds: dur }) }).catch(() => {});
+      delete _readStartRef.current[prev];
+    }
+    _readStartRef.current[name] = Date.now();
 
     try {
       const data = await api(`/page/${name}`);
@@ -2007,6 +2321,13 @@ function BrowseTab() {
       setSelected(name);
     } catch { setPageContent("Failed to load page."); setParsedPage(null); setSelected(name); }
     finally { setPageLoading(false); }
+  }
+
+  async function handleRandom() {
+    try {
+      const data = await api("/random-concept");
+      if (data.name) openPage(data.name);
+    } catch {}
   }
 
   async function handleDelete(name, e) {
@@ -2036,7 +2357,28 @@ function BrowseTab() {
       const q = search.toLowerCase();
       return !q || p.title.toLowerCase().includes(q) || p.name.toLowerCase().includes(q) ||
         (p.tags || []).some(t => t.toLowerCase().includes(q));
+    })
+    .filter(p => {
+      // Tag filter: if selectedTags is not empty, page must have at least one selected tag
+      if (selectedTags.size === 0) return true;
+      return (p.tags || []).some(t => selectedTags.has(t));
+    })
+    .sort((a, b) => {
+      // Sorting
+      if (sortBy === "name") {
+        return (a.title || a.name).localeCompare(b.title || b.name);
+      } else if (sortBy === "entry_count") {
+        return (b.entry_count || 0) - (a.entry_count || 0);
+      } else {
+        // "updated" — sort by last_updated date descending (newest first)
+        const dateA = new Date(a.last_updated || 0).getTime();
+        const dateB = new Date(b.last_updated || 0).getTime();
+        return dateB - dateA;
+      }
     });
+
+  // Extract unique tags from all pages for tag filter UI
+  const allTags = Array.from(new Set(pages.flatMap(p => p.tags || []))).sort();
 
   function parseContentChunks(md) {
     const parts = md.split(/```mermaid\n?([\s\S]*?)```/g);
@@ -2057,7 +2399,14 @@ function BrowseTab() {
       <div className="h-full flex flex-col">
         {/* Header */}
         <div className="flex items-center gap-2 mb-4 pb-3 border-b border-stone-100 shrink-0">
-          <button onClick={() => { setSelected(null); setParsedPage(null); }}
+          <button onClick={() => {
+            if (selected && _readStartRef.current[selected]) {
+              const dur = Math.round((Date.now() - _readStartRef.current[selected]) / 1000);
+              api("/log-read", { method: "POST", body: JSON.stringify({ page: selected, duration_seconds: dur }) }).catch(() => {});
+              delete _readStartRef.current[selected];
+            }
+            setSelected(null); setParsedPage(null);
+          }}
             className="flex items-center gap-1.5 text-sm text-stone-500 hover:text-stone-800 transition-colors">
             <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 19l-7-7 7-7"/></svg>
             Back
@@ -2066,10 +2415,20 @@ function BrowseTab() {
           <span className="text-sm font-medium text-stone-700 flex-1 truncate">{selected}</span>
           <div className="flex items-center gap-1">
             {folder === "concepts" && (
-              <button onClick={() => handleFix(selected)} disabled={fixing[selected]}
-                className="text-xs px-2.5 py-1 border border-stone-200 text-stone-500 rounded-lg hover:bg-stone-50 disabled:opacity-40 transition-colors">
-                {fixing[selected] ? "…" : "Fix"}
-              </button>
+              <>
+                <button onClick={() => handleFix(selected)} disabled={fixing[selected]}
+                  className="text-xs px-2.5 py-1 border border-stone-200 text-stone-500 rounded-lg hover:bg-stone-50 disabled:opacity-40 transition-colors">
+                  {fixing[selected] ? "…" : "Fix"}
+                </button>
+                <button onClick={() => setSummaryModal(selected)}
+                  className="text-xs px-2.5 py-1 border border-emerald-100 text-emerald-600 rounded-lg hover:bg-emerald-50 transition-colors">
+                  Study
+                </button>
+                <button onClick={() => setEditModal(true)}
+                  className="text-xs px-2.5 py-1 border border-blue-100 text-blue-500 rounded-lg hover:bg-blue-50 transition-colors">
+                  Edit
+                </button>
+              </>
             )}
             <button onClick={() => {
               handleDelete(selected, { stopPropagation: () => {} });
@@ -2105,6 +2464,17 @@ function BrowseTab() {
             onClose={() => setConsolidateModal(null)}
             onDone={() => { setConsolidateModal(null); setSelected(null); reloadPages(); }} />
         )}
+        {editModal && (
+          <EditModal
+            pageName={selected}
+            rawContent={pageContent}
+            onClose={() => setEditModal(false)}
+            onSaved={() => { setEditModal(false); openPage(selected); }}
+          />
+        )}
+        {summaryModal && (
+          <SummaryModal pageName={summaryModal} onClose={() => setSummaryModal(null)} />
+        )}
       </div>
     );
   }
@@ -2120,6 +2490,10 @@ function BrowseTab() {
         <div className="flex gap-1.5">
           {folder === "concepts" && (
             <>
+              <button onClick={handleRandom}
+                className="text-xs px-3 py-1.5 rounded-xl border border-stone-200 text-stone-500 hover:bg-stone-50 transition-colors">
+                🎲 Random
+              </button>
               <button onClick={() => setDeepDiveFilter(v => !v)}
                 className={`text-xs px-3 py-1.5 rounded-xl border transition-colors ${deepDiveFilter ? "bg-orange-500 text-white border-orange-500" : "border-orange-200 text-orange-500 hover:bg-orange-50"}`}>
                 🔍 Want more
@@ -2177,15 +2551,77 @@ function BrowseTab() {
         ))}
       </div>
 
-      {/* Search */}
-      <div className="relative mb-3">
-        <svg className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-stone-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"/></svg>
-        <input
-          className="w-full pl-9 pr-4 py-2 bg-white border border-stone-200 rounded-xl text-sm placeholder-stone-400 focus:outline-none focus:ring-2 focus:ring-orange-200 focus:border-orange-300"
-          placeholder={`Search ${folder}…`}
-          value={search}
-          onChange={e => setSearch(e.target.value)}
-        />
+      {/* Search and filters */}
+      <div className="space-y-3 mb-3">
+        {/* Search input */}
+        <div className="relative">
+          <svg className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-stone-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"/></svg>
+          <input
+            className="w-full pl-9 pr-4 py-2 bg-white border border-stone-200 rounded-xl text-sm placeholder-stone-400 focus:outline-none focus:ring-2 focus:ring-orange-200 focus:border-orange-300"
+            placeholder={`Search ${folder}…`}
+            value={search}
+            onChange={e => setSearch(e.target.value)}
+          />
+        </div>
+
+        {/* Filter and sort controls */}
+        <div className="flex gap-2">
+          {/* Tag filter dropdown */}
+          <div className="relative flex-1">
+            <button
+              onClick={() => setShowTagFilter(!showTagFilter)}
+              className="w-full flex items-center justify-between px-3 py-2 bg-white border border-stone-200 rounded-xl text-sm text-stone-700 hover:border-stone-300 transition-colors"
+            >
+              <span className="flex items-center gap-1">
+                🏷️ Tags
+                {selectedTags.size > 0 && (
+                  <span className="ml-1 text-xs bg-orange-100 text-orange-700 px-1.5 py-0.5 rounded">
+                    {selectedTags.size}
+                  </span>
+                )}
+              </span>
+              <svg className={`w-4 h-4 transition-transform ${showTagFilter ? "rotate-180" : ""}`} fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 14l-7 7m0 0l-7-7m7 7V3" />
+              </svg>
+            </button>
+            {showTagFilter && allTags.length > 0 && (
+              <div className="absolute top-full left-0 right-0 mt-1 bg-white border border-stone-200 rounded-xl shadow-lg z-10 max-h-60 overflow-y-auto">
+                <div className="p-2 space-y-1">
+                  {allTags.map(tag => (
+                    <label key={tag} className="flex items-center gap-2 px-2 py-1.5 hover:bg-stone-50 rounded cursor-pointer text-sm">
+                      <input
+                        type="checkbox"
+                        checked={selectedTags.has(tag)}
+                        onChange={e => {
+                          const newTags = new Set(selectedTags);
+                          if (e.target.checked) {
+                            newTags.add(tag);
+                          } else {
+                            newTags.delete(tag);
+                          }
+                          setSelectedTags(newTags);
+                        }}
+                        className="w-4 h-4 rounded border-stone-300 text-orange-600 focus:ring-orange-200"
+                      />
+                      <span className="text-stone-700">{tag}</span>
+                    </label>
+                  ))}
+                </div>
+              </div>
+            )}
+          </div>
+
+          {/* Sort dropdown */}
+          <select
+            value={sortBy}
+            onChange={e => setSortBy(e.target.value)}
+            className="px-3 py-2 bg-white border border-stone-200 rounded-xl text-sm text-stone-700 hover:border-stone-300 transition-colors focus:outline-none focus:ring-2 focus:ring-orange-200"
+          >
+            <option value="updated">Updated</option>
+            <option value="name">Name</option>
+            <option value="entry_count">Entries</option>
+          </select>
+        </div>
       </div>
 
       {/* Pages list */}
@@ -2258,6 +2694,203 @@ function BrowseTab() {
   );
 }
 
+// ── DASHBOARD TAB ─────────────────────────────────────────────────────────────
+
+function RecentlyRead() {
+  const [reads, setReads] = useState([]);
+
+  useEffect(() => {
+    api("/recent-reads?limit=5").then(d => setReads(d.reads || [])).catch(() => {});
+  }, []);
+
+  if (reads.length === 0) return null;
+
+  function fmtAge(ts) {
+    const diffMs = Date.now() - new Date(ts + "Z").getTime();
+    const diffMin = Math.floor(diffMs / 60000);
+    if (diffMin < 1) return "just now";
+    if (diffMin < 60) return `${diffMin}m ago`;
+    const diffHr = Math.floor(diffMin / 60);
+    if (diffHr < 24) return `${diffHr}h ago`;
+    return `${Math.floor(diffHr / 24)}d ago`;
+  }
+
+  return (
+    <div className="bg-white border border-stone-200 rounded-lg p-4">
+      <h3 className="text-sm font-semibold text-stone-900 mb-3">Recently Read</h3>
+      <div className="space-y-2">
+        {reads.map((r, i) => (
+          <div key={i} className="flex items-center justify-between">
+            <span className="text-sm text-stone-700 truncate flex-1">{r.concept}</span>
+            <div className="flex items-center gap-2 shrink-0 ml-2">
+              {r.duration_seconds > 0 && (
+                <span className="text-[10px] text-stone-400">{r.duration_seconds}s</span>
+              )}
+              <span className="text-xs text-stone-400">{fmtAge(r.ts)}</span>
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function DashboardTab() {
+  const [stats, setStats] = useState(null);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    async function loadStats() {
+      try {
+        const data = await api("/dashboard-stats");
+        setStats(data);
+      } catch (err) {
+        console.error("Failed to load dashboard stats:", err);
+      } finally {
+        setLoading(false);
+      }
+    }
+    loadStats();
+  }, []);
+
+  if (loading) return <div className="text-stone-500 py-8">Loading learning metrics…</div>;
+  if (!stats) return <div className="text-red-600 py-8">Failed to load dashboard stats.</div>;
+
+  // Build a 16-week × 7-day heatmap grid (most recent week on the right)
+  const heatmapWeeks = 16;
+  const activityMap = stats.activity_by_date || {};
+  const maxCell = Math.max(...Object.values(activityMap), 1);
+  // Anchor: today (local)
+  const today = new Date(); today.setHours(0,0,0,0);
+  // Find the Sunday of the current week
+  const todayDow = today.getDay(); // 0=Sun
+  const gridEnd = new Date(today); gridEnd.setDate(today.getDate() - todayDow + 6); // Saturday of this week
+  // Build columns: week 0 = oldest (left), week 15 = newest (right)
+  const cols = [];
+  for (let w = heatmapWeeks - 1; w >= 0; w--) {
+    const days = [];
+    for (let d = 0; d < 7; d++) {
+      const cell = new Date(gridEnd);
+      cell.setDate(gridEnd.getDate() - w * 7 - (6 - d));
+      const key = cell.toISOString().slice(0, 10);
+      const count = activityMap[key] || 0;
+      const isFuture = cell > today;
+      days.push({ key, count, isFuture, date: cell });
+    }
+    cols.push(days);
+  }
+  // Month labels: show month name when a col's Sunday crosses a month boundary
+  const DAY_LABELS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+  function heatColor(count, isFuture) {
+    if (isFuture) return "bg-stone-100";
+    if (count === 0) return "bg-stone-100";
+    const ratio = count / maxCell;
+    if (ratio < 0.25) return "bg-orange-200";
+    if (ratio < 0.5)  return "bg-orange-300";
+    if (ratio < 0.75) return "bg-orange-400";
+    return "bg-orange-500";
+  }
+
+  const maxTagCount = stats.top_tags.length > 0 ? stats.top_tags[0].count : 1;
+
+  return (
+    <div className="space-y-5 pb-8">
+      {/* Stats row */}
+      <div className="grid grid-cols-3 gap-3">
+        <div className="bg-white border border-stone-200 rounded-xl p-3 text-center">
+          <div className="text-2xl font-bold text-orange-500">{stats.new_concepts_this_week}</div>
+          <div className="text-[10px] text-stone-500 mt-0.5 leading-tight">concepts<br/>this week</div>
+        </div>
+        <div className="bg-white border border-stone-200 rounded-xl p-3 text-center">
+          <div className="text-2xl font-bold text-blue-500">{stats.learning_velocity.entries_per_week}</div>
+          <div className="text-[10px] text-stone-500 mt-0.5 leading-tight">entries<br/>/ week</div>
+        </div>
+        <div className="bg-white border border-stone-200 rounded-xl p-3 text-center">
+          <div className="text-2xl font-bold text-purple-500">{stats.unique_concepts}</div>
+          <div className="text-[10px] text-stone-500 mt-0.5 leading-tight">concepts<br/>touched</div>
+        </div>
+      </div>
+
+      {/* Recently Read */}
+      <RecentlyRead />
+
+      {/* Contribution heatmap */}
+      <div className="bg-white border border-stone-200 rounded-xl p-4">
+        <h3 className="text-sm font-semibold text-stone-900 mb-3">Ingestion activity</h3>
+        <div className="flex gap-1">
+          {/* Day-of-week labels */}
+          <div className="flex flex-col gap-0.5 mr-0.5">
+            {DAY_LABELS.map((d, i) => (
+              <div key={d} className={`h-3 text-[8px] text-stone-400 flex items-center ${i % 2 === 1 ? "opacity-100" : "opacity-0"}`} style={{width: 20}}>
+                {d}
+              </div>
+            ))}
+          </div>
+          {/* Grid columns */}
+          <div className="flex gap-0.5 flex-1 overflow-hidden">
+            {cols.map((days, wi) => (
+              <div key={wi} className="flex flex-col gap-0.5 flex-1">
+                {days.map(({ key, count, isFuture }) => (
+                  <div key={key}
+                    title={count > 0 ? `${key}: ${count} ${count === 1 ? "entry" : "entries"}` : key}
+                    className={`h-3 rounded-sm ${heatColor(count, isFuture)} cursor-default`} />
+                ))}
+              </div>
+            ))}
+          </div>
+        </div>
+        <div className="flex items-center justify-end gap-1 mt-2">
+          <span className="text-[9px] text-stone-400">less</span>
+          {["bg-stone-100","bg-orange-200","bg-orange-300","bg-orange-400","bg-orange-500"].map(c => (
+            <div key={c} className={`w-2.5 h-2.5 rounded-sm ${c}`} />
+          ))}
+          <span className="text-[9px] text-stone-400">more</span>
+        </div>
+      </div>
+
+      {/* Top Tags */}
+      {stats.top_tags.length > 0 && (
+        <div className="bg-white border border-stone-200 rounded-xl p-4">
+          <h3 className="text-sm font-semibold text-stone-900 mb-3">Top tags</h3>
+          <div className="space-y-2">
+            {stats.top_tags.slice(0, 8).map((item) => (
+              <div key={item.tag} className="flex items-center gap-2">
+                <span className="text-xs text-stone-600 w-20 shrink-0 truncate">{item.tag}</span>
+                <div className="flex-1 h-2 bg-stone-100 rounded-full overflow-hidden">
+                  <div
+                    className="h-full bg-orange-400 rounded-full transition-all"
+                    style={{ width: `${(item.count / maxTagCount) * 100}%` }}
+                  />
+                </div>
+                <span className="text-xs text-stone-400 w-4 text-right shrink-0">{item.count}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* Sources */}
+      {stats.top_sources.length > 0 && (
+        <div className="bg-white border border-stone-200 rounded-xl p-4">
+          <h3 className="text-sm font-semibold text-stone-900 mb-3">Sources</h3>
+          <div className="flex flex-wrap gap-2">
+            {stats.top_sources.map((item) => {
+              const sourceEmoji = { tweet: "𝕏", article: "📄", video: "📺", blog: "✍️", paper: "📜", unknown: "❓" };
+              return (
+                <div key={item.source} className="flex items-center gap-1.5 bg-stone-50 border border-stone-200 rounded-lg px-3 py-1.5">
+                  <span className="text-sm">{sourceEmoji[item.source] || "🔗"}</span>
+                  <span className="text-xs text-stone-600 capitalize">{item.source}</span>
+                  <span className="text-xs font-semibold text-stone-800">{item.count}</span>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 // ── APP SHELL ─────────────────────────────────────────────────────────────────
 
 const TABS = [
@@ -2269,6 +2902,9 @@ const TABS = [
   )},
   { id: "browse", label: "Browse", icon: (
     <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10"/></svg>
+  )},
+  { id: "dashboard", label: "Dashboard", icon: (
+    <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z"/></svg>
   )},
 ];
 
@@ -2351,6 +2987,7 @@ export default function App() {
               <BrowseTab />
             </div>
           )}
+          {tab === "dashboard" && <DashboardTab />}
         </div>
       </main>
     </div>

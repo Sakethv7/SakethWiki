@@ -213,25 +213,41 @@ async def generate_summary(page: str):
 ## 📋 Implementation Sequence
 
 ### Week 1
-1. Learning Dashboard (1-2 days) → get metacognition immediately
-2. Search/filter on Browse (2 hours) → usability
+1. ✅ Learning Dashboard (1-2 days) → get metacognition immediately
+2. ✅ Search/filter on Browse (2 hours) → usability
 3. Quick wins polish (3-4 hours in parallel) → feels better
-4. Maturity scoring (1 day) → confidence signal
+4. ✅ Maturity scoring (1 day) → confidence signal
 
 ### Week 2
-1. Health check caching (1-2 days) → save money & time
+1. ✅ Health check caching (1-2 days) → save money & time
 2. Better queue management (1-2 days) → handle growth
-3. Auto-summaries (2-3 days) → new capability
+3. ✅ Auto-summaries (2-3 days) → new capability
 
 ### Week 3
-1. Inline editing (2-3 days) → reduce friction
+1. ✅ Inline editing (2-3 days) → reduce friction
 2. Evolution timeline (1 day) → better understanding
-3. Tag hierarchy (2-3 days) → scale-ready taxonomy
+3. ✅ Tag hierarchy (2-3 days) → scale-ready taxonomy
 
 ### Week 4
 1. Polish based on feedback
 2. Bug fixes discovered during implementation
 3. Start next batch
+
+---
+
+## ✅ Recently Shipped (Session — 2026-04-21)
+
+| Feature | Notes |
+|---------|-------|
+| Recently Read | `POST /log-read` + `GET /recent-reads`, reads.jsonl, Dashboard section |
+| Inline Concept Editing | `POST /edit-page/{name}`, EditModal with preview + git commit |
+| Tag Normalizer | tag-ontology.json, `POST /normalize-tags`, `GET /tag-ontology`, auto-normalize on approve |
+| Dashboard Redesign | GitHub-style 16×7 orange heatmap, compact stat row, source pill chips |
+| iOS Shortcut Fast Path | ~20ms return, background asyncio extraction, "Extracting…" spinner, 3s polls |
+| Image Paste & Drag-Drop | Document-level paste, drag-and-drop with orange highlight, thumbnail preview |
+| Random Concept | `GET /random-concept`, 🎲 button in Browse |
+| Study Summaries | `POST /generate-summary/{name}`, one-liner + Q&A + mermaid diagram modal |
+| Tag Vault Cleanup Script | `normalize_vault_tags.py --dry-run` / apply |
 
 ---
 

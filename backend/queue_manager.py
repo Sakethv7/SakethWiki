@@ -51,3 +51,14 @@ def remove(item_id: str) -> bool:
         return False
     _write(new_items)
     return True
+
+
+def update(item_id: str, updated: dict) -> bool:
+    """Replace a queue item in-place (used by background extraction)."""
+    items = _read()
+    for i, item in enumerate(items):
+        if item.get("id") == item_id:
+            items[i] = updated
+            _write(items)
+            return True
+    return False

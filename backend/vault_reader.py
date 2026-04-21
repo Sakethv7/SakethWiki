@@ -282,6 +282,7 @@ def parse_concept_page(page_name: str) -> Optional[dict]:
         "title": meta.get("title", page_name.replace("-", " ").title()),
         "tags": meta.get("tags", []) if isinstance(meta.get("tags"), list) else [],
         "understanding_version": int(meta.get("understanding_version", 1)),
+        "understanding_maturity": int(meta.get("understanding_maturity", 0)) if meta.get("understanding_maturity") else None,
         "last_evolution": meta.get("last_evolution", ""),
         "last_updated": meta.get("last_updated", ""),
         "entry_count": int(meta.get("entry_count", len(sections))),

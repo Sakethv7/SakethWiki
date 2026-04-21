@@ -11,6 +11,7 @@ GET  /page/{name} — full content of a concept page
 import base64
 import json
 import os
+import random
 import re as _re
 import uuid
 from datetime import datetime
@@ -31,7 +32,7 @@ if _env_path.exists():
 import anthropic
 import httpx
 from bs4 import BeautifulSoup
-from fastapi import FastAPI, HTTPException, Response
+from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -115,6 +116,7 @@ class SaveAnswerRequest(BaseModel):
 
 class LintRequest(BaseModel):
     save: bool = False  # write lint report to _wiki/insights/ if True
+    force_refresh: bool = False  # if True, bypass cache and re-run Sonnet scan
 
 
 class ConsolidateRequest(BaseModel):
@@ -124,12 +126,17 @@ class ConsolidateRequest(BaseModel):
 
 # ── /ingest ──────────────────────────────────────────────────────────────────
 
+def _is_ios_shortcut(request: Request) -> bool:
+    """Detect iOS Shortcuts / Share Sheet callers by User-Agent."""
+    ua = request.headers.get("user-agent", "").lower()
+    return any(s in ua for s in ("shortcuts", "cfnetwork", "darwin", "ios"))
+
+
 @app.post("/ingest")
-async def ingest(req: IngestRequest):
+async def ingest(req: IngestRequest, request: Request):
     if not req.url and not req.text and not req.image_base64:
         raise HTTPException(400, "Provide url, text, or image_base64")
 
-    raw_text = ""
     source_url = req.url or ""
 
     # Deduplication: reject if URL is already pending in queue or written to vault
@@ -137,6 +144,33 @@ async def ingest(req: IngestRequest):
         duplicate = _find_duplicate(source_url)
         if duplicate:
             raise HTTPException(409, f"Already ingested: {duplicate}")
+
+    # iOS Shortcuts / Share Sheet: queue instantly and extract in background
+    # so the request returns in <100ms and never times out on the device
+    if _is_ios_shortcut(request) and source_url and not req.text and not req.image_base64:
+        item_id = str(uuid.uuid4())
+        item = {
+            "id": item_id,
+            "url": source_url,
+            "title": source_url,
+            "key_concepts": [],
+            "summary": ["Extracting in background…"],
+            "suggested_page": "unprocessed",
+            "suggested_wikilinks": [],
+            "tags": [],
+            "diagram": "",
+            "pending_extraction": True,
+            "queued_at": datetime.now().isoformat(),
+        }
+        queue_manager.enqueue(item)
+        asyncio.create_task(_background_extract(item_id, source_url))
+        return {"id": item_id, "queued": True, "diff_preview": {
+            "title": source_url, "summary": ["Saved — extracting in background"],
+            "suggested_page": "unprocessed", "suggested_wikilinks": [], "tags": [],
+            "key_concepts": [], "references": [], "diagram": "",
+        }}
+
+    raw_text = ""
 
     # Step 1: fetch URL with httpx + parse with BeautifulSoup (zero LLM)
     if req.url:
@@ -645,12 +679,56 @@ Rules:
 
 # ── /queue-url (iOS Share Sheet fast-path) ───────────────────────────────────
 
+async def _background_extract(item_id: str, url: str) -> None:
+    """
+    Run fetch + Sonnet extraction in the background after /queue-url returns.
+    Updates the queue item in-place so it's ready to review when the user opens the UI.
+    On failure, marks the item with extraction_error so the UI can show a retry option.
+    """
+    loop = asyncio.get_running_loop()
+    try:
+        # Run blocking I/O in a thread so we don't block the event loop
+        raw_text = await loop.run_in_executor(None, _fetch_url, url)
+        existing_pages = [p["name"] for p in vault_reader.list_concept_pages()]
+        extraction = await loop.run_in_executor(
+            None, _extract_with_sonnet, raw_text, [], url, existing_pages
+        )
+        item = queue_manager.get_by_id(item_id)
+        if item:
+            item.update({
+                "title": extraction["title"],
+                "key_concepts": extraction.get("key_concepts", []),
+                "summary": extraction["summary"],
+                "suggested_page": extraction["suggested_page"],
+                "suggested_wikilinks": extraction.get("suggested_wikilinks", []),
+                "tags": extraction.get("tags", []),
+                "references": extraction.get("references", []),
+                "diagram": extraction.get("diagram", ""),
+                "pending_extraction": False,
+                "extraction_error": None,
+                "extracted_at": datetime.now().isoformat(),
+            })
+            queue_manager.update(item_id, item)
+    except Exception as e:
+        # Mark as failed so the UI shows a retry option instead of spinning forever
+        item = queue_manager.get_by_id(item_id)
+        if item:
+            item.update({
+                "pending_extraction": False,
+                "extraction_error": str(e),
+                "summary": [f"Extraction failed: {e}"],
+                "title": item.get("url", url),
+            })
+            queue_manager.update(item_id, item)
+
+
 @app.post("/queue-url")
 async def queue_url(req: IngestRequest):
     """
     Lightweight endpoint for the iOS Share Sheet.
     Queues a URL instantly (no fetch, no LLM) so the shortcut
-    gets a response in <1s. Full extraction happens at approve time.
+    gets a response in <1s. Extraction runs in the background so the
+    item is ready to review by the time the user opens the web UI.
     """
     url = (req.url or "").strip()
     if not url:
@@ -666,17 +744,21 @@ async def queue_url(req: IngestRequest):
     item = {
         "id": item_id,
         "url": url,
-        "title": url,                      # placeholder — replaced at approve time
+        "title": url,                      # placeholder — replaced by background task
         "key_concepts": [],
-        "summary": ["Queued from iOS Share Sheet — tap Approve to extract."],
+        "summary": ["Extracting in background…"],
         "suggested_page": "unprocessed",
         "suggested_wikilinks": [],
         "tags": [],
         "diagram": "",
-        "pending_extraction": True,        # flag so UI shows "needs extraction"
+        "pending_extraction": True,
         "queued_at": datetime.now().isoformat(),
     }
     queue_manager.enqueue(item)
+
+    # Fire-and-forget background extraction — does not block the response
+    asyncio.create_task(_background_extract(item_id, url))
+
     return {"queued": True, "id": item_id, "url": url}
 
 
@@ -1024,6 +1106,84 @@ async def get_page(page_name: str):
     backlinks_index = vault_reader.build_backlinks_index()
     backlinks = backlinks_index.get(page_name, [])
     return {"name": page_name, "content": content, "parsed": parsed, "backlinks": backlinks}
+
+
+# ── /dashboard-stats ──────────────────────────────────────────────────────────
+
+@app.get("/dashboard-stats")
+async def get_dashboard_stats():
+    """
+    Return learning metrics for the last 30 days:
+    - Activity timeline (concepts added by date)
+    - Learning velocity (entries/week, concepts/week)
+    - Most-referenced tags (frequency)
+    - Top sources (source_type frequency)
+    - New concepts this week
+    """
+    vault_path = Path(os.environ.get("VAULT_PATH", "/Users/sakethv7/SakethVault"))
+    traces_path = vault_path / "_wiki" / "meta" / "traces.jsonl"
+
+    # Parse all traces
+    traces = []
+    if traces_path.exists():
+        for line in traces_path.read_text().splitlines():
+            if line.strip():
+                try:
+                    traces.append(json.loads(line))
+                except Exception:
+                    continue
+
+    # Filter to last 30 days and only approved items
+    from datetime import timedelta
+    cutoff = datetime.now() - timedelta(days=30)
+    recent_traces = [
+        t for t in traces
+        if t.get("approved") and datetime.fromisoformat(t.get("ts", "")) > cutoff
+    ]
+
+    # Activity timeline: group by date
+    activity_by_date = {}
+    for trace in recent_traces:
+        date = trace.get("ts", "").split("T")[0]
+        activity_by_date[date] = activity_by_date.get(date, 0) + 1
+
+    # Learning velocity: entries per week, unique concepts per week
+    entries_per_week = len(recent_traces) / max(1, (datetime.now() - cutoff).days / 7)
+    unique_concepts = len(set(t.get("final_page") for t in recent_traces if t.get("final_page")))
+    concepts_per_week = unique_concepts / max(1, (datetime.now() - cutoff).days / 7)
+
+    # Tags frequency
+    tag_counts = {}
+    for trace in recent_traces:
+        for tag in trace.get("tags_final", []):
+            tag_counts[tag] = tag_counts.get(tag, 0) + 1
+    top_tags = sorted(tag_counts.items(), key=lambda x: x[1], reverse=True)[:10]
+
+    # Source type frequency
+    source_counts = {}
+    for trace in recent_traces:
+        source = trace.get("source_type", "unknown")
+        source_counts[source] = source_counts.get(source, 0) + 1
+    top_sources = sorted(source_counts.items(), key=lambda x: x[1], reverse=True)
+
+    # New concepts this week
+    week_cutoff = datetime.now() - timedelta(days=7)
+    week_traces = [t for t in recent_traces if datetime.fromisoformat(t.get("ts", "")) > week_cutoff]
+    new_concepts_week = len(set(t.get("final_page") for t in week_traces if t.get("final_page")))
+
+    return {
+        "period_days": 30,
+        "total_approved": len(recent_traces),
+        "unique_concepts": unique_concepts,
+        "activity_by_date": activity_by_date,
+        "learning_velocity": {
+            "entries_per_week": round(entries_per_week, 2),
+            "concepts_per_week": round(concepts_per_week, 2),
+        },
+        "top_tags": [{"tag": tag, "count": count} for tag, count in top_tags],
+        "top_sources": [{"source": src, "count": count} for src, count in top_sources],
+        "new_concepts_this_week": new_concepts_week,
+    }
 
 
 # ── /analyze-traces ──────────────────────────────────────────────────────────
@@ -1508,10 +1668,18 @@ pages_read: {req.pages_read}
 
 # ── /lint ─────────────────────────────────────────────────────────────────────
 
+import hashlib
+
 _LINT_CACHE_PATH = Path(__file__).parent / "lint_cache.json"
+
+def _compute_pages_hash(pages: list) -> str:
+    """Compute hash of page list (names + entry_counts) to detect changes."""
+    content = json.dumps([(p["name"], p["entry_count"]) for p in sorted(pages, key=lambda x: x["name"])], sort_keys=True)
+    return hashlib.md5(content.encode()).hexdigest()
 
 
 def _load_lint_cache() -> Optional[dict]:
+    """Load cached lint report if it exists."""
     try:
         if _LINT_CACHE_PATH.exists():
             return json.loads(_LINT_CACHE_PATH.read_text())
@@ -1520,20 +1688,54 @@ def _load_lint_cache() -> Optional[dict]:
     return None
 
 
-def _save_lint_cache(report: dict) -> None:
+def _is_cache_valid(cached: dict, pages: list) -> bool:
+    """Check if cached lint report is still valid (<24h and page list unchanged)."""
+    if not cached:
+        return False
+
     try:
-        _LINT_CACHE_PATH.write_text(json.dumps(report))
+        # Check timestamp (must be < 24h old)
+        cached_ts = datetime.fromisoformat(cached.get("ran_at", ""))
+        age = (datetime.now() - cached_ts).total_seconds()
+        if age > 86400:  # 24 hours in seconds
+            return False
+
+        # Check page list hash (must match current pages)
+        cached_hash = cached.get("_pages_hash")
+        current_hash = _compute_pages_hash(pages)
+        if cached_hash != current_hash:
+            return False
+
+        return True
+    except Exception:
+        return False
+
+
+def _save_lint_cache(report: dict, pages: list) -> None:
+    """Save lint report with metadata (timestamp, pages_hash)."""
+    try:
+        cached = {
+            **report,
+            "ran_at": datetime.now().isoformat(),
+            "_pages_hash": _compute_pages_hash(pages)
+        }
+        _LINT_CACHE_PATH.write_text(json.dumps(cached, indent=2))
     except Exception:
         pass
 
 
 @app.get("/lint")
 async def get_lint_cache():
-    """Return the last cached lint report, or 204 if none exists yet."""
+    """
+    Return the last cached lint report if it exists, or 204 if no cache.
+    Use POST /lint to generate or refresh the health check report.
+    """
     cached = _load_lint_cache()
     if cached is None:
         return Response(status_code=204)
-    return cached
+    cached_clean = {k: v for k, v in cached.items() if not k.startswith("_")}
+    cached_clean["cached"] = True
+    return cached_clean
 
 
 @app.post("/lint")
@@ -1545,10 +1747,24 @@ async def lint_wiki(req: LintRequest):
     - suggested new articles
     - orphaned pages (no wikilinks pointing to them)
     Optionally saves the report as _wiki/insights/YYYY-MM-DD-lint.md
+
+    Cache strategy:
+    - If force_refresh=False, checks cache for <24h validity + matching page list hash
+    - If cache valid, returns cached report (saves ~$0.10 and 30s latency)
+    - If cache invalid or force_refresh=True, runs full Sonnet scan
     """
     pages = vault_reader.list_concept_pages()
     if not pages:
         raise HTTPException(400, "No concept pages to lint yet.")
+
+    # ── Check cache first ────────────────────────────────────────────────────────
+    if not req.force_refresh:
+        cached = _load_lint_cache()
+        if _is_cache_valid(cached, pages):
+            # Remove metadata fields from cached report before returning
+            cached_clean = {k: v for k, v in cached.items() if not k.startswith("_")}
+            cached_clean["from_cache"] = True
+            return cached_clean
 
     # Read all pages — strip frontmatter, cap each at 1200 chars for token efficiency
     pages_context = []
@@ -1723,8 +1939,8 @@ pages_scanned: {len(pages)}
                     f"\n## {time_str} · lint\nPages scanned: {len(pages)}\nHealth score: {report.get('health_score')}\nWritten to: {file_written}\n")
 
     result = {**report, "pages_scanned": len(pages), "file_written": file_written,
-              "ran_at": datetime.now().strftime("%Y-%m-%d %H:%M")}
-    _save_lint_cache(result)
+              "from_cache": False, "ran_at": datetime.now().isoformat()}
+    _save_lint_cache(result, pages)
     return result
 
 
@@ -1904,6 +2120,186 @@ async def fix_page(page_name: str):
         "sections_sorted": len(parts) > 2,
         "entry_count_updated": section_count,
         "changes_made": changes,
+    }
+
+
+# ── POST /calculate-maturity/{page} ───────────────────────────────────────────
+
+@app.post("/calculate-maturity/{page_name}")
+async def calculate_maturity(page_name: str):
+    """
+    Calculate and store understanding maturity score (0-100) for a concept page.
+
+    Formula:
+    - source_count (30%): # of source sections (## entries)
+    - recency (20%): high if updated <30 days ago, decay otherwise
+    - incoming_links (25%): # of pages linking to this one
+    - evolution (15%): understanding_version or entry_count
+    - contradictions (10%): penalty for [!warning] callouts
+
+    Updates frontmatter with understanding_maturity: 0-100
+    """
+    import re
+    vault_path = Path(os.environ.get("VAULT_PATH", "/Users/sakethv7/SakethVault"))
+    wiki_dir = vault_path / "_wiki"
+
+    # Find the page
+    page_path = wiki_dir / "concepts" / f"{page_name}.md"
+    if not page_path.exists():
+        for folder in ["insights", "sources", "open-threads", "meta"]:
+            candidate = wiki_dir / folder / f"{page_name}.md"
+            if candidate.exists():
+                page_path = candidate
+                break
+
+    if not page_path.exists():
+        raise HTTPException(404, f"Page '{page_name}' not found")
+
+    content = page_path.read_text(encoding="utf-8")
+
+    # Parse frontmatter
+    fm_match = re.match(r"^---\n(.*?)\n---\n", content, re.DOTALL)
+    if not fm_match:
+        raise HTTPException(400, "Invalid page frontmatter")
+
+    fm_text = fm_match.group(1)
+
+    # Extract fields from frontmatter
+    last_updated_match = re.search(r"last_updated:\s*(\d{4}-\d{2}-\d{2})", fm_text)
+    last_updated = last_updated_match.group(1) if last_updated_match else None
+
+    understanding_version_match = re.search(r"understanding_version:\s*(\d+)", fm_text)
+    understanding_version = int(understanding_version_match.group(1)) if understanding_version_match else 1
+
+    # Count sources (## sections)
+    source_count = len(re.findall(r"^## ", content, re.MULTILINE))
+
+    # Count contradictions ([!warning] callouts)
+    contradiction_count = len(re.findall(r"\[!warning\]", content))
+
+    # Count incoming links (backlinks) — pages that link to this one
+    all_pages = list(wiki_dir.glob("**/*.md"))
+    backlink_count = 0
+    kebab_name = page_name.lower().replace(" ", "-")
+    for page_file in all_pages:
+        if page_file == page_path:
+            continue
+        try:
+            text = page_file.read_text(encoding="utf-8")
+            # Count links like [[page_name]] or [[kebab-name]]
+            if f"[[{kebab_name}]]" in text or f"[[{page_name}]]" in text:
+                backlink_count += 1
+        except:
+            pass
+
+    # Calculate recency component
+    days_since_update = 999
+    if last_updated:
+        try:
+            update_date = datetime.strptime(last_updated, "%Y-%m-%d").date()
+            today = datetime.now().date()
+            days_since_update = (today - update_date).days
+        except:
+            pass
+
+    recency_score = 100 if days_since_update < 30 else max(0, 100 - (days_since_update - 30) // 7 * 10)
+
+    # Normalize components
+    # Use vault-wide maximums for normalization
+    max_sources = max(10, source_count + 5)  # avoid division by very small numbers
+    max_links = max(5, backlink_count + 2)
+    max_evolutions = max(5, understanding_version + 2)
+    max_total_sources = max(1, source_count)
+
+    # Calculate weighted score
+    score = (
+        (source_count / max_sources) * 30 +
+        (recency_score / 100) * 20 +
+        (backlink_count / max_links) * 25 +
+        (understanding_version / max_evolutions) * 15 +
+        (1 - (contradiction_count / max_total_sources if max_total_sources > 0 else 0)) * 10
+    )
+
+    # Clamp to 0-100
+    maturity_score = int(max(0, min(100, score)))
+
+    # Update frontmatter with maturity score
+    new_fm = re.sub(
+        r"(understanding_version:\s*)\d+",
+        f"\\g<1>{understanding_version}",
+        fm_text
+    )
+
+    # Add or update understanding_maturity
+    if "understanding_maturity:" in new_fm:
+        new_fm = re.sub(
+            r"(understanding_maturity:\s*)\d+",
+            f"\\g<1>{maturity_score}",
+            new_fm
+        )
+    else:
+        # Add it before understanding_version if possible, otherwise at the end
+        if "understanding_version:" in new_fm:
+            new_fm = new_fm.replace(
+                f"understanding_version: {understanding_version}",
+                f"understanding_maturity: {maturity_score}\nunderstanding_version: {understanding_version}"
+            )
+        else:
+            new_fm += f"\nunderstanding_maturity: {maturity_score}"
+
+    new_content = content.replace(fm_match.group(0), f"---\n{new_fm}\n---\n")
+
+    # Atomic write
+    _atomic_write_path(page_path, new_content)
+
+    return {
+        "success": True,
+        "page": page_name,
+        "understanding_maturity": maturity_score,
+        "components": {
+            "source_count": source_count,
+            "days_since_update": days_since_update,
+            "recency_score": recency_score,
+            "backlink_count": backlink_count,
+            "understanding_version": understanding_version,
+            "contradiction_count": contradiction_count,
+        },
+    }
+
+
+# ── POST /calculate-all-maturity ──────────────────────────────────────────────
+
+@app.post("/calculate-all-maturity")
+async def calculate_all_maturity():
+    """
+    Calculate maturity score for all concept pages.
+    Returns list of updated pages with their scores.
+    """
+    vault_path = Path(os.environ.get("VAULT_PATH", "/Users/sakethv7/SakethVault"))
+    concepts_dir = vault_path / "_wiki" / "concepts"
+
+    results = []
+    for page_file in sorted(concepts_dir.glob("*.md")):
+        page_name = page_file.stem
+        try:
+            result = await calculate_maturity(page_name)
+            results.append({
+                "page": page_name,
+                "maturity": result["understanding_maturity"],
+                "success": True,
+            })
+        except Exception as e:
+            results.append({
+                "page": page_name,
+                "error": str(e),
+                "success": False,
+            })
+
+    return {
+        "success": True,
+        "total_pages": len(results),
+        "success_count": sum(1 for r in results if r["success"]),
+        "pages": results,
     }
 
 
@@ -2224,6 +2620,208 @@ async def get_history(limit: int = 20):
     # Most recent first
     entries.reverse()
     return {"entries": entries[:limit]}
+
+
+# ── /log-read  ───────────────────────────────────────────────────────────────
+
+class LogReadRequest(BaseModel):
+    page: str
+    duration_seconds: int = 0
+
+
+@app.post("/log-read")
+async def log_read(req: LogReadRequest):
+    vault_path = Path(os.environ.get("VAULT_PATH", "/Users/sakethv7/SakethVault"))
+    reads_path = vault_path / "_wiki" / "meta" / "reads.jsonl"
+    reads_path.parent.mkdir(parents=True, exist_ok=True)
+    entry = json.dumps({"ts": datetime.utcnow().isoformat(), "concept": req.page, "duration_seconds": req.duration_seconds})
+    with reads_path.open("a", encoding="utf-8") as f:
+        f.write(entry + "\n")
+    return {"ok": True}
+
+
+@app.get("/recent-reads")
+async def recent_reads(limit: int = 10):
+    vault_path = Path(os.environ.get("VAULT_PATH", "/Users/sakethv7/SakethVault"))
+    reads_path = vault_path / "_wiki" / "meta" / "reads.jsonl"
+    if not reads_path.exists():
+        return {"reads": []}
+    lines = reads_path.read_text(encoding="utf-8").splitlines()
+    # Parse last 200 lines, deduplicate keeping most recent occurrence
+    seen = {}
+    for line in reversed(lines[-200:]):
+        if not line.strip():
+            continue
+        try:
+            entry = json.loads(line)
+            concept = entry.get("concept", "")
+            if concept and concept not in seen:
+                seen[concept] = entry
+        except Exception:
+            continue
+    ordered = sorted(seen.values(), key=lambda e: e.get("ts", ""), reverse=True)
+    return {"reads": ordered[:limit]}
+
+
+# ── /edit-page/{page} ────────────────────────────────────────────────────────
+
+class EditPageRequest(BaseModel):
+    updated_content: str
+
+
+@app.post("/edit-page/{page_name}")
+async def edit_page(page_name: str, req: EditPageRequest):
+    import subprocess
+    vault_path = Path(os.environ.get("VAULT_PATH", "/Users/sakethv7/SakethVault"))
+    page_path = vault_path / "_wiki" / "concepts" / f"{page_name}.md"
+    if not page_path.exists():
+        raise HTTPException(404, f"Page '{page_name}' not found")
+
+    current = page_path.read_text(encoding="utf-8")
+
+    # Extract existing frontmatter
+    frontmatter = ""
+    if current.startswith("---"):
+        end = current.find("---", 3)
+        if end != -1:
+            frontmatter = current[: end + 3]
+
+    # Validate updated_content doesn't start with frontmatter (we keep the original)
+    body = req.updated_content
+    if body.startswith("---"):
+        # If user accidentally included frontmatter, strip it
+        fm_end = body.find("---", 3)
+        if fm_end != -1:
+            body = body[fm_end + 3:].lstrip("\n")
+
+    new_content = frontmatter + "\n" + body if frontmatter else body
+
+    # Atomic write
+    page_path.write_text(new_content, encoding="utf-8")
+
+    # Git commit
+    git_sha = ""
+    try:
+        subprocess.run(["git", "add", str(page_path)], cwd=str(vault_path), check=True, capture_output=True)
+        result = subprocess.run(
+            ["git", "commit", "-m", f"Updated {page_name} via web UI"],
+            cwd=str(vault_path), check=True, capture_output=True, text=True,
+        )
+        sha_match = _re.search(r"\[[\w/]+ ([0-9a-f]+)\]", result.stdout)
+        git_sha = sha_match.group(1) if sha_match else ""
+    except Exception as e:
+        pass  # write succeeded, git commit is best-effort
+
+    return {"success": True, "git_commit_sha": git_sha}
+
+
+# ── /normalize-tags ──────────────────────────────────────────────────────────
+
+@app.post("/normalize-tags")
+async def normalize_tags_endpoint(payload: dict):
+    tags = payload.get("tags", [])
+    vault_path = Path(os.environ.get("VAULT_PATH", "/Users/sakethv7/SakethVault"))
+    ontology_path = vault_path / "_wiki" / "meta" / "tag-ontology.json"
+    if not ontology_path.exists():
+        return {"normalized": tags, "mappings": {}}
+
+    ontology = json.loads(ontology_path.read_text(encoding="utf-8"))
+
+    # Build synonym → canonical lookup
+    synonym_map: dict[str, str] = {}
+    for canonical, info in ontology.items():
+        for syn in info.get("synonyms", []):
+            synonym_map[syn.lower()] = canonical
+
+    normalized = []
+    mappings = {}
+    for tag in tags:
+        canonical = synonym_map.get(tag.lower())
+        if canonical and canonical != tag:
+            mappings[tag] = canonical
+            normalized.append(canonical)
+        else:
+            normalized.append(tag)
+
+    # Deduplicate while preserving order
+    seen_n: set[str] = set()
+    deduped = []
+    for t in normalized:
+        if t not in seen_n:
+            seen_n.add(t)
+            deduped.append(t)
+
+    return {"normalized": deduped, "mappings": mappings}
+
+
+@app.get("/tag-ontology")
+async def get_tag_ontology():
+    vault_path = Path(os.environ.get("VAULT_PATH", "/Users/sakethv7/SakethVault"))
+    ontology_path = vault_path / "_wiki" / "meta" / "tag-ontology.json"
+    if not ontology_path.exists():
+        return {}
+    return json.loads(ontology_path.read_text(encoding="utf-8"))
+
+
+# ── /random-concept ───────────────────────────────────────────────────────────
+
+@app.get("/random-concept")
+async def random_concept():
+    pages = vault_reader.list_concept_pages()
+    if not pages:
+        raise HTTPException(400, "No concept pages found")
+    page = random.choice(pages)
+    return {"name": page["name"]}
+
+
+# ── /generate-summary/{page_name} ────────────────────────────────────────────
+
+@app.post("/generate-summary/{page_name}")
+async def generate_summary(page_name: str):
+    content = vault_reader.read_page(page_name)
+    if content is None:
+        raise HTTPException(404, f"Page '{page_name}' not found")
+
+    client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
+
+    prompt = f"""You are studying a personal knowledge wiki page about "{page_name}".
+
+Here is the full page content:
+{content[:4000]}
+
+Generate a structured study summary. Return ONLY valid JSON with this exact structure (no markdown fences):
+{{
+  "one_liner": "One sentence (max 20 words) capturing the core concept",
+  "paragraph": "2-3 sentence explanation in simple terms a smart person can grasp quickly",
+  "prerequisites": ["concept1", "concept2"],
+  "self_test": [
+    {{"q": "Question?", "a": "Answer"}},
+    {{"q": "Question?", "a": "Answer"}},
+    {{"q": "Question?", "a": "Answer"}},
+    {{"q": "Question?", "a": "Answer"}},
+    {{"q": "Question?", "a": "Answer"}}
+  ],
+  "diagram": "graph TD\\n  A[Core] --> B[Aspect1]\\n  A --> C[Aspect2]"
+}}
+
+Rules: prerequisites = 2-4 items, self_test = exactly 5 items, diagram = 6-10 nodes max."""
+
+    resp = client.messages.create(
+        model="claude-sonnet-4-6",
+        max_tokens=1500,
+        messages=[{"role": "user", "content": prompt}]
+    )
+
+    text = resp.content[0].text.strip()
+    if text.startswith("```"):
+        text = "\n".join(text.split("\n")[1:])
+    if text.endswith("```"):
+        text = "\n".join(text.split("\n")[:-1])
+
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        raise HTTPException(500, "Failed to parse summary from model")
 
 
 # ── dev entrypoint ────────────────────────────────────────────────────────────
