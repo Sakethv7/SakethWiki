@@ -2189,12 +2189,12 @@ async def calculate_maturity(page_name: str):
     """
     Calculate and store understanding maturity score (0-100) for a concept page.
 
-    Formula:
-    - source_count (30%): # of source sections (## entries)
-    - recency (20%): high if updated <30 days ago, decay otherwise
-    - incoming_links (25%): # of pages linking to this one
-    - evolution (15%): understanding_version or entry_count
-    - contradictions (10%): penalty for [!warning] callouts
+    Formula (v2):
+    - backlinks      (40%): pages that reference this one — best signal of load-bearing knowledge
+    - evolution      (25%): how many times understanding was revisited/refined
+    - source_count   (20%): capped at 5 — marginal value of source #6 is ~zero
+    - activity       (10%): read recently (reads.jsonl) > just updated recently
+    - contradictions  (5%): penalty for unresolved [!warning] callouts
 
     Updates frontmatter with understanding_maturity: 0-100
     """
@@ -2231,13 +2231,15 @@ async def calculate_maturity(page_name: str):
     except (ValueError, TypeError):
         understanding_version = 1
 
-    # Count sources (## sections)
-    source_count = len(re.findall(r"^## ", content, re.MULTILINE))
+    # Count sources (## sections) — capped at 5, diminishing returns beyond that
+    SOURCE_CAP = 5
+    raw_source_count = len(re.findall(r"^## ", content, re.MULTILINE))
+    source_count = min(raw_source_count, SOURCE_CAP)
 
     # Count contradictions ([!warning] callouts)
     contradiction_count = len(re.findall(r"\[!warning\]", content))
 
-    # Count incoming links (backlinks) — pages that link to this one
+    # Count incoming links (backlinks) — pages that reference this one
     all_pages = list(wiki_dir.glob("**/*.md"))
     backlink_count = 0
     kebab_name = page_name.lower().replace(" ", "-")
@@ -2246,39 +2248,51 @@ async def calculate_maturity(page_name: str):
             continue
         try:
             text = page_file.read_text(encoding="utf-8")
-            # Count links like [[page_name]] or [[kebab-name]]
             if f"[[{kebab_name}]]" in text or f"[[{page_name}]]" in text:
                 backlink_count += 1
         except OSError:
             pass
 
-    # Calculate recency component
-    days_since_update = 999
-    if last_updated:
+    # Activity score: was this page read recently? (reads.jsonl)
+    # Better than last_updated recency — a concept you return to is alive;
+    # a concept that's just old but stable shouldn't be penalised.
+    reads_path = vault_path / "_wiki" / "meta" / "reads.jsonl"
+    days_since_read = 999
+    if reads_path.exists():
+        for line in reads_path.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            try:
+                r = json.loads(line)
+                if r.get("concept") == page_name:
+                    read_date = datetime.fromisoformat(r["ts"]).date()
+                    gap = (datetime.now().date() - read_date).days
+                    days_since_read = min(days_since_read, gap)
+            except Exception:
+                continue
+    # Fall back to last_updated if never read via the app
+    if days_since_read == 999 and last_updated:
         try:
-            update_date = datetime.strptime(last_updated, "%Y-%m-%d").date()
-            today = datetime.now().date()
-            days_since_update = (today - update_date).days
+            days_since_read = (datetime.now().date() - datetime.strptime(last_updated, "%Y-%m-%d").date()).days
         except (ValueError, TypeError):
             pass
+    # Full score if touched within 14 days, linear decay to 0 at 90 days, floor 20
+    activity_score = max(20, 100 - max(0, days_since_read - 14) * (80 / 76))
 
-    recency_score = 100 if days_since_update < 30 else max(0, 100 - (days_since_update - 30) // 7 * 10)
+    # ── Weighted formula (total 100) ─────────────────────────────────────────
+    # backlinks:      saturates at 8 (beyond that you have a pillar concept)
+    # evolution:      saturates at 5 revisits
+    # source:         capped at SOURCE_CAP above
+    # activity:       0–100 score computed above
+    # contradictions: flat penalty per unresolved warning
+    backlink_score  = min(backlink_count / 8, 1.0) * 40
+    evolution_score = min(understanding_version / 5, 1.0) * 25
+    source_score    = (source_count / SOURCE_CAP) * 20
+    activity_part   = (activity_score / 100) * 10
+    contradiction_penalty = min(contradiction_count * 2.5, 5)   # max -5pts
+    contradiction_part = 5 - contradiction_penalty
 
-    # Normalize components
-    # Use vault-wide maximums for normalization
-    max_sources = max(10, source_count + 5)  # avoid division by very small numbers
-    max_links = max(5, backlink_count + 2)
-    max_evolutions = max(5, understanding_version + 2)
-    max_total_sources = max(1, source_count)
-
-    # Calculate weighted score
-    score = (
-        (source_count / max_sources) * 30 +
-        (recency_score / 100) * 20 +
-        (backlink_count / max_links) * 25 +
-        (understanding_version / max_evolutions) * 15 +
-        (1 - (contradiction_count / max_total_sources if max_total_sources > 0 else 0)) * 10
-    )
+    score = backlink_score + evolution_score + source_score + activity_part + contradiction_part
 
     # Clamp to 0-100
     maturity_score = int(max(0, min(100, score)))
@@ -2317,12 +2331,17 @@ async def calculate_maturity(page_name: str):
         "page": page_name,
         "understanding_maturity": maturity_score,
         "components": {
-            "source_count": source_count,
-            "days_since_update": days_since_update,
-            "recency_score": recency_score,
             "backlink_count": backlink_count,
+            "backlink_score": round(backlink_score, 1),
             "understanding_version": understanding_version,
+            "evolution_score": round(evolution_score, 1),
+            "source_count": raw_source_count,
+            "source_count_capped": source_count,
+            "source_score": round(source_score, 1),
+            "days_since_read": days_since_read if days_since_read < 999 else None,
+            "activity_score": round(activity_score, 1),
             "contradiction_count": contradiction_count,
+            "contradiction_part": round(contradiction_part, 1),
         },
     }
 
