@@ -409,7 +409,6 @@ function IngestTab({ onApproved, onSwitchToChat }) {
   const [done, setDone] = useState(null);
   const [openThread, setOpenThread] = useState(false);
   const [questionNudge, setQuestionNudge] = useState(false);
-  const [deepResearch, setDeepResearch] = useState(false);
   const fileRef = useRef();
   const [queueKey, setQueueKey] = useState(0);
   const [ontologyTags, setOntologyTags] = useState([]);
@@ -518,7 +517,6 @@ function IngestTab({ onApproved, onSwitchToChat }) {
       if (firstLine.startsWith("http://") || firstLine.startsWith("https://")) body.url = firstLine;
       else if (trimmed) body.text = trimmed;
       if (images.length) body.images = images.map(({ data, mediaType }) => ({ data, mediaType }));
-      if (deepResearch) body.deep_research = true;
       const data = await api("/ingest", { method: "POST", body: JSON.stringify(body) });
       setPreview(data); setEdits(null);
     } catch (e) { setError(e.message); }
@@ -639,12 +637,6 @@ function IngestTab({ onApproved, onSwitchToChat }) {
               className="text-stone-400 hover:text-stone-600 transition-colors">
               <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M15.172 7l-6.586 6.586a2 2 0 102.828 2.828l6.414-6.586a4 4 0 00-5.656-5.656l-6.415 6.585a6 6 0 108.486 8.486L20.5 13"/></svg>
             </button>
-            <button onClick={() => setDeepResearch(v => !v)}
-              title="Deep Research: analyzes content through 6 lenses"
-              className={`flex items-center gap-1.5 text-xs px-2.5 py-1 rounded-lg border transition-colors ${deepResearch ? "bg-violet-50 border-violet-200 text-violet-700 font-medium" : "border-stone-200 text-stone-400 hover:text-stone-600"}`}>
-              <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.8} d="M9.663 17h4.673M12 3v1m6.364 1.636l-.707.707M21 12h-1M4 12H3m3.343-5.657l-.707-.707m2.828 9.9a5 5 0 117.072 0l-.548.547A3.374 3.374 0 0014 18.469V19a2 2 0 11-4 0v-.531c0-.895-.356-1.754-.988-2.386l-.548-.547z"/></svg>
-              Deep
-            </button>
           </div>
           <input ref={fileRef} type="file" accept="image/*" multiple className="hidden" onChange={handleImageUpload} />
 
@@ -653,7 +645,7 @@ function IngestTab({ onApproved, onSwitchToChat }) {
             {loading ? (
               <span className="flex items-center gap-2">
                 <svg className="w-3.5 h-3.5 animate-spin" fill="none" viewBox="0 0 24 24"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"/><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/></svg>
-                {deepResearch ? "Analyzing 6 lenses…" : "Processing…"}
+                {"Processing…"}
               </span>
             ) : "Process"}
           </button>
@@ -753,48 +745,6 @@ function IngestTab({ onApproved, onSwitchToChat }) {
                 )}
               </ul>
             </div>
-
-            {/* Deep Research lenses */}
-            {display.lenses && Object.keys(display.lenses).length > 0 && (
-              <div>
-                <p className="text-xs font-semibold text-stone-400 uppercase tracking-wider mb-2.5 flex items-center gap-1.5">
-                  <svg className="w-3 h-3 text-violet-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9.663 17h4.673M12 3v1m6.364 1.636l-.707.707M21 12h-1M4 12H3m3.343-5.657l-.707-.707m2.828 9.9a5 5 0 117.072 0l-.548.547A3.374 3.374 0 0014 18.469V19a2 2 0 11-4 0v-.531c0-.895-.356-1.754-.988-2.386l-.548-.547z"/></svg>
-                  6-Lens Analysis
-                </p>
-                <div className="grid grid-cols-1 gap-2">
-                  {Object.entries(display.lenses).map(([key, lens]) => {
-                    const confDot = lens.confidence === "high" ? "🟢" : lens.confidence === "medium" ? "🟡" : "🔴";
-                    return (
-                      <div key={key} className="bg-stone-50 rounded-xl px-3.5 py-3 border border-stone-100">
-                        <div className="flex items-center gap-1.5 mb-1">
-                          <span className="text-xs font-semibold text-stone-700">{lens.label}</span>
-                          <span className="text-[10px]">{confDot}</span>
-                        </div>
-                        <p className="text-xs text-stone-600 leading-relaxed">{lens.finding}</p>
-                      </div>
-                    );
-                  })}
-                </div>
-                {display.synthesis && (
-                  <div className="mt-2 bg-violet-50 rounded-xl px-3.5 py-3 border border-violet-100">
-                    <p className="text-xs font-semibold text-violet-700 mb-1">Synthesis</p>
-                    <p className="text-xs text-violet-800 leading-relaxed">{display.synthesis}</p>
-                  </div>
-                )}
-                {display.open_questions?.length > 0 && (
-                  <div className="mt-2">
-                    <p className="text-xs font-semibold text-stone-400 mb-1">Open Questions</p>
-                    <ul className="space-y-1">
-                      {display.open_questions.map((q, i) => (
-                        <li key={i} className="text-xs text-stone-500 flex gap-2">
-                          <span className="text-stone-300 shrink-0">?</span>{q}
-                        </li>
-                      ))}
-                    </ul>
-                  </div>
-                )}
-              </div>
-            )}
 
             {/* Tags + wikilinks row */}
             <div className="space-y-2.5">
@@ -1053,14 +1003,14 @@ const EVO_COLORS = {
 };
 const EVO_LABELS = { "🔵": "extends", "🟡": "refines", "🟠": "supersedes", "🔴": "contradicts", "⚪": "duplicate" };
 
-function SummaryModal({ pageName, onClose }) {
+function KnowledgeGapsModal({ pageName, onClose }) {
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [revealed, setRevealed] = useState(new Set());
 
   useEffect(() => {
-    api(`/generate-summary/${pageName}`, { method: "POST" })
+    api(`/knowledge-gaps/${pageName}`, { method: "POST" })
       .then(d => { setData(d); setLoading(false); })
       .catch(e => { setError(e.message); setLoading(false); });
   }, [pageName]);
@@ -1073,7 +1023,10 @@ function SummaryModal({ pageName, onClose }) {
     <div className="fixed inset-0 z-50 flex items-start justify-center bg-black/40 pt-10 px-4 overflow-y-auto">
       <div className="w-full max-w-2xl bg-white rounded-2xl shadow-2xl flex flex-col max-h-[85vh] mb-10">
         <div className="flex items-center justify-between px-5 py-3 border-b border-stone-100 shrink-0">
-          <span className="text-sm font-semibold text-stone-700">Study — {pageName}</span>
+          <div>
+            <span className="text-sm font-semibold text-stone-700">Knowledge Gaps — {pageName}</span>
+            <p className="text-xs text-stone-400 mt-0.5">What your notes raise but don't fully answer</p>
+          </div>
           <button onClick={onClose} className="text-stone-400 hover:text-stone-600 transition-colors">
             <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12"/></svg>
           </button>
@@ -1082,26 +1035,38 @@ function SummaryModal({ pageName, onClose }) {
           {loading && (
             <div className="flex items-center gap-2 text-sm text-stone-400 py-8 justify-center">
               <svg className="w-4 h-4 animate-spin" fill="none" viewBox="0 0 24 24"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"/><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/></svg>
-              Generating study summary…
+              Finding gaps in your notes…
             </div>
           )}
           {error && <p className="text-sm text-red-500">{error}</p>}
           {data && (
             <>
-              {/* One-liner */}
-              <div className="bg-emerald-50 border border-emerald-100 rounded-xl px-4 py-3">
-                <p className="text-xs font-semibold uppercase tracking-wide text-emerald-600 mb-1">Core idea</p>
-                <p className="text-sm font-medium text-emerald-900">{data.one_liner}</p>
-              </div>
-              {/* Paragraph */}
-              <div>
-                <p className="text-xs font-semibold uppercase tracking-wide text-stone-400 mb-1.5">In plain terms</p>
-                <p className="text-sm text-stone-700 leading-relaxed">{data.paragraph}</p>
-              </div>
+              {/* Gap questions */}
+              {data.gaps?.length > 0 && (
+                <div>
+                  <p className="text-xs font-semibold uppercase tracking-wide text-stone-400 mb-2">Open questions your notes can't answer</p>
+                  <div className="space-y-2">
+                    {data.gaps.map((gap, i) => (
+                      <div key={i} className="border border-amber-100 rounded-xl overflow-hidden">
+                        <button onClick={() => toggleReveal(i)}
+                          className="w-full flex items-start justify-between gap-3 px-4 py-2.5 text-left hover:bg-amber-50 transition-colors">
+                          <span className="text-sm text-stone-700">{gap.q}</span>
+                          <svg className={`w-4 h-4 text-stone-400 shrink-0 mt-0.5 transition-transform ${revealed.has(i) ? "rotate-180" : ""}`} fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7"/></svg>
+                        </button>
+                        {revealed.has(i) && (
+                          <div className="px-4 py-2.5 bg-amber-50 border-t border-amber-100 text-sm text-stone-600">
+                            {gap.why}
+                          </div>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
               {/* Prerequisites */}
               {data.prerequisites?.length > 0 && (
                 <div>
-                  <p className="text-xs font-semibold uppercase tracking-wide text-stone-400 mb-1.5">Prerequisites</p>
+                  <p className="text-xs font-semibold uppercase tracking-wide text-stone-400 mb-1.5">Prerequisites to understand first</p>
                   <div className="flex flex-wrap gap-1.5">
                     {data.prerequisites.map(p => (
                       <span key={p} className="text-xs px-2.5 py-1 bg-stone-100 text-stone-600 rounded-lg">{p}</span>
@@ -1112,30 +1077,8 @@ function SummaryModal({ pageName, onClose }) {
               {/* Diagram */}
               {data.diagram && (
                 <div>
-                  <p className="text-xs font-semibold uppercase tracking-wide text-stone-400 mb-1.5">Structure</p>
+                  <p className="text-xs font-semibold uppercase tracking-wide text-stone-400 mb-1.5">Concept map</p>
                   <MermaidDiagram chart={data.diagram} />
-                </div>
-              )}
-              {/* Self-test */}
-              {data.self_test?.length > 0 && (
-                <div>
-                  <p className="text-xs font-semibold uppercase tracking-wide text-stone-400 mb-2">Self-test</p>
-                  <div className="space-y-2">
-                    {data.self_test.map((qa, i) => (
-                      <div key={i} className="border border-stone-100 rounded-xl overflow-hidden">
-                        <button onClick={() => toggleReveal(i)}
-                          className="w-full flex items-start justify-between gap-3 px-4 py-2.5 text-left hover:bg-stone-50 transition-colors">
-                          <span className="text-sm text-stone-700">{qa.q}</span>
-                          <svg className={`w-4 h-4 text-stone-400 shrink-0 mt-0.5 transition-transform ${revealed.has(i) ? "rotate-180" : ""}`} fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7"/></svg>
-                        </button>
-                        {revealed.has(i) && (
-                          <div className="px-4 py-2.5 bg-stone-50 border-t border-stone-100 text-sm text-stone-600">
-                            {qa.a}
-                          </div>
-                        )}
-                      </div>
-                    ))}
-                  </div>
                 </div>
               )}
             </>
@@ -2565,8 +2508,8 @@ function BrowseTab() {
                   {fixing[selected] ? "…" : "Fix"}
                 </button>
                 <button onClick={() => setSummaryModal(selected)}
-                  className="text-xs px-2.5 py-1 border border-emerald-100 text-emerald-600 rounded-lg hover:bg-emerald-50 transition-colors">
-                  Study
+                  className="text-xs px-2.5 py-1 border border-amber-100 text-amber-600 rounded-lg hover:bg-amber-50 transition-colors">
+                  Gaps
                 </button>
                 <button onClick={() => setEditModal(true)}
                   className="text-xs px-2.5 py-1 border border-blue-100 text-blue-500 rounded-lg hover:bg-blue-50 transition-colors">
@@ -2617,7 +2560,7 @@ function BrowseTab() {
           />
         )}
         {summaryModal && (
-          <SummaryModal pageName={summaryModal} onClose={() => setSummaryModal(null)} />
+          <KnowledgeGapsModal pageName={summaryModal} onClose={() => setSummaryModal(null)} />
         )}
       </div>
     );
@@ -2895,7 +2838,42 @@ function RecentlyRead() {
   );
 }
 
-function DashboardTab() {
+function ReviewDueSection({ onNavigate }) {
+  const [due, setDue] = useState(null);
+
+  useEffect(() => {
+    api("/review-due").then(d => setDue(d.due)).catch(() => setDue([]));
+  }, []);
+
+  if (!due || due.length === 0) return null;
+
+  return (
+    <div className="bg-white border border-amber-200 rounded-xl p-4">
+      <div className="flex items-center justify-between mb-3">
+        <h3 className="text-sm font-semibold text-stone-900">Due for review</h3>
+        <span className="text-xs text-amber-600 bg-amber-50 border border-amber-100 px-2 py-0.5 rounded-lg">{due.length} pages</span>
+      </div>
+      <div className="space-y-2">
+        {due.slice(0, 6).map(item => (
+          <button key={item.name} onClick={() => onNavigate?.(item.name)}
+            className="w-full flex items-center justify-between gap-3 text-left hover:bg-stone-50 rounded-lg px-2 py-1.5 transition-colors group">
+            <span className="text-sm text-stone-700 group-hover:text-orange-600 truncate">{item.name}</span>
+            <div className="flex items-center gap-2 shrink-0">
+              {item.maturity != null && (
+                <span className="text-xs text-stone-400">{item.maturity}/100</span>
+              )}
+              <span className="text-xs text-amber-500">
+                {item.days_since_read == null ? "never read" : `${item.days_since_read}d ago`}
+              </span>
+            </div>
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function DashboardTab({ onNavigateToConcept }) {
   const [stats, setStats] = useState(null);
   const [loading, setLoading] = useState(true);
 
@@ -2973,6 +2951,9 @@ function DashboardTab() {
 
       {/* Recently Read */}
       <RecentlyRead />
+
+      {/* Review Due */}
+      <ReviewDueSection onNavigate={onNavigateToConcept} />
 
       {/* Contribution heatmap */}
       <div className="bg-white border border-stone-200 rounded-xl p-4">
@@ -3148,7 +3129,7 @@ export default function App() {
               <BrowseTab />
             </div>
           )}
-          {tab === "dashboard" && <DashboardTab />}
+          {tab === "dashboard" && <DashboardTab onNavigateToConcept={() => setTab("browse")} />}
         </div>
       </main>
     </div>

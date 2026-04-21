@@ -15,7 +15,7 @@ import os
 import random
 import re as _re
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
 
@@ -100,7 +100,6 @@ class IngestRequest(BaseModel):
     image_base64: Optional[str] = None        # legacy single image
     images: Optional[list] = None             # [{data: b64, mediaType: "image/png"}, ...]
     force: bool = False
-    deep_research: bool = False
 
 
 class ApproveRequest(BaseModel):
@@ -610,88 +609,6 @@ Rules:
     return data
 
 
-def _deep_research_with_sonnet(text: str, source_url: str, base_extraction: dict) -> dict:
-    """Run 6-lens deep research analysis on top of a base extraction."""
-    content_budget = min(len(text), 12000)
-
-    prompt = f"""You are a deep research analyst. Analyze this content through 6 distinct lenses.
-Each lens must independently re-examine the content from a fundamentally different angle.
-The tension between lenses is where the real insight lives.
-
-Source: {source_url}
-Title: {base_extraction.get('title', '')}
-
-Content:
-{text[:content_budget]}
-
-Respond with a JSON object (no markdown fences) with exactly this structure:
-{{
-  "lenses": {{
-    "technical": {{
-      "label": "Technical",
-      "finding": "2-3 sentences. What does the mechanism/data actually say? Strip narrative, focus on how it works.",
-      "confidence": "high|medium|low"
-    }},
-    "economic": {{
-      "label": "Economic",
-      "finding": "2-3 sentences. Follow the money. Who pays, who profits, what incentives drive this?",
-      "confidence": "high|medium|low"
-    }},
-    "historical": {{
-      "label": "Historical",
-      "finding": "2-3 sentences. What patterns repeat? What has been tried before? What context is missing?",
-      "confidence": "high|medium|low"
-    }},
-    "contrarian": {{
-      "label": "Contrarian",
-      "finding": "2-3 sentences. What if the consensus here is wrong? Who benefits from the current framing? What is nobody saying?",
-      "confidence": "high|medium|low"
-    }},
-    "first_principles": {{
-      "label": "First Principles",
-      "finding": "2-3 sentences. Forget everything. What are the fundamental truths? What is the simplest model that explains this?",
-      "confidence": "high|medium|low"
-    }},
-    "practical": {{
-      "label": "Practical",
-      "finding": "2-3 sentences. What can I actually do with this? What is the most actionable takeaway?",
-      "confidence": "high|medium|low"
-    }}
-  }},
-  "synthesis": "3-4 sentences. Where do the lenses agree? Where do they contradict? What is the real insight that only emerges from all 6 angles together?",
-  "open_questions": ["question this research raises but does not answer", "another open question"]
-}}
-
-Rules:
-- Each lens MUST rethink the content, not just rephrase the same point
-- Contrarian lens should feel like a different researcher who disagrees with the others
-- Confidence reflects how much evidence in the content supports this lens's finding
-- open_questions: 2-3 questions this content raises but does not answer"""
-
-    message = client.messages.create(
-        model="claude-sonnet-4-6",
-        max_tokens=2500,
-        messages=[{"role": "user", "content": prompt}],
-    )
-
-    raw = message.content[0].text.strip()
-    if raw.startswith("```"):
-        raw = raw.split("```")[1]
-        if raw.startswith("json"):
-            raw = raw[4:]
-        raw = raw.strip()
-
-    # Find first { in case model adds prose
-    brace = raw.find("{")
-    if brace > 0:
-        raw = raw[brace:]
-
-    try:
-        return json.loads(raw)
-    except json.JSONDecodeError:
-        return {}
-
-
 # ── /queue-url (iOS Share Sheet fast-path) ───────────────────────────────────
 
 async def _background_extract(item_id: str, url: str) -> None:
@@ -1010,17 +927,60 @@ def _extract_topic(msg: str, relevant_names: list) -> Optional[str]:
     return scored[0]
 
 
+def _semantic_page_select(message: str, page_summaries: str) -> list[str]:
+    """
+    Stage 1: Ask Haiku which pages are relevant to the user's question.
+    Sends one line per page (name + understanding block excerpt), returns up to 5 slugs.
+    Cheap: ~200 input tokens, no full page content.
+    """
+    prompt = (
+        f"User question: {message}\n\n"
+        "Below are all concept pages in the wiki (name | understanding excerpt).\n"
+        "Return ONLY a JSON array of the 1-5 most relevant page slugs (e.g. [\"kv-cache\",\"attention\"]).\n"
+        "If nothing is relevant, return [].\n\n"
+        f"{page_summaries}"
+    )
+    resp = client.messages.create(
+        model="claude-haiku-4-5-20251001",
+        max_tokens=200,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    raw = resp.content[0].text.strip()
+    try:
+        start = raw.find("[")
+        end = raw.rfind("]") + 1
+        return json.loads(raw[start:end]) if start >= 0 else []
+    except (json.JSONDecodeError, ValueError):
+        return []
+
+
 @app.post("/chat")
 async def chat(req: ChatRequest):
     if not req.message or not req.message.strip():
         raise HTTPException(400, "message cannot be empty")
-    # Step 1: keyword-match to find relevant pages
-    relevant_names = vault_reader.find_relevant_pages(req.message)
 
-    # Step 2: read up to 5 most relevant pages with adaptive char budget
-    pages_content = vault_reader.read_pages_content(relevant_names[:5])
+    # Stage 1: build a cheap summary of all pages (name + first 200 chars of understanding)
+    all_pages = vault_reader.list_concept_pages()
+    page_summaries_parts = []
+    for p in all_pages:
+        content = vault_reader.read_page(p["name"]) or ""
+        body = _strip_frontmatter(content)
+        # Grab just enough to let the model recognise the topic
+        excerpt = body[:200].replace("\n", " ").strip()
+        page_summaries_parts.append(f"{p['name']} | {excerpt}")
+    page_summaries = "\n".join(page_summaries_parts)
 
-    # Step 3: build context — strip frontmatter, distribute budget proportionally
+    # Stage 1: Haiku picks relevant pages semantically
+    loop = asyncio.get_event_loop()
+    relevant_names = await loop.run_in_executor(
+        None, _semantic_page_select, req.message, page_summaries
+    )
+    # Fallback to keyword match if semantic stage returns nothing
+    if not relevant_names:
+        relevant_names = vault_reader.find_relevant_pages(req.message)
+
+    # Stage 2: load full content for selected pages
+    pages_content = vault_reader.read_pages_content(relevant_names[:RAG_TOP_K])
     context_parts = []
     n_pages = len(pages_content)
     per_page = RAG_CONTEXT_BUDGET // n_pages if n_pages else RAG_CONTEXT_BUDGET
@@ -1031,30 +991,25 @@ async def chat(req: ChatRequest):
 
     index_content = vault_reader.read_index()
 
-    # Prompt caching: system (instructions + index) cached as a block — reused
-    # between calls until the vault changes. Context pages cached separately in
-    # the user turn — reused across queries that hit the same pages.
-    # Cache writes: 1.25x normal price. Cache reads: 0.1x. Breaks even after 2 calls.
+    # Prompt caching: system block cached across calls
     system_block = [
         {
             "type": "text",
             "text": (
                 "You are Saketh's personal AI knowledge assistant for his SakethWiki"
                 " — ML/AI things learned in the wild.\n\n"
-                "Answer from the wiki pages only. Be direct. Use [[PageName]] notation."
-                " Say if info is missing.\n\n"
+                "Answer from the wiki pages only. Be direct and specific. Use [[PageName]] notation."
+                " If the wiki doesn't cover the topic, say so clearly and suggest what to capture.\n\n"
                 f"Wiki index:\n{index_content[:800]}"
             ),
             "cache_control": {"type": "ephemeral"},
         }
     ]
 
-    # Build history; inject cached context block into the first user turn
     history_messages = []
     for turn in req.history:
         history_messages.append({"role": turn["role"], "content": turn["content"]})
 
-    # Current user turn: context (cacheable) + the actual question
     user_content = [
         {
             "type": "text",
@@ -1077,7 +1032,7 @@ async def chat(req: ChatRequest):
 
     answer = response.content[0].text
 
-    # If this is a self-knowledge query, attach the structured concept page
+    # Attach structured knowledge card for self-knowledge queries
     knowledge_card = None
     if _is_knowledge_query(req.message):
         topic = _extract_topic(req.message, relevant_names)
@@ -1187,7 +1142,6 @@ async def get_dashboard_stats():
                     continue
 
     # Filter to last 30 days and only approved items
-    from datetime import timedelta
     cutoff = datetime.now() - timedelta(days=30)
     recent_traces = []
     for t in traces:
@@ -2857,41 +2811,102 @@ async def random_concept():
     return {"name": page["name"]}
 
 
-# ── /generate-summary/{page_name} ────────────────────────────────────────────
+# ── /review-due ───────────────────────────────────────────────────────────────
 
-@app.post("/generate-summary/{page_name}")
-async def generate_summary(page_name: str):
+@app.get("/review-due")
+async def review_due():
+    """
+    Return concept pages that are overdue for review.
+    Criteria: not read in 30+ days AND maturity < 70.
+    Reads meta/reads.jsonl for last-read timestamps.
+    """
+    vault_path = Path(os.environ.get("VAULT_PATH", "/Users/sakethv7/SakethVault"))
+    reads_path = vault_path / "_wiki" / "meta" / "reads.jsonl"
+
+    # Build last-read map: page → most recent read date
+    last_read: dict[str, datetime] = {}
+    if reads_path.exists():
+        with open(reads_path) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                    page = entry.get("page", "")
+                    ts = datetime.fromisoformat(entry.get("timestamp", ""))
+                    if page and (page not in last_read or ts > last_read[page]):
+                        last_read[page] = ts
+                except (json.JSONDecodeError, ValueError, KeyError):
+                    continue
+
+    now = datetime.now()
+    cutoff = now - timedelta(days=30)
+    due = []
+    for p in vault_reader.list_concept_pages():
+        name = p["name"]
+        content = vault_reader.read_page(name) or ""
+        fm = vault_reader._parse_frontmatter(content)
+        maturity = fm.get("understanding_maturity")
+        if maturity is not None and maturity >= 70:
+            continue  # solid, skip
+        last = last_read.get(name)
+        if last and last > cutoff:
+            continue  # recently read, skip
+        days_since = (now - last).days if last else None
+        due.append({
+            "name": name,
+            "maturity": maturity,
+            "days_since_read": days_since,
+            "last_read": last.isoformat() if last else None,
+        })
+
+    # Sort: never-read first, then longest overdue
+    due.sort(key=lambda x: (x["days_since_read"] is not None, -(x["days_since_read"] or 9999)))
+    return {"due": due, "total": len(due)}
+
+
+# ── /knowledge-gaps/{page_name} ───────────────────────────────────────────────
+
+@app.post("/knowledge-gaps/{page_name}")
+async def knowledge_gaps(page_name: str):
+    """
+    Generate 5 questions Saketh probably can't answer yet from his own notes.
+    Also returns prerequisites and a concept diagram.
+    Replaces /generate-summary — we don't need summaries of our own notes, we need gaps.
+    """
     content = vault_reader.read_page(page_name)
     if content is None:
         raise HTTPException(404, f"Page '{page_name}' not found")
 
-    client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
+    prompt = f"""You are reviewing a personal knowledge wiki page about "{page_name}".
+Your job: find the GAPS — things the page touches on but doesn't fully explain,
+questions a curious learner would ask after reading this that the page can't answer.
 
-    prompt = f"""You are studying a personal knowledge wiki page about "{page_name}".
-
-Here is the full page content:
+Page content:
 {content[:4000]}
 
-Generate a structured study summary. Return ONLY valid JSON with this exact structure (no markdown fences):
+Return ONLY valid JSON with this exact structure (no markdown fences):
 {{
-  "one_liner": "One sentence (max 20 words) capturing the core concept",
-  "paragraph": "2-3 sentence explanation in simple terms a smart person can grasp quickly",
-  "prerequisites": ["concept1", "concept2"],
-  "self_test": [
-    {{"q": "Question?", "a": "Answer"}},
-    {{"q": "Question?", "a": "Answer"}},
-    {{"q": "Question?", "a": "Answer"}},
-    {{"q": "Question?", "a": "Answer"}},
-    {{"q": "Question?", "a": "Answer"}}
+  "gaps": [
+    {{"q": "Question the page raises but doesn't fully answer?", "why": "Why this matters / what's missing"}},
+    {{"q": "Another gap question?", "why": "..."}},
+    {{"q": "A deeper follow-up?", "why": "..."}},
+    {{"q": "A practical application question?", "why": "..."}},
+    {{"q": "A connections question (how does this relate to X)?", "why": "..."}},
   ],
+  "prerequisites": ["concept-slug-1", "concept-slug-2"],
   "diagram": "graph TD\\n  A[Core] --> B[Aspect1]\\n  A --> C[Aspect2]"
 }}
 
-Rules: prerequisites = 2-4 items, self_test = exactly 5 items, diagram = 6-10 nodes max."""
+Rules:
+- gaps = exactly 5, each should feel like something you genuinely can't answer from the notes alone
+- prerequisites = 2-4 concept slugs (kebab-case) the reader should understand first
+- diagram = 6-10 nodes max, show how this concept connects to related ideas"""
 
     resp = client.messages.create(
         model="claude-sonnet-4-6",
-        max_tokens=1500,
+        max_tokens=1200,
         messages=[{"role": "user", "content": prompt}]
     )
 
@@ -2904,7 +2919,7 @@ Rules: prerequisites = 2-4 items, self_test = exactly 5 items, diagram = 6-10 no
     try:
         return json.loads(text)
     except json.JSONDecodeError:
-        raise HTTPException(500, "Failed to parse summary from model")
+        raise HTTPException(500, "Failed to parse knowledge gaps from model")
 
 
 # ── dev entrypoint ────────────────────────────────────────────────────────────
