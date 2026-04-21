@@ -107,9 +107,18 @@ function TagPill({ tag }) {
   );
 }
 
+// Keep in sync with backend VALID_TAGS in main.py
 const VALID_TAGS = [
+  // ML / AI
   "RAG", "Agents", "Serving", "MLOps", "LLM", "Inference",
-  "VectorDB", "Attention", "KVCache", "Quantization", "FineTuning", "Embeddings", "Agentic",
+  "VectorDB", "Attention", "KVCache", "Quantization",
+  "FineTuning", "Embeddings", "Agentic",
+  // Tech / Engineering
+  "Engineering", "Systems", "DevTools", "Product", "Security",
+  // Finance / Business
+  "Finance", "Investing", "Business", "Startups", "Economics",
+  // Self-improvement / meta
+  "Productivity", "Learning", "Health", "Mental-models", "Career",
 ];
 
 // ── INGEST TAB ────────────────────────────────────────────────────────────────
@@ -538,7 +547,14 @@ function IngestTab({ onApproved, onSwitchToChat }) {
         : "Skipped.";
       setDone(doneMsg);
       setPreview(null); setEdits(null); setInput(""); setImages([]); setOpenThread(false);
-      if (approved) onApproved?.();
+      if (approved) {
+        onApproved?.();
+        // Fire-and-forget: update maturity score for the saved page
+        if (data.file_written) {
+          const pageName = data.file_written.replace(/^.*\//, "").replace(/\.md$/, "");
+          api(`/calculate-maturity/${encodeURIComponent(pageName)}`, { method: "POST" }).catch(() => {});
+        }
+      }
       setQueueKey(k => k + 1);
     } catch (e) { setError(e.message); }
     finally { setApproving(false); }
@@ -747,7 +763,6 @@ function IngestTab({ onApproved, onSwitchToChat }) {
                 </p>
                 <div className="grid grid-cols-1 gap-2">
                   {Object.entries(display.lenses).map(([key, lens]) => {
-                    const confColor = lens.confidence === "high" ? "text-emerald-500" : lens.confidence === "medium" ? "text-amber-500" : "text-red-400";
                     const confDot = lens.confidence === "high" ? "🟢" : lens.confidence === "medium" ? "🟡" : "🔴";
                     return (
                       <div key={key} className="bg-stone-50 rounded-xl px-3.5 py-3 border border-stone-100">
@@ -1198,8 +1213,92 @@ function EditModal({ pageName, rawContent, onClose, onSaved }) {
   );
 }
 
+// ── EVOLUTION TIMELINE MODAL ─────────────────────────────────────────────────
+
+const EVO_TYPE_LABEL = {
+  extends: { icon: "➕", label: "Extended" },
+  refines: { icon: "✏️", label: "Refined" },
+  supersedes: { icon: "🔄", label: "Superseded" },
+  contradicts: { icon: "⚡", label: "Contradicted" },
+  duplicates: { icon: "🔁", label: "Duplicate" },
+};
+
+function EvolutionTimelineModal({ pageName, onClose }) {
+  const [events, setEvents] = useState(null);
+
+  useEffect(() => {
+    api(`/page-history/${encodeURIComponent(pageName)}`)
+      .then(d => setEvents(d.events || []))
+      .catch(() => setEvents([]));
+  }, [pageName]);
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40" onClick={onClose}>
+      <div className="bg-white rounded-2xl shadow-xl w-full max-w-md mx-4 max-h-[80vh] flex flex-col" onClick={e => e.stopPropagation()}>
+        <div className="flex items-center justify-between px-5 py-4 border-b border-stone-100">
+          <div>
+            <h3 className="text-sm font-semibold text-stone-800">Evolution Timeline</h3>
+            <p className="text-xs text-stone-400 mt-0.5">{pageName}</p>
+          </div>
+          <button onClick={onClose} className="text-stone-400 hover:text-stone-700 text-xl leading-none">×</button>
+        </div>
+        <div className="flex-1 overflow-y-auto px-5 py-4">
+          {events === null ? (
+            <p className="text-sm text-stone-400 text-center py-8">Loading…</p>
+          ) : events.length === 0 ? (
+            <p className="text-sm text-stone-400 text-center py-8">No trace history yet — approve more items to build a timeline.</p>
+          ) : (
+            <ol className="relative border-l border-stone-200 space-y-6 ml-2">
+              {events.map((ev, i) => {
+                const meta = EVO_TYPE_LABEL[ev.evolution_type] || { icon: "📌", label: ev.evolution_type };
+                const date = ev.ts ? ev.ts.slice(0, 10) : "—";
+                const shortSrc = ev.source?.length > 60 ? ev.source.slice(0, 57) + "…" : ev.source;
+                return (
+                  <li key={i} className="ml-4">
+                    <span className="absolute -left-2 flex items-center justify-center w-4 h-4 bg-orange-100 rounded-full ring-2 ring-white text-[10px]">
+                      {meta.icon}
+                    </span>
+                    <div className="flex items-baseline gap-2 mb-0.5">
+                      <span className="text-xs font-semibold text-stone-700">{meta.label}</span>
+                      <span className="text-[10px] text-stone-400">{date}</span>
+                    </div>
+                    {ev.evolution_reason && (
+                      <p className="text-xs text-stone-600 leading-relaxed mb-1">{ev.evolution_reason}</p>
+                    )}
+                    <p className="text-[10px] text-stone-400 truncate">{shortSrc}</p>
+                    {ev.tags?.length > 0 && (
+                      <div className="flex flex-wrap gap-1 mt-1">
+                        {ev.tags.map(t => (
+                          <span key={t} className="text-[10px] bg-stone-100 text-stone-500 px-1.5 py-0.5 rounded">{t}</span>
+                        ))}
+                      </div>
+                    )}
+                  </li>
+                );
+              })}
+            </ol>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function ConceptPageView({ page }) {
   const [expandedSections, setExpandedSections] = useState(new Set([0]));
+  const [showTimeline, setShowTimeline] = useState(false);
+  const [maturity, setMaturity] = useState(page.understanding_maturity);
+  const [recalculating, setRecalculating] = useState(false);
+
+  async function recalcMaturity() {
+    setRecalculating(true);
+    try {
+      const d = await api(`/calculate-maturity/${encodeURIComponent(page.name)}`, { method: "POST" });
+      setMaturity(d.understanding_maturity);
+    } catch {}
+    finally { setRecalculating(false); }
+  }
+
   const toggleSection = i => setExpandedSections(prev => {
     const n = new Set(prev); n.has(i) ? n.delete(i) : n.add(i); return n;
   });
@@ -1212,29 +1311,57 @@ function ConceptPageView({ page }) {
 
   return (
     <div className="space-y-4 pb-6">
+      {showTimeline && <EvolutionTimelineModal pageName={page.name} onClose={() => setShowTimeline(false)} />}
       {/* Understanding block */}
       <div className={`rounded-2xl border p-4 ${evoColor}`}>
         <div className="flex items-start justify-between gap-3 mb-2">
-          <div className="flex items-center gap-2">
+          <button
+            onClick={() => setShowTimeline(true)}
+            className="flex items-center gap-2 hover:opacity-75 transition-opacity"
+            title="View evolution timeline"
+          >
             <span className="text-lg">{page.evolution_badge}</span>
             <span className="text-xs font-semibold uppercase tracking-wide opacity-70">Current understanding</span>
-          </div>
+          </button>
           <div className="flex items-center gap-1.5 shrink-0">
-            {page.understanding_maturity !== undefined && (
+            {maturity !== undefined && (
               <>
-                <div title="Understanding maturity score" className="flex items-center gap-1 px-2 py-1 bg-white/50 rounded-lg">
-                  <span className="text-xs font-medium text-stone-700">{page.understanding_maturity}</span>
+                <div className="flex items-center gap-1 px-2 py-1 bg-white/50 rounded-lg">
+                  <span className="text-xs font-medium text-stone-700">{maturity}</span>
                   <div className="w-16 h-1.5 bg-stone-200 rounded-full overflow-hidden">
                     <div
                       className={`h-full transition-colors ${
-                        page.understanding_maturity >= 70 ? "bg-emerald-500" :
-                        page.understanding_maturity >= 50 ? "bg-amber-500" :
+                        maturity >= 70 ? "bg-emerald-500" :
+                        maturity >= 50 ? "bg-amber-500" :
                         "bg-red-500"
                       }`}
-                      style={{ width: `${page.understanding_maturity}%` }}
+                      style={{ width: `${maturity}%` }}
                     />
                   </div>
+                  <button
+                    onClick={recalcMaturity}
+                    disabled={recalculating}
+                    title="Recalculate maturity score"
+                    className="ml-0.5 text-stone-400 hover:text-stone-600 disabled:opacity-40 transition-colors"
+                  >
+                    <svg className={`w-3 h-3 ${recalculating ? "animate-spin" : ""}`} fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+                    </svg>
+                  </button>
                 </div>
+                <span className="text-xs opacity-50">·</span>
+              </>
+            )}
+            {maturity === undefined && (
+              <>
+                <button
+                  onClick={recalcMaturity}
+                  disabled={recalculating}
+                  className="text-xs px-2 py-1 bg-white/50 rounded-lg text-stone-500 hover:text-stone-700 disabled:opacity-40"
+                  title="Calculate maturity score"
+                >
+                  {recalculating ? "…" : "Score"}
+                </button>
                 <span className="text-xs opacity-50">·</span>
               </>
             )}
@@ -1991,7 +2118,8 @@ const TAG_COLORS_GRAPH = {
 function GraphPanel({ onClose, onOpenPage }) {
   const canvasRef = useRef(null);
   const [graphData, setGraphData] = useState(null);
-  const [hovered, setHovered] = useState(null);
+  const [hovered, setHovered] = useState(null);   // tooltip only — never triggers canvas re-init
+  const hoveredRef = useRef(null);                 // canvas draw reads this (no re-init on hover)
   const simRef = useRef(null);
 
   useEffect(() => {
@@ -2058,7 +2186,7 @@ function GraphPanel({ onClose, onOpenPage }) {
       nodes.forEach(n => {
         const r = Math.max(8, Math.min(18, 6 + n.entry_count * 2));
         const color = TAG_COLORS_GRAPH[n.tags?.[0]] || "#94a3b8";
-        const isHov = hovered?.id === n.id;
+        const isHov = hoveredRef.current?.id === n.id;
         ctx.beginPath(); ctx.arc(n.x, n.y, r + (isHov ? 3 : 0), 0, Math.PI*2);
         ctx.fillStyle = isHov ? color : color + "cc";
         ctx.fill();
@@ -2091,7 +2219,8 @@ function GraphPanel({ onClose, onOpenPage }) {
     function onMove(e) {
       const rect = canvas.getBoundingClientRect();
       const n = getNode(e.clientX - rect.left, e.clientY - rect.top);
-      setHovered(n || null);
+      hoveredRef.current = n || null;   // canvas draw (no re-render)
+      setHovered(n || null);            // tooltip div only
       canvas.style.cursor = n ? "pointer" : "default";
     }
     function onClick(e) {
@@ -2102,7 +2231,7 @@ function GraphPanel({ onClose, onOpenPage }) {
     canvas.addEventListener("mousemove", onMove);
     canvas.addEventListener("click", onClick);
     return () => { cancelAnimationFrame(frame); canvas.removeEventListener("mousemove", onMove); canvas.removeEventListener("click", onClick); };
-  }, [graphData, hovered]);
+  }, [graphData]); // hoveredRef is a ref — changing it never triggers re-init
 
   return (
     <div className="mb-4 bg-white border border-violet-100 rounded-2xl overflow-hidden shadow-sm">
@@ -2232,6 +2361,7 @@ const FOLDERS = [
   { key: "concepts", label: "Concepts" },
   { key: "sources", label: "Sources" },
   { key: "insights", label: "Insights" },
+  { key: "open-threads", label: "🔍 Threads" },
 ];
 
 function BrowseTab() {
@@ -2255,6 +2385,12 @@ function BrowseTab() {
   const [showTagFilter, setShowTagFilter] = useState(false);
   const [editModal, setEditModal] = useState(false);
   const [summaryModal, setSummaryModal] = useState(null); // page name or null
+  const [ontologyTagList, setOntologyTagList] = useState([]); // canonical tags from ontology
+  const [minMaturity, setMinMaturity] = useState(0); // maturity range filter (0 = off)
+
+  useEffect(() => {
+    api("/tag-ontology").then(d => setOntologyTagList(Object.keys(d))).catch(() => {});
+  }, []);
 
   function reloadPages(f = folder) {
     api(`/pages?folder=${f}`).then(d => setPages(d.pages)).catch(() => {});
@@ -2363,6 +2499,11 @@ function BrowseTab() {
       if (selectedTags.size === 0) return true;
       return (p.tags || []).some(t => selectedTags.has(t));
     })
+    .filter(p => {
+      // Maturity filter: only applies to concepts folder when minMaturity > 0
+      if (folder !== "concepts" || minMaturity === 0) return true;
+      return (p.understanding_maturity ?? 0) >= minMaturity;
+    })
     .sort((a, b) => {
       // Sorting
       if (sortBy === "name") {
@@ -2377,8 +2518,11 @@ function BrowseTab() {
       }
     });
 
-  // Extract unique tags from all pages for tag filter UI
-  const allTags = Array.from(new Set(pages.flatMap(p => p.tags || []))).sort();
+  // Merge ontology canonical tags with tags actually present in vault pages
+  const allTags = Array.from(new Set([
+    ...ontologyTagList,
+    ...pages.flatMap(p => p.tags || []),
+  ])).sort();
 
   function parseContentChunks(md) {
     const parts = md.split(/```mermaid\n?([\s\S]*?)```/g);
@@ -2622,6 +2766,22 @@ function BrowseTab() {
             <option value="entry_count">Entries</option>
           </select>
         </div>
+
+        {/* Maturity range filter — only shown on Concepts folder */}
+        {folder === "concepts" && (
+          <div className="flex items-center gap-3 px-3 py-2 bg-white border border-stone-200 rounded-xl">
+            <span className="text-xs text-stone-500 whitespace-nowrap">Maturity ≥</span>
+            <input
+              type="range" min={0} max={100} step={10}
+              value={minMaturity}
+              onChange={e => setMinMaturity(Number(e.target.value))}
+              className="flex-1 accent-orange-500"
+            />
+            <span className={`text-xs font-medium w-7 text-right ${minMaturity > 0 ? "text-orange-600" : "text-stone-400"}`}>
+              {minMaturity > 0 ? minMaturity : "off"}
+            </span>
+          </div>
+        )}
       </div>
 
       {/* Pages list */}
@@ -2913,7 +3073,8 @@ function BackendStatus() {
 
   useEffect(() => {
     function check() {
-      fetch(`${API}/queue`).then(() => setOnline(true)).catch(() => setOnline(false));
+      // Use /health — lightweight ping, no queue I/O
+      fetch(`${API}/health`).then(() => setOnline(true)).catch(() => setOnline(false));
     }
     check();
     const interval = setInterval(check, 5000);

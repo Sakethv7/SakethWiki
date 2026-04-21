@@ -10,6 +10,7 @@ GET  /page/{name} — full content of a concept page
 """
 import base64
 import json
+import logging
 import os
 import random
 import re as _re
@@ -17,6 +18,8 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
+
+logger = logging.getLogger("sakethwiki")
 
 # Auto-load .env from project root (one level up from backend/)
 _env_path = Path(__file__).parent.parent / ".env"
@@ -62,6 +65,18 @@ app.add_middleware(
 )
 
 client = anthropic.Anthropic()
+
+# ── tunable constants ─────────────────────────────────────────────────────────
+
+URL_SCRAPE_CHAR_LIMIT   = 5000   # max chars kept from fetched URL body
+URL_SCRAPE_LINK_LIMIT   = 20     # max external links scraped per page
+RAG_TOP_K               = 10     # top-k pages considered for chat context
+RAG_CONTEXT_BUDGET      = 6000   # total chars of vault context injected into chat
+SELF_LEARN_TRACE_WINDOW = 100    # last N traces sent to Sonnet for weekly analysis
+LINT_CACHE_TTL_SECONDS  = 86400  # 24 h — lint report cache validity
+WEEKLY_ANALYSIS_INTERVAL_SECONDS = 3600  # scheduler checks every hour
+
+# ─────────────────────────────────────────────────────────────────────────────
 
 VALID_TAGS = [
     # ML / AI
@@ -193,8 +208,8 @@ async def ingest(req: IngestRequest, request: Request):
     if req.deep_research and raw_text:
         try:
             deep_data = _deep_research_with_sonnet(raw_text, source_url, extraction)
-        except Exception:
-            pass  # deep research is best-effort, never block the ingest
+        except Exception as _e:
+            logger.warning("deep_research failed (non-blocking): %s", _e)
 
     # Step 3: stage to queue
     item_id = str(uuid.uuid4())
@@ -410,14 +425,14 @@ def _fetch_url(url: str) -> str:
                 continue
             seen_ext.add(href)
             ext_links.append(href)
-            if len(ext_links) >= 20:  # cap — let Sonnet pick the useful ones
+            if len(ext_links) >= URL_SCRAPE_LINK_LIMIT:  # cap — let Sonnet pick the useful ones
                 break
 
         links_block = ""
         if ext_links:
             links_block = "\n\nReferenced links:\n" + "\n".join(f"- {u}" for u in ext_links)
 
-        return text[:5000] + links_block
+        return text[:URL_SCRAPE_CHAR_LIMIT] + links_block
     except Exception as e:
         raise HTTPException(502, f"Failed to fetch URL: {e}")
 
@@ -474,7 +489,7 @@ def _extract_with_sonnet(text: str, images: Optional[list], source_url: str,
 
     # Trim existing_pages to top-10 most relevant — avoids context bloat at scale
     relevant_pages = _top_matching_pages(
-        (text or "") + " " + source_url, existing_pages, max_pages=10
+        (text or "") + " " + source_url, existing_pages, max_pages=RAG_TOP_K
     )
     pages_hint = (
         "Existing concept pages (prefer mapping to these over creating new ones):\n"
@@ -887,8 +902,8 @@ async def approve(item_id: str, req: ApproveRequest):
                 "diagram": extraction.get("diagram", ""),
                 "pending_extraction": False,
             })
-        except Exception:
-            pass  # if extraction fails, write with placeholder content
+        except Exception as _e:
+            logger.warning("background extraction failed for item %s: %s", item_id, _e)
 
     # Snapshot original values before edits (for trace logging)
     item["_original_suggested_page"] = item.get("suggested_page", "")
@@ -914,15 +929,15 @@ async def approve(item_id: str, req: ApproveRequest):
     page_name = Path(file_path).stem
     try:
         wiki_writer.fix_page_wikilinks(page_name)
-    except Exception:
-        pass  # non-critical, don't fail the approval
+    except Exception as _e:
+        logger.warning("fix_page_wikilinks failed for %s: %s", page_name, _e)
 
     # Classify any new tags so the frontend has colors for them
     try:
         api_key = os.environ.get("ANTHROPIC_API_KEY", "")
         tag_classifier.classify_new_tags(item.get("tags", []), api_key)
-    except Exception:
-        pass  # non-critical
+    except Exception as _e:
+        logger.warning("tag_classifier failed: %s", _e)
 
     # If deep-dive requested, add tag to the written page's frontmatter
     deep_dive_tagged = False
@@ -930,8 +945,8 @@ async def approve(item_id: str, req: ApproveRequest):
         try:
             _add_deep_dive_tag(file_path)
             deep_dive_tagged = True
-        except Exception:
-            pass  # non-critical
+        except Exception as _e:
+            logger.warning("_add_deep_dive_tag failed for %s: %s", file_path, _e)
 
     evolution = item.get("_evolution", {})
 
@@ -954,8 +969,8 @@ async def approve(item_id: str, req: ApproveRequest):
             "wikilinks_suggested": item.get("suggested_wikilinks", []),
             "deep_dive": deep_dive_tagged,
         })
-    except Exception:
-        pass  # non-critical
+    except Exception as _e:
+        logger.warning("_append_trace failed on approve: %s", _e)
 
     return {
         "success": True,
@@ -1003,14 +1018,12 @@ async def chat(req: ChatRequest):
     relevant_names = vault_reader.find_relevant_pages(req.message)
 
     # Step 2: read up to 5 most relevant pages with adaptive char budget
-    # Total context budget: ~6000 chars (~1500 tokens) split across pages
-    CONTEXT_BUDGET = 6000
     pages_content = vault_reader.read_pages_content(relevant_names[:5])
 
     # Step 3: build context — strip frontmatter, distribute budget proportionally
     context_parts = []
     n_pages = len(pages_content)
-    per_page = CONTEXT_BUDGET // n_pages if n_pages else CONTEXT_BUDGET
+    per_page = RAG_CONTEXT_BUDGET // n_pages if n_pages else RAG_CONTEXT_BUDGET
     for name, content in pages_content.items():
         body = _strip_frontmatter(content)
         context_parts.append(f"=== [[{name}]] ===\n{body[:per_page]}")
@@ -1082,6 +1095,12 @@ async def chat(req: ChatRequest):
 # ── /pages ───────────────────────────────────────────────────────────────────
 
 
+@app.get("/health")
+async def health():
+    """Lightweight liveness probe — no DB, no LLM, just confirms the process is up."""
+    return {"status": "ok"}
+
+
 @app.get("/pages")
 async def list_pages(folder: str = "concepts"):
     return {"pages": vault_reader.list_pages_in_folder(folder)}
@@ -1106,6 +1125,40 @@ async def get_page(page_name: str):
     backlinks_index = vault_reader.build_backlinks_index()
     backlinks = backlinks_index.get(page_name, [])
     return {"name": page_name, "content": content, "parsed": parsed, "backlinks": backlinks}
+
+
+# ── /page-history/{page_name} ─────────────────────────────────────────────────
+
+@app.get("/page-history/{page_name}")
+async def get_page_history(page_name: str):
+    """
+    Return all approval traces that reference this concept page (as final_page).
+    Used by the evolution timeline modal in the frontend.
+    """
+    vault_path = Path(os.environ.get("VAULT_PATH", "/Users/sakethv7/SakethVault"))
+    traces_path = vault_path / "_wiki" / "meta" / "traces.jsonl"
+    events = []
+    if traces_path.exists():
+        for line in traces_path.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            try:
+                t = json.loads(line)
+            except Exception:
+                continue
+            if t.get("final_page") == page_name and t.get("approved"):
+                events.append({
+                    "ts": t.get("ts", ""),
+                    "source": t.get("url") or t.get("source_type", "text"),
+                    "source_type": t.get("source_type", "text"),
+                    "evolution_type": t.get("evolution_type", "extends"),
+                    "evolution_reason": t.get("evolution_reason", ""),
+                    "tags": t.get("tags_final", []),
+                    "page_corrected": t.get("page_corrected", False),
+                })
+    # Return chronological order (oldest first)
+    events.sort(key=lambda e: e["ts"])
+    return {"page": page_name, "events": events}
 
 
 # ── /dashboard-stats ──────────────────────────────────────────────────────────
@@ -1136,10 +1189,16 @@ async def get_dashboard_stats():
     # Filter to last 30 days and only approved items
     from datetime import timedelta
     cutoff = datetime.now() - timedelta(days=30)
-    recent_traces = [
-        t for t in traces
-        if t.get("approved") and datetime.fromisoformat(t.get("ts", "")) > cutoff
-    ]
+    recent_traces = []
+    for t in traces:
+        if not t.get("approved"):
+            continue
+        try:
+            ts = datetime.fromisoformat(t.get("ts", ""))
+        except (ValueError, TypeError):
+            continue  # skip traces with missing or malformed timestamps
+        if ts > cutoff:
+            recent_traces.append(t)
 
     # Activity timeline: group by date
     activity_by_date = {}
@@ -1214,7 +1273,7 @@ async def analyze_traces():
         raise HTTPException(400, f"Need at least 3 traces to analyze (have {len(traces)})")
 
     # Build compact trace summary for the prompt
-    trace_summary = json.dumps(traces[-100:], indent=2)  # last 100 max
+    trace_summary = json.dumps(traces[-SELF_LEARN_TRACE_WINDOW:], indent=2)
 
     prompt = f"""You are analyzing usage traces from a personal knowledge wiki system to find patterns and suggest improvements.
 
@@ -1697,7 +1756,7 @@ def _is_cache_valid(cached: dict, pages: list) -> bool:
         # Check timestamp (must be < 24h old)
         cached_ts = datetime.fromisoformat(cached.get("ran_at", ""))
         age = (datetime.now() - cached_ts).total_seconds()
-        if age > 86400:  # 24 hours in seconds
+        if age > LINT_CACHE_TTL_SECONDS:
             return False
 
         # Check page list hash (must match current pages)
@@ -2157,19 +2216,20 @@ async def calculate_maturity(page_name: str):
 
     content = page_path.read_text(encoding="utf-8")
 
-    # Parse frontmatter
-    fm_match = re.match(r"^---\n(.*?)\n---\n", content, re.DOTALL)
-    if not fm_match:
+    # Parse frontmatter via canonical util (vault_reader._parse_frontmatter)
+    fm = vault_reader._parse_frontmatter(content)
+    if not fm:
         raise HTTPException(400, "Invalid page frontmatter")
 
-    fm_text = fm_match.group(1)
+    # Preserve raw block for rewrite later
+    fm_match = re.match(r"^---\n(.*?)\n---\n", content, re.DOTALL)
+    fm_text = fm_match.group(1) if fm_match else ""
 
-    # Extract fields from frontmatter
-    last_updated_match = re.search(r"last_updated:\s*(\d{4}-\d{2}-\d{2})", fm_text)
-    last_updated = last_updated_match.group(1) if last_updated_match else None
-
-    understanding_version_match = re.search(r"understanding_version:\s*(\d+)", fm_text)
-    understanding_version = int(understanding_version_match.group(1)) if understanding_version_match else 1
+    last_updated = fm.get("last_updated")
+    try:
+        understanding_version = int(fm.get("understanding_version", 1))
+    except (ValueError, TypeError):
+        understanding_version = 1
 
     # Count sources (## sections)
     source_count = len(re.findall(r"^## ", content, re.MULTILINE))
@@ -2189,7 +2249,7 @@ async def calculate_maturity(page_name: str):
             # Count links like [[page_name]] or [[kebab-name]]
             if f"[[{kebab_name}]]" in text or f"[[{page_name}]]" in text:
                 backlink_count += 1
-        except:
+        except OSError:
             pass
 
     # Calculate recency component
@@ -2199,7 +2259,7 @@ async def calculate_maturity(page_name: str):
             update_date = datetime.strptime(last_updated, "%Y-%m-%d").date()
             today = datetime.now().date()
             days_since_update = (today - update_date).days
-        except:
+        except (ValueError, TypeError):
             pass
 
     recency_score = 100 if days_since_update < 30 else max(0, 100 - (days_since_update - 30) // 7 * 10)
@@ -2413,13 +2473,13 @@ async def _weekly_analysis_scheduler():
                     # Import httpx to call our own endpoint internally
                     import httpx as _httpx
                     _httpx.post("http://localhost:8001/analyze-traces", timeout=60)
-                except Exception:
-                    pass  # non-critical
+                except Exception as _e:
+                    logger.warning("weekly analysis scheduler HTTP call failed: %s", _e)
 
-        except Exception:
-            pass
+        except Exception as _e:
+            logger.warning("weekly analysis scheduler outer loop error: %s", _e)
 
-        await asyncio.sleep(3600)  # check every hour
+        await asyncio.sleep(WEEKLY_ANALYSIS_INTERVAL_SECONDS)
 
 
 def _append_trace(trace: dict) -> None:
@@ -2507,7 +2567,11 @@ def _add_deep_dive_tag(file_path: str) -> None:
         return
     fm = content[3:end]
     body = content[end:]
-    # Check if deep-dive already in tags
+    # Use canonical parser to check existing tags before mutating
+    existing_tags = vault_reader._parse_frontmatter(content).get("tags", [])
+    if "deep-dive" in (existing_tags if isinstance(existing_tags, list) else []):
+        return
+    # Kept for backwards compat: also skip if raw text already has deep-dive
     if "deep-dive" in fm:
         return
     # Find tags line and inject deep-dive
@@ -2710,7 +2774,7 @@ async def edit_page(page_name: str, req: EditPageRequest):
         sha_match = _re.search(r"\[[\w/]+ ([0-9a-f]+)\]", result.stdout)
         git_sha = sha_match.group(1) if sha_match else ""
     except Exception as e:
-        pass  # write succeeded, git commit is best-effort
+        logger.warning("git commit failed (write succeeded): %s", e)
 
     return {"success": True, "git_commit_sha": git_sha}
 
