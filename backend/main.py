@@ -59,9 +59,9 @@ app = FastAPI(title="SakethWiki API", version="1.0.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_methods=["GET", "POST", "DELETE"],
+    allow_headers=["Content-Type"],
 )
 
 client = anthropic.Anthropic()
@@ -202,14 +202,6 @@ async def ingest(req: IngestRequest, request: Request):
     existing_pages = [p["name"] for p in vault_reader.list_concept_pages()]
     extraction = _extract_with_sonnet(raw_text, all_images, source_url, existing_pages)
 
-    # Step 2b: deep research — run 6-lens analysis if requested
-    deep_data = {}
-    if req.deep_research and raw_text:
-        try:
-            deep_data = _deep_research_with_sonnet(raw_text, source_url, extraction)
-        except Exception as _e:
-            logger.warning("deep_research failed (non-blocking): %s", _e)
-
     # Step 3: stage to queue
     item_id = str(uuid.uuid4())
     item = {
@@ -226,10 +218,6 @@ async def ingest(req: IngestRequest, request: Request):
         "staged_at": datetime.now().isoformat(),
         "status": "pending",
     }
-    if deep_data:
-        item["lenses"] = deep_data.get("lenses", {})
-        item["synthesis"] = deep_data.get("synthesis", "")
-        item["open_questions"] = deep_data.get("open_questions", [])
     queue_manager.enqueue(item)
 
     return {
