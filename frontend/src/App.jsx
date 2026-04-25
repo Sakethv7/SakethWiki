@@ -22,7 +22,7 @@ function sanitizeMermaid(chart) {
 let _mermaidReady = false;
 function ensureMermaid() {
   if (!_mermaidReady) {
-    mermaid.initialize({ startOnLoad: false, theme: "neutral", securityLevel: "loose" });
+    mermaid.initialize({ startOnLoad: false, theme: "neutral", securityLevel: "antiscript" });
     _mermaidReady = true;
   }
 }
@@ -53,7 +53,7 @@ function MermaidDiagram({ chart }) {
   if (!svg) return <div className="text-xs text-stone-400 py-2">Rendering diagram…</div>;
   return (
     <div className="w-full overflow-x-auto rounded-xl bg-white border border-stone-100 p-4 [&_svg]:max-w-full [&_svg]:h-auto"
-      dangerouslySetInnerHTML={{ __html: DOMPurify.sanitize(svg, { USE_PROFILES: { svg: true, svgFilters: true } }) }} />
+      dangerouslySetInnerHTML={{ __html: svg }} />
   );
 }
 

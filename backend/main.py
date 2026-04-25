@@ -512,21 +512,30 @@ def _extract_with_sonnet(text: str, images: Optional[list], source_url: str,
         depth = "long-form"
         model = "claude-sonnet-4-6"   # complex reasoning / vision needed
         bullet_rule = "EXACTLY 5 bullets — the 5 most important, distinct, specific insights. Each 1-2 sentences. First-person ('I learned...'). No filler, no repetition."
-        diagram_rule = "A simple, clean Mermaid diagram (6-10 nodes max). flowchart LR or graph LR preferred. Show only the core concept/architecture — not every detail. Labels must be short (3-5 words)."
+        diagram_rule = (
+            "ONLY include a diagram if the content has a clear visual structure worth showing "
+            "(e.g. architecture, pipeline, hierarchy, decision flow). "
+            "If it's a simple concept, a person's opinion, or a news item — return empty string \"\". "
+            "If you do draw one: flowchart LR, 5-8 nodes max, short labels (2-4 words each)."
+        )
         content_budget = 10000
         max_out = 1500
     elif content_len > 1500:
         depth = "medium"
         model = "claude-haiku-4-5-20251001"  # structured extraction, no deep reasoning
         bullet_rule = "3-4 bullets — each a distinct, specific insight. First-person ('I learned...'). No filler."
-        diagram_rule = "A simple Mermaid diagram (5-8 nodes). flowchart LR preferred. Core concept only, short labels."
+        diagram_rule = (
+            "ONLY include a diagram if the content has a clear structure worth visualising. "
+            "Most medium articles do NOT need one — return \"\" if unsure. "
+            "If you do: flowchart LR, 4-6 nodes, short labels."
+        )
         content_budget = 6000
         max_out = 1200
     else:
         depth = "short"
         model = "claude-haiku-4-5-20251001"  # short structured extraction
         bullet_rule = "2-3 bullets — each a sharp, distinct insight. First-person."
-        diagram_rule = "A minimal Mermaid diagram (3-5 nodes). Core idea only."
+        diagram_rule = 'Return "" — short content rarely benefits from a diagram.'
         content_budget = 3000
         max_out = 800
 
