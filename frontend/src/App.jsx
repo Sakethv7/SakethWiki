@@ -22,7 +22,7 @@ function sanitizeMermaid(chart) {
 let _mermaidReady = false;
 function ensureMermaid() {
   if (!_mermaidReady) {
-    mermaid.initialize({ startOnLoad: false, theme: "neutral", securityLevel: "strict" });
+    mermaid.initialize({ startOnLoad: false, theme: "neutral", securityLevel: "loose" });
     _mermaidReady = true;
   }
 }
