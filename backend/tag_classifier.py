@@ -9,6 +9,8 @@ import os
 from pathlib import Path
 from typing import Optional
 
+import llm_client
+
 TAG_GROUPS_FILE = Path(__file__).parent / "tag_groups.json"
 
 # Semantic groups. Frontend maps these names to Tailwind color strings.
@@ -94,7 +96,16 @@ def classify_new_tags(tags: list[str], api_key: Optional[str] = None) -> dict[st
     if not unknown:
         return current
 
-    key = api_key or os.environ.get("ANTHROPIC_API_KEY", "")
+    provider = os.environ.get("LLM_PROVIDER_TAG_CLASSIFY", os.environ.get("LLM_PROVIDER", "anthropic")).lower()
+    if provider == "anthropic":
+        key = api_key or os.environ.get("ANTHROPIC_API_KEY", "")
+    elif provider == "qwen":
+        key = api_key or os.environ.get("QWEN_API_KEY", "")
+    elif provider == "gemma":
+        key = api_key or os.environ.get("GEMMA_API_KEY", "") or os.environ.get("GEMINI_API_KEY", "")
+    else:
+        key = api_key or os.environ.get("OPENAI_COMPAT_API_KEY", "")
+
     if not key:
         # No API key — assign "meta" as safe fallback
         for t in unknown:
@@ -103,8 +114,6 @@ def classify_new_tags(tags: list[str], api_key: Optional[str] = None) -> dict[st
         return current
 
     try:
-        import anthropic
-        client = anthropic.Anthropic(api_key=key)
         groups_desc = (
             "models (LLMs/neural nets), training (fine-tuning/optimization), "
             "attention (transformers/self-attention), inference (serving/deployment), "
@@ -118,12 +127,14 @@ def classify_new_tags(tags: list[str], api_key: Optional[str] = None) -> dict[st
             f"Tags: {', '.join(unknown)}\n"
             f'Reply with JSON only, no prose: {{"tag": "group", ...}}'
         )
-        resp = client.messages.create(
+        raw = llm_client.complete(
+            task="tag_classify",
             model="claude-haiku-4-5-20251001",
             max_tokens=300,
             messages=[{"role": "user", "content": prompt}],
-        )
-        raw = resp.content[0].text.strip()
+            api_key=key,
+            expect_json=True,
+        ).strip()
         # Extract JSON even if wrapped in ```
         m = re.search(r"\{.*\}", raw, re.DOTALL)
         if m:

@@ -32,13 +32,13 @@ if _env_path.exists():
             if _v:  # force-set if .env has a non-empty value (override empty env vars)
                 os.environ[_k] = _v
 
-import anthropic
 import httpx
 from bs4 import BeautifulSoup
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
+import llm_client
 import queue_manager
 import tag_classifier
 import vault_reader
@@ -63,8 +63,6 @@ app.add_middleware(
     allow_methods=["GET", "POST", "DELETE"],
     allow_headers=["Content-Type"],
 )
-
-client = anthropic.Anthropic()
 
 # ── tunable constants ─────────────────────────────────────────────────────────
 
@@ -574,13 +572,23 @@ Rules:
 - diagram: {diagram_rule} Escape all newlines as \\n in the JSON string. No special chars in node labels.""",
     })
 
-    message = client.messages.create(
+    raw = llm_client.complete(
+        task="ingest_extract",
         model=model,
         max_tokens=max_out,
         messages=[{"role": "user", "content": user_content}],
-    )
-
-    raw = message.content[0].text.strip()
+        expect_json=True,
+        required_json_keys=[
+            "title",
+            "key_concepts",
+            "summary",
+            "suggested_page",
+            "suggested_wikilinks",
+            "tags",
+            "references",
+            "diagram",
+        ],
+    ).strip()
     if raw.startswith("```"):
         raw = raw.split("```")[1]
         if raw.startswith("json"):
@@ -937,12 +945,13 @@ def _semantic_page_select(message: str, page_summaries: str) -> list[str]:
         "If nothing is relevant, return [].\n\n"
         f"{page_summaries}"
     )
-    resp = client.messages.create(
+    raw = llm_client.complete(
+        task="chat_select_pages",
         model="claude-haiku-4-5-20251001",
         max_tokens=200,
         messages=[{"role": "user", "content": prompt}],
-    )
-    raw = resp.content[0].text.strip()
+        expect_json=True,
+    ).strip()
     try:
         start = raw.find("[")
         end = raw.rfind("]") + 1
@@ -1020,14 +1029,13 @@ async def chat(req: ChatRequest):
     ]
     history_messages.append({"role": "user", "content": user_content})
 
-    response = client.messages.create(
+    answer = llm_client.complete(
+        task="chat_answer",
         model="claude-haiku-4-5-20251001",
         max_tokens=1200,
         system=system_block,
         messages=history_messages,
     )
-
-    answer = response.content[0].text
 
     # Attach structured knowledge card for self-knowledge queries
     knowledge_card = None
@@ -1277,12 +1285,14 @@ prompt_hints must be actionable, specific, and short — they will be directly i
 - "The tag Agentic is frequently corrected to Agents — use Agents for tool-use and orchestration content"
 """
 
-    message = client.messages.create(
+    raw = llm_client.complete(
+        task="analyze_traces",
         model="claude-sonnet-4-6",
         max_tokens=2000,
         messages=[{"role": "user", "content": prompt}],
-    )
-    raw = message.content[0].text.strip()
+        expect_json=True,
+        required_json_keys=["patterns", "prompt_hints", "summary"],
+    ).strip()
     if raw.startswith("```"):
         raw = raw.split("```")[1]
         if raw.startswith("json"):
@@ -1848,13 +1858,22 @@ Rules:
 - quick_wins: max 5, concrete and specific
 - health_score: 100 = complete, well-connected, no gaps; start at 100 and deduct for each real issue"""
 
-    message = client.messages.create(
+    raw = llm_client.complete(
+        task="lint_scan",
         model="claude-sonnet-4-6",
         max_tokens=4000,
         messages=[{"role": "user", "content": prompt}],
-    )
-
-    raw = message.content[0].text.strip()
+        expect_json=True,
+        required_json_keys=[
+            "health_score",
+            "category_scores",
+            "inconsistencies",
+            "missing_connections",
+            "suggested_articles",
+            "orphaned_pages",
+            "quick_wins",
+        ],
+    ).strip()
     # Strip any markdown fences (```json ... ``` or ``` ... ```)
     if "```" in raw:
         parts = raw.split("```")
@@ -1877,7 +1896,8 @@ Rules:
     except json.JSONDecodeError as first_err:
         # Retry once with an explicit "fix the JSON" prompt
         try:
-            fix_msg = client.messages.create(
+            raw2 = llm_client.complete(
+                task="lint_json_fix",
                 model="claude-haiku-4-5-20251001",
                 max_tokens=4000,
                 messages=[
@@ -1885,8 +1905,17 @@ Rules:
                     {"role": "assistant", "content": raw},
                     {"role": "user", "content": "Your previous response was not valid JSON. Return ONLY the raw JSON object, no prose or markdown."},
                 ],
-            )
-            raw2 = fix_msg.content[0].text.strip().lstrip("```json").lstrip("```").rstrip("```").strip()
+                expect_json=True,
+                required_json_keys=[
+                    "health_score",
+                    "category_scores",
+                    "inconsistencies",
+                    "missing_connections",
+                    "suggested_articles",
+                    "orphaned_pages",
+                    "quick_wins",
+                ],
+            ).strip().lstrip("```json").lstrip("```").rstrip("```").strip()
             report = json.loads(raw2)
         except Exception:
             raise HTTPException(500, f"LLM returned unparseable JSON: {first_err}\nRaw: {raw[:300]}")
@@ -2031,13 +2060,12 @@ Rules:
 7. Set last_updated = today ({datetime.now().strftime("%Y-%m-%d")})
 8. Output ONLY the final merged markdown file, nothing else"""
 
-    message = client.messages.create(
+    merged = llm_client.complete(
+        task="consolidate_pages",
         model="claude-sonnet-4-6",
         max_tokens=3000,
         messages=[{"role": "user", "content": prompt}],
-    )
-
-    merged = message.content[0].text.strip()
+    ).strip()
     # Strip accidental code fences
     if merged.startswith("```"):
         merged = merged.split("```", 2)[1]
@@ -2901,13 +2929,14 @@ Rules:
 - prerequisites = 2-4 concept slugs (kebab-case) the reader should understand first
 - diagram = 6-10 nodes max, show how this concept connects to related ideas"""
 
-    resp = client.messages.create(
+    text = llm_client.complete(
+        task="knowledge_gaps",
         model="claude-sonnet-4-6",
         max_tokens=1200,
-        messages=[{"role": "user", "content": prompt}]
-    )
-
-    text = resp.content[0].text.strip()
+        messages=[{"role": "user", "content": prompt}],
+        expect_json=True,
+        required_json_keys=["gaps", "prerequisites", "diagram"],
+    ).strip()
     if text.startswith("```"):
         text = "\n".join(text.split("\n")[1:])
     if text.endswith("```"):

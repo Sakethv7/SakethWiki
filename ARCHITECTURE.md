@@ -46,7 +46,7 @@ URL/Text/Image/Screenshot
     ↓
 iOS User-Agent? → fast path (returns ~20ms)
     ↓ yes                    ↓ no
-asyncio.create_task()   BeautifulSoup parse + Claude Sonnet extract (sync)
+asyncio.create_task()   BeautifulSoup parse + routed extraction model (sync)
     ↓                        ↓
 Queue item: { id, title, summary, tags, suggested_page, wikilinks, diagram?, status? }
     ↓
@@ -59,7 +59,7 @@ Approve → wiki_writer.py → Atomic file write → Vault + Trace
 
 **Image paste & drag-and-drop:** Document-level `paste` listener captures clipboard images anywhere on the page (not just textarea focus). Drag-and-drop onto the capture card shows an orange highlight. Thumbnail click opens full-size. `+` tile adds more images. Images sent as base64 in `/ingest` payload.
 
-**Key design:** Zero LLM for parsing (BeautifulSoup only). Full LLM only for semantic extraction. All writes are atomic (write-to-temp → rename).
+**Key design:** Zero LLM for parsing (BeautifulSoup only). LLM is task-routed (Anthropic/Ollama/Qwen) for semantic work with contract fallback on critical paths. All writes are atomic (write-to-temp → rename).
 
 ### 2. Self-Learning Loop
 
@@ -69,7 +69,7 @@ Approve → wiki_writer.py → Atomic file write → Vault + Trace
 ```
 traces.jsonl (all approve/reject history)
     ↓
-Claude Sonnet reads last 100 traces
+Routed analysis model reads last 100 traces (default Sonnet)
     ↓
 Identifies patterns:
   - Tag confusion (what gets corrected most often?)
@@ -84,7 +84,7 @@ Writes: system-insights.md
 Next /ingest → reads Prompt Hints section → injects into extraction prompt
 ```
 
-**Cost:** ~$0.10-0.30/week (one Sonnet call). Trace logging is free (file append).
+**Cost:** Depends on provider route for `ANALYZE_TRACES`. Trace logging is free (file append).
 
 ### 3. Vault Health & Automation (with Intelligent Caching)
 
@@ -156,12 +156,12 @@ YES: find_relevant_pages() → parse_concept_page()
     ↓
 NO: keyword_match_context() → raw markdown snippets
     ↓
-Claude Haiku answers with context
+Routed chat model answers with context
     ↓
 Return: {answer, knowledge_card?, sources}
 ```
 
-**Optimization:** Pre-filtered context (keyword search → top 5 pages) before LLM. Haiku is sufficient for Q&A; Sonnet reserved for extraction.
+**Optimization:** Pre-filtered context (keyword search → top 5 pages) before LLM. Chat can run on local Ollama/Qwen; critical integrity tasks remain Anthropic by default.
 
 ### 5. Learning Dashboard
 
@@ -406,9 +406,9 @@ last_evolution: 2026-04-18
 
 ### 4. **LLM Where Rule-Based Fails**
 - URL parsing: BeautifulSoup (zero LLM)
-- Extraction: Sonnet (complex semantic reasoning)
-- Evolution classification: Haiku (fast binary choice)
-- Chat: Haiku (speed matters, pre-filtered context)
+- Extraction: task-routed model (default Anthropic on long/image)
+- Evolution classification: task-routed model (default local; fallback on contract failure)
+- Chat: task-routed model (default local; low latency)
 
 ### 5. **Living Understanding Blocks**
 - NOT append-only — single synthesized block at top
@@ -472,5 +472,5 @@ last_evolution: 2026-04-18
 
 ### Scaling Considerations
 - **Vault Size:** Current design handles 100-500 concept pages easily. Beyond 1000, consider pagination in health checks.
-- **LLM Costs:** Switch cheaper models for high-volume operations (e.g., Haiku for full vault scan if cost becomes issue).
+- **LLM Costs:** Keep high-volume reversible tasks on local models; keep integrity-critical tasks on Anthropic with contract fallback.
 - **Trace Storage:** Consider archiving old traces (>1 year) to `_archive/` once insights are extracted.

@@ -10,7 +10,7 @@ A personal knowledge system for capturing things learned in the wild — X/Twitt
 
 - **Backend:** FastAPI + Python, running on port 8001
 - **Frontend:** React + Vite, Tailwind CSS (CDN), running on port 5173
-- **LLMs:** `claude-sonnet-4-6` (extraction, summaries, lint) · `claude-haiku-4-5` (evolution analysis, chat, formatting)
+- **LLMs:** Provider-routed by task (`anthropic` / `ollama` / `qwen` / OpenAI-compatible)
 - **Storage:** Flat Markdown files — no database, no embeddings
 
 ---
@@ -30,8 +30,80 @@ pip install -r ../requirements.txt
 
 ```bash
 cp .env.example .env
-# Edit .env — set ANTHROPIC_API_KEY and VAULT_PATH
+# Edit .env — set VAULT_PATH + one LLM provider key
+# (default is Anthropic via LLM_PROVIDER=anthropic)
 ```
+
+### LLM provider routing (optional)
+
+SakethWiki now supports provider routing by task through env vars:
+
+- `LLM_PROVIDER=anthropic|qwen|ollama|gemma|<custom>`
+- `LLM_PROVIDER_<TASK>=...` (per-task override)
+- `LLM_MODEL_<TASK>=...` (per-task model override)
+
+Examples:
+
+```bash
+# Keep high-risk tasks on Anthropic
+LLM_PROVIDER=anthropic
+
+# Route chat to Qwen for lower cost
+LLM_PROVIDER_CHAT_ANSWER=qwen
+LLM_PROVIDER_CHAT_SELECT_PAGES=qwen
+LLM_MODEL_CHAT_ANSWER=qwen-plus
+```
+
+Ollama local example:
+
+```bash
+ollama pull qwen2.5:7b
+ollama pull qwen2.5vl:7b
+
+LLM_PROVIDER=ollama
+OLLAMA_BASE_URL=http://localhost:11434/v1
+OLLAMA_MODEL_TEXT=qwen2.5:7b
+OLLAMA_MODEL_VISION=qwen2.5vl:7b
+```
+
+Task keys currently used in code include:
+`INGEST_EXTRACT`, `CHAT_SELECT_PAGES`, `CHAT_ANSWER`, `EVOLUTION_CLASSIFY`,
+`TAG_CLASSIFY`, `ANALYZE_TRACES`, `LINT_SCAN`, `LINT_JSON_FIX`,
+`CONSOLIDATE_PAGES`, `KNOWLEDGE_GAPS`.
+
+### Recommended hybrid profile (quality + cost)
+
+For local-Qwen + Anthropic guardrails:
+
+```bash
+LLM_PROVIDER=ollama
+OLLAMA_BASE_URL=http://localhost:11434/v1
+OLLAMA_MODEL_TEXT=qwen3:14b
+OLLAMA_MODEL_VISION=qwen2.5vl:7b
+
+# Critical integrity paths on Anthropic
+LLM_PROVIDER_INGEST_EXTRACT=anthropic
+LLM_PROVIDER_LINT_SCAN=anthropic
+LLM_PROVIDER_LINT_JSON_FIX=anthropic
+LLM_PROVIDER_CONSOLIDATE_PAGES=anthropic
+LLM_PROVIDER_KNOWLEDGE_GAPS=anthropic
+
+# Optional speed tuning for low-risk tasks
+LLM_MODEL_CHAT_SELECT_PAGES=qwen3:8b
+LLM_MODEL_TAG_CLASSIFY=qwen3:8b
+```
+
+Contract fallback guardrail (implemented in `llm_client`):
+- `LLM_FALLBACK_TO_ANTHROPIC=true` to force fallback on contract failures.
+- `LLM_FALLBACK_<TASK>=true|false` for per-task control.
+- Critical tasks default to fallback even when global flag is unset.
+
+### Config + Docs Sync Policy
+
+This repo follows a strict sync policy on behavior changes:
+- If `.env` variables are added/renamed/removed, update `.env.example` in the same change.
+- If endpoint behavior, routing, or architecture changes, update `README.md`, `ARCHITECTURE.md`, and `CONCEPTS.md` in the same change.
+- Prefer PRs that include code + docs together to avoid drift.
 
 ### 3. Create the vault structure
 
@@ -94,7 +166,7 @@ cd frontend && npm run build
 | POST | `/ingest` | Fetch URL or accept text/image, extract metadata, stage to queue |
 | GET | `/queue` | List all pending review items |
 | POST | `/approve/{id}` | Approve or reject a queued item |
-| POST | `/chat` | Chat with your wiki (keyword-matched context + Claude) |
+| POST | `/chat` | Chat with your wiki (keyword-matched context + routed LLM) |
 | GET | `/pages?folder=` | List pages in a folder (concepts, sources, insights, meta) |
 | GET | `/page/{name}` | Full content + parsed structured data for a page |
 | DELETE | `/page/{name}` | Delete a page |
@@ -115,7 +187,7 @@ cd frontend && npm run build
 | **POST** | **`/normalize-tags`** | **Map tag synonyms to canonical tags via tag-ontology.json** |
 | **GET** | **`/tag-ontology`** | **Return the canonical tag ontology** |
 | **GET** | **`/random-concept`** | **Return a random concept page name** |
-| **POST** | **`/generate-summary/{name}`** | **Generate study summary: one-liner, paragraph, prerequisites, self-test Q&A, diagram** |
+| **POST** | **`/knowledge-gaps/{page_name}`** | **Generate 5 unanswered questions, prerequisites, and a concept diagram** |
 
 ### POST /ingest
 
@@ -255,7 +327,7 @@ Supports intelligent caching to save time and costs:
 ```
 
 - `save`: If true, writes the lint report to `_wiki/insights/`
-- `force_refresh`: If true, bypasses cache and runs full Sonnet scan (useful after adding pages)
+- `force_refresh`: If true, bypasses cache and runs full lint scan (useful after adding pages)
 
 **Cache behavior:**
 - Cache is stored in `_wiki/meta/lint-cache.json` with metadata (timestamp, page list hash)
@@ -328,7 +400,7 @@ No request body needed. Displays in the **Dashboard** tab:
 
 ## Self-Learning System
 
-Every approve/reject event writes a trace to `_wiki/meta/traces.jsonl`. Once a week (auto) or on demand via the 🧠 Learn button in Browse, Claude Sonnet analyzes the traces and writes structured findings to `_wiki/meta/system-insights.md`:
+Every approve/reject event writes a trace to `_wiki/meta/traces.jsonl`. Once a week (auto) or on demand via the 🧠 Learn button in Browse, the routed analysis model (default Anthropic Sonnet) analyzes traces and writes structured findings to `_wiki/meta/system-insights.md`:
 
 - Which page suggestions were wrong most often
 - Tag confusion patterns (e.g. `Agentic` vs `Agents`)
@@ -348,25 +420,21 @@ Returns a randomly chosen concept page.
 
 Frontend: 🎲 **Random** button in Browse header opens the page directly.
 
-### POST /generate-summary/{name}
+### POST /knowledge-gaps/{page_name}
 
-Generates a structured study summary for a concept page using `claude-sonnet-4-6`.
+Generates unanswered questions from a concept page plus prerequisites and a diagram.
 
 Response:
 ```json
 {
-  "one_liner": "KV-cache stores attention keys/values so decoding skips recomputation.",
-  "paragraph": "During autoregressive inference...",
-  "prerequisites": ["attention-mechanisms", "transformers"],
-  "self_test": [
-    { "q": "What does KV-cache store?", "a": "Keys and values from attention layers..." },
-    ...
+  "gaps": [
+    { "q": "How does KV cache layout affect GPU memory bandwidth?", "why": "The page mentions cache cost but not memory layout tradeoffs." },
+    { "q": "When does speculative decoding reduce end-to-end latency?", "why": "Related optimization is referenced but not explained." }
   ],
+  "prerequisites": ["attention-mechanisms", "transformers"],
   "diagram": "graph TD\n  A[Decode token] --> B[Check KV-cache]..."
 }
 ```
-
-Frontend: **Study** button on concept page header opens a modal with collapsible Q&A.
 
 ### POST /log-read
 

@@ -28,15 +28,13 @@ if _env_path.exists():
             if _v:
                 os.environ[_k] = _v
 
-import anthropic
+import llm_client
 
 VAULT_PATH   = Path(os.environ.get("VAULT_PATH", "/Users/sakethv7/SakethVault"))
 CONCEPTS_DIR = VAULT_PATH / "_wiki" / "concepts"
 SOURCES_DIR  = VAULT_PATH / "_wiki" / "sources"
 INDEX_PATH   = VAULT_PATH / "_wiki" / "index.md"
 LOG_PATH     = VAULT_PATH / "_wiki" / "log.md"
-
-client = anthropic.Anthropic()
 
 EVOLUTION_TYPES = ("extends", "refines", "supersedes", "duplicates", "contradicts")
 
@@ -143,12 +141,14 @@ Definitions:
 Be strict about duplicates — if the core insight is already captured, call it a duplicate."""
 
     try:
-        msg = client.messages.create(
+        raw = llm_client.complete(
+            task="evolution_classify",
             model="claude-haiku-4-5-20251001",
             max_tokens=400,
             messages=[{"role": "user", "content": prompt}],
-        )
-        raw = msg.content[0].text.strip()
+            expect_json=True,
+            required_json_keys=["evolution_type", "evolution_reason", "updated_understanding"],
+        ).strip()
         # Strip markdown fences if present
         if "```" in raw:
             raw = raw.split("```")[1]

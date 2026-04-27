@@ -5,7 +5,7 @@
 ```mermaid
 graph TB
     subgraph SelfLearning["Self-Learning Loop"]
-        SL1[traces.jsonl] --> SL2[Weekly analysis\nclaude-sonnet-4-5]
+        SL1[traces.jsonl] --> SL2[Weekly analysis\nrouted LLM]
         SL2 --> SL3[system-insights.md\nPatterns + Prompt Hints]
         SL3 --> SL4[Pre-extraction\nhints injected]
         SL4 --> SL1
@@ -25,7 +25,7 @@ graph TB
         D --> H
         F --> H
         G --> H[POST /ingest]
-        H --> I[claude-sonnet-4-5\nextract metadata]
+        H --> I[routed LLM\nextract metadata]
         I --> J[hitl_queue.json\nstage with UUID]
         J --> K[GET /queue]
         K --> L{Human Review}
@@ -33,7 +33,7 @@ graph TB
         L -- reject --> N[Remove from queue]
         M --> O[wiki_writer.py]
         O --> P{Page exists?}
-        P -- yes --> Q[claude-haiku-4-5\nclassify evolution]
+        P -- yes --> Q[routed LLM\nclassify evolution]
         P -- no --> R[Create page\nwith understanding block]
         Q --> S[Evolve understanding\nappend section]
         S --> T[Atomic write]
@@ -52,7 +52,7 @@ graph TB
         Y -- yes --> Z[find_relevant_pages\nparse_concept_page]
         Y -- no --> AA[keyword match context]
         Z --> AB[Return knowledge_card]
-        AA --> AC[claude-haiku-4-5\nanswer with context]
+        AA --> AC[routed LLM\nanswer with context]
     end
 
     subgraph Frontend["Frontend (Vite/React :5173)"]
@@ -77,7 +77,7 @@ graph TB
 3. httpx.get(url) → BeautifulSoup → raw_text[:8000]
    (zero LLM — pure HTML parsing)
         ↓
-4. claude-sonnet-4-5 extracts:
+4. Routed extraction model extracts:
    { title, key_concepts, summary[5], suggested_page,
      suggested_wikilinks, tags, diagram? }
         ↓
@@ -91,7 +91,7 @@ graph TB
         ↓
 8. wiki_writer.py:
    a. If page exists:
-      - claude-haiku-4-5 classifies relationship:
+      - routed model classifies relationship:
         extends / refines / supersedes / duplicates / contradicts
       - Rewrites > Current understanding block with new synthesis
       - Updates evolution badge (🔵🟡🟠🔴⚪)
@@ -119,7 +119,7 @@ Each concept page has a **living understanding block** at the top:
 > *— refined by "PagedAttention paper" · 2026-04-14*
 ```
 
-When new information arrives, Haiku classifies the relationship:
+When new information arrives, the evolution classifier classifies the relationship:
 
 | Type | Badge | Meaning |
 |------|-------|---------|
@@ -133,19 +133,19 @@ The understanding block is **rewritten** on each approval (not appended to), so 
 
 ---
 
-## Model Assignment
+## Model Assignment (Current)
 
-| Task | Model | Rationale |
-|------|-------|-----------|
-| URL fetch + parse | httpx + BeautifulSoup | Zero LLM — deterministic, fast, free |
-| Content extraction | claude-sonnet-4-5 | Strong reasoning for concept ID, tag classification, diagram generation |
-| Evolution classification | claude-haiku-4-5 | Fast binary classification per approval — cheap, low-latency |
-| Wiki section formatting | claude-haiku-4-5 | Template-filling — fast + cheap, quality sufficient |
-| Understanding synthesis | claude-haiku-4-5 | Short synthesis from existing + new bullets |
-| Chat Q&A | claude-haiku-4-5 | Speed matters; context pre-filtered by keyword match |
-| All routing/parsing | Pure Python | Zero LLM — regex + string ops are deterministic |
+| Task | Default Route | Notes |
+|------|---------------|-------|
+| URL fetch + parse | `httpx + BeautifulSoup` | Zero LLM — deterministic, fast, free |
+| Content extraction (long/image) | Anthropic (`INGEST_EXTRACT`) | Quality-critical; multimodal-heavy |
+| Evolution classification | Ollama/Qwen by default | Contract fallback to Anthropic on invalid output |
+| Chat page selection | Ollama/Qwen by default | Cheap + low latency |
+| Chat Q&A | Ollama/Qwen by default | Can be overridden per task |
+| Lint / consolidate / knowledge gaps | Anthropic by default | Integrity-critical tasks |
+| All routing/parsing | Pure Python + `llm_client` | Task-based provider routing + contract guardrails |
 
-**Principle:** LLM only where rule-based fails. Every LLM call has a defined, narrow scope.
+**Principle:** LLM only where rule-based fails. High-volume tasks can run local; integrity-critical tasks use strict output contracts with Anthropic fallback.
 
 ---
 
