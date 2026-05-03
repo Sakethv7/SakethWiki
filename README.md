@@ -164,6 +164,8 @@ cd frontend && npm run build
 | Method | Path | Description |
 |--------|------|-------------|
 | POST | `/ingest` | Fetch URL or accept text/image, extract metadata, stage to queue |
+| POST | `/ingest-markdown` | Stage pasted markdown clip directly to intelligence queue |
+| POST | `/inbox/process` | Scan `_wiki/inbox/*.md` and stage clips to queue |
 | GET | `/queue` | List all pending review items |
 | POST | `/approve/{id}` | Approve or reject a queued item |
 | POST | `/chat` | Chat with your wiki (keyword-matched context + routed LLM) |
@@ -509,4 +511,52 @@ Reads synonyms from `_wiki/meta/tag-ontology.json` and rewrites frontmatter tags
 cd backend
 source venv/bin/activate
 pytest tests/
+```
+
+---
+
+## Focus Mode (Packaging)
+
+SakethWiki now ships with a packaging-first UX mode in the frontend.
+
+- **Primary loop:** `Capture` + `Ask`
+- **Secondary surfaces:** `Library` (Browse) + `Insights` (Dashboard)
+- **Onboarding:** one-time first-run card with quick actions
+- **Toggle:** header button switches between `Focus Mode` and `Classic Tabs`
+
+This keeps compounding wiki capabilities intact while reducing daily interaction friction.
+
+## App Icon
+
+- Web app icon now uses: `frontend/public/factorymind-mark.svg`
+- macOS app icon now uses: `resources/AppIcon.icns`
+
+If you re-export the AppleScript app, assign `resources/AppIcon.icns` as the application icon in Script Editor / Finder info panel.
+
+## Web Clipper Integration (New Default Flow)
+
+Capture is now split into transport vs intelligence:
+
+- **Transport:** Obsidian Web Clipper writes markdown into vault (`_wiki/inbox`) or you paste markdown in the Capture box.
+- **Intelligence:** SakethWiki parses clip content, proposes `suggested_page` / tags / links, and stages it to HITL queue.
+- **Decision:** You approve merge/create/discard in the same queue UI.
+
+### Option A — paste markdown directly
+
+Paste markdown into Capture and click Process. The frontend auto-routes markdown-like input to `/ingest-markdown`.
+
+### Option B — clip directly into vault
+
+Save clip files as `.md` under:
+
+```bash
+~/SakethVault/_wiki/inbox/
+```
+
+Then click **Process inbox clips** in Capture (or call `/inbox/process`).
+
+Processed files are moved to:
+
+```bash
+~/SakethVault/_wiki/inbox/processed/
 ```

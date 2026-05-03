@@ -37,3 +37,6 @@ nohup.out
 # IDE
 .vscode/
 .idea/
+
+hitl_queue.lock
+frontend/public/

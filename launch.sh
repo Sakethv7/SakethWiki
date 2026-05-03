@@ -5,7 +5,7 @@ pkill -f 'main\.py' 2>/dev/null
 pkill -f 'vite' 2>/dev/null
 sleep 1
 
-PROJECT="/Users/sakethv7/Sakethwiki"
+PROJECT="/Users/sakethv7/projects/Sakethwiki"
 export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 
 # Start backend (use venv python directly to avoid arch mismatch)

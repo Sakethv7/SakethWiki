@@ -278,11 +278,15 @@ def _format_section(item: dict) -> str:
     today         = datetime.now().strftime("%Y-%m-%d")
 
     bullets  = "\n".join(f"- {b}" for b in summary_bullets)
+    table = _summary_to_table(summary_bullets)
     normalized = [_wikilink_to_kebab(w) for w in wikilinks]
     related  = ", ".join(f"[[{w}]]" for w in normalized) if normalized else ""
     key_insight = _distill_insight(summary_bullets)
 
-    section = f"## [{source_title}]({source_url}) · {today}\n\n{bullets}\n\n**Key insight:** {key_insight}\n"
+    section = f"## [{source_title}]({source_url}) · {today}\n\n"
+    if table:
+        section += "**Insight map**\n\n" + table + "\n\n"
+    section += f"{bullets}\n\n**Key insight:** {key_insight}\n"
     if related:
         section += f"\nRelated: {related}\n"
 
@@ -296,6 +300,43 @@ def _format_section(item: dict) -> str:
 
     section += "\n---"
     return section
+
+
+def _summary_to_table(summary_bullets: list[str]) -> str:
+    """
+    Render a compact markdown table for scannability.
+    Deterministic heuristic split:
+    - Left: core claim
+    - Right: why-it-matters / mechanism
+    """
+    rows = []
+    for b in (summary_bullets or [])[:6]:
+        text = " ".join(str(b).split())
+        if not text:
+            continue
+        left, right = _split_claim(text)
+        # Escape pipes so markdown table doesn't break
+        left = left.replace("|", "\\|")
+        right = right.replace("|", "\\|")
+        rows.append((left, right))
+    if len(rows) < 2:
+        return ""
+    out = ["| Insight | Why it matters |", "|---|---|"]
+    out.extend([f"| {l} | {r} |" for l, r in rows])
+    return "\n".join(out)
+
+
+def _split_claim(text: str) -> tuple[str, str]:
+    # Prefer em-dash style split, then semicolon/colon, else midpoint fallback
+    for sep in [" — ", "; ", ": "]:
+        if sep in text:
+            a, b = text.split(sep, 1)
+            return a.strip(), b.strip()
+    words = text.split()
+    if len(words) < 10:
+        return text, "Context retained from source."
+    pivot = max(6, min(len(words) - 3, len(words) // 2))
+    return " ".join(words[:pivot]).strip(), " ".join(words[pivot:]).strip()
 
 
 # ── vault index / log ─────────────────────────────────────────────────────────

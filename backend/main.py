@@ -9,11 +9,13 @@ GET  /pages       — list all concept pages with metadata
 GET  /page/{name} — full content of a concept page
 """
 import base64
+import hashlib
 import json
 import logging
 import os
 import random
 import re as _re
+import shutil
 import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -100,6 +102,22 @@ class IngestRequest(BaseModel):
     force: bool = False
 
 
+class MarkdownIngestRequest(BaseModel):
+    markdown: str
+    source_url: Optional[str] = None
+    clip_title: Optional[str] = None
+    force: bool = False
+
+
+class InboxProcessRequest(BaseModel):
+    limit: int = 20
+    force: bool = False
+
+
+class RegenerateRequest(BaseModel):
+    mode: str = "full"  # full | diagram
+
+
 class ApproveRequest(BaseModel):
     approved: bool
     redirect_note: Optional[str] = None
@@ -117,6 +135,19 @@ class OpenThreadRequest(BaseModel):
 class ChatRequest(BaseModel):
     message: str
     history: list = []
+
+
+class InterviewRequest(BaseModel):
+    question: str
+    user_answer: Optional[str] = None
+
+
+class GapQueueRequest(BaseModel):
+    concept: str
+    gap: str
+    what_to_add: str
+    target_page: str
+    tags: list = []
 
 
 class SaveAnswerRequest(BaseModel):
@@ -137,6 +168,225 @@ class ConsolidateRequest(BaseModel):
 
 
 # ── /ingest ──────────────────────────────────────────────────────────────────
+
+def _vault_path() -> Path:
+    return Path(os.environ.get("VAULT_PATH", "/Users/sakethv7/SakethVault"))
+
+
+def _wiki_path() -> Path:
+    return _vault_path() / "_wiki"
+
+
+def _inbox_path() -> Path:
+    return _wiki_path() / "inbox"
+
+
+def _processed_inbox_path() -> Path:
+    return _inbox_path() / "processed"
+
+
+def _inbox_source_dirs() -> list[Path]:
+    """
+    Default scan paths for raw markdown clips.
+    Override with CLIP_INBOX_DIRS (comma-separated absolute or relative paths).
+    """
+    custom = os.environ.get("CLIP_INBOX_DIRS", "").strip()
+    if custom:
+        dirs = []
+        for raw in custom.split(","):
+            raw = raw.strip()
+            if not raw:
+                continue
+            p = Path(raw).expanduser()
+            if not p.is_absolute():
+                p = _vault_path() / p
+            dirs.append(p)
+        return dirs
+
+    return [
+        _inbox_path(),                 # new canonical path
+        _vault_path() / "Clippings",   # Obsidian Web Clipper default
+        _vault_path() / "clippings",   # lowercase variant
+        _wiki_path() / "Clippings",
+    ]
+
+
+def _processed_clips_index_path() -> Path:
+    return _wiki_path() / "meta" / "processed_clips.jsonl"
+
+
+def _extract_markdown_title(markdown: str) -> str:
+    # Prefer frontmatter title, then first markdown heading
+    fm = vault_reader._parse_frontmatter(markdown)
+    title = (fm.get("title") or "").strip() if isinstance(fm, dict) else ""
+    if title:
+        return title
+    for line in markdown.splitlines():
+        s = line.strip()
+        if s.startswith("# "):
+            return s[2:].strip()
+    return "Web clip"
+
+
+def _extract_markdown_mermaid(markdown: str) -> str:
+    m = _re.search(r"```mermaid\s*([\s\S]*?)```", markdown, flags=_re.IGNORECASE)
+    return (m.group(1).strip() if m else "")
+
+
+def _extract_markdown_image_links(markdown: str) -> list[str]:
+    links = []
+    # Markdown image syntax ![alt](url)
+    for m in _re.finditer(r"!\[[^\]]*\]\((https?://[^)\s]+)\)", markdown):
+        links.append(m.group(1))
+    # HTML image tags
+    for m in _re.finditer(r'<img[^>]+src=["\'](https?://[^"\']+)["\']', markdown, flags=_re.IGNORECASE):
+        links.append(m.group(1))
+    # Preserve order, unique
+    seen = set()
+    out = []
+    for u in links:
+        if u in seen:
+            continue
+        seen.add(u)
+        out.append(u)
+    return out[:10]
+
+
+def _clip_signature(markdown: str, source_url: str = "", clip_title: str = "") -> str:
+    body = " ".join(markdown.split())[:2000]
+    seed = f"{source_url.strip()}|{clip_title.strip()}|{body}"
+    return hashlib.sha256(seed.encode("utf-8")).hexdigest()
+
+
+def _is_clip_processed(sig: str) -> bool:
+    # Check queue first
+    for item in queue_manager.get_all():
+        if item.get("clip_signature") == sig:
+            return True
+    # Then check historical index
+    idx = _processed_clips_index_path()
+    if not idx.exists():
+        return False
+    for line in idx.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            rec = json.loads(line)
+        except Exception:
+            continue
+        if rec.get("clip_signature") == sig:
+            return True
+    return False
+
+
+def _record_processed_clip(item: dict, file_written: str) -> None:
+    sig = item.get("clip_signature")
+    if not sig:
+        return
+    idx = _processed_clips_index_path()
+    idx.parent.mkdir(parents=True, exist_ok=True)
+    rec = {
+        "ts": datetime.now().isoformat(),
+        "clip_signature": sig,
+        "title": item.get("title", ""),
+        "source_url": item.get("url", ""),
+        "inbox_file": item.get("inbox_file", ""),
+        "file_written": file_written,
+    }
+    with open(idx, "a", encoding="utf-8") as f:
+        f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+    inbox_file = item.get("inbox_file")
+    if inbox_file:
+        src = Path(inbox_file)
+        if src.exists():
+            _processed_inbox_path().mkdir(parents=True, exist_ok=True)
+            dst = _processed_inbox_path() / src.name
+            if dst.exists():
+                stem = src.stem
+                dst = _processed_inbox_path() / f"{stem}-{int(datetime.now().timestamp())}.md"
+            shutil.move(str(src), str(dst))
+
+
+def _stage_markdown_clip(markdown: str, source_url: str = "", clip_title: str = "", inbox_file: str = "", force: bool = False) -> dict:
+    text = markdown.strip()
+    if not text:
+        raise HTTPException(400, "Markdown is empty")
+    sig = _clip_signature(text, source_url, clip_title)
+    if not force and _is_clip_processed(sig):
+        raise HTTPException(409, "Clip already processed")
+
+    title_hint = clip_title.strip() if clip_title else _extract_markdown_title(text)
+    existing_pages = [p["name"] for p in vault_reader.list_concept_pages()]
+    extraction = _extract_with_sonnet(text, [], source_url or f"clip://{title_hint}", existing_pages)
+    # Preserve raw markdown visuals deterministically when present
+    md_diagram = _extract_markdown_mermaid(text)
+    if md_diagram and not extraction.get("diagram"):
+        extraction["diagram"] = md_diagram
+    md_images = _extract_markdown_image_links(text)
+    if md_images:
+        refs = extraction.get("references", []) or []
+        extraction["references"] = list(dict.fromkeys(refs + md_images))[:10]
+    item_id = str(uuid.uuid4())
+    item = {
+        "id": item_id,
+        "url": source_url or "",
+        "title": extraction["title"] or title_hint,
+        "key_concepts": extraction.get("key_concepts", []),
+        "summary": extraction["summary"],
+        "suggested_page": extraction["suggested_page"],
+        "suggested_wikilinks": extraction.get("suggested_wikilinks", []),
+        "tags": extraction.get("tags", []),
+        "references": extraction.get("references", []),
+        "diagram": extraction.get("diagram", ""),
+        "source_type": "clip_markdown",
+        "clip_signature": sig,
+        "raw_markdown": text,
+        "inbox_file": inbox_file,
+        "staged_at": datetime.now().isoformat(),
+        "status": "pending",
+    }
+    queue_manager.enqueue(item)
+    return item
+
+
+def _regen_item(item: dict, mode: str = "full") -> dict:
+    """Regenerate queue item extraction from raw markdown or source URL."""
+    updated = dict(item)
+    existing_pages = [p["name"] for p in vault_reader.list_concept_pages()]
+
+    if mode == "diagram":
+        updated["diagram"] = _fallback_diagram_from_summary(
+            title=updated.get("title", "Concept"),
+            summary=updated.get("summary", []),
+            key_concepts=updated.get("key_concepts", []),
+        )
+        updated["regenerated_at"] = datetime.now().isoformat()
+        updated["regenerated_mode"] = "diagram"
+        return updated
+
+    raw_md = updated.get("raw_markdown", "")
+    src_url = updated.get("url", "")
+    if raw_md:
+        extraction = _extract_with_sonnet(raw_md, [], src_url or "clip://regenerate", existing_pages)
+        md_diagram = _extract_markdown_mermaid(raw_md)
+        if md_diagram and not extraction.get("diagram"):
+            extraction["diagram"] = md_diagram
+        md_images = _extract_markdown_image_links(raw_md)
+        if md_images:
+            refs = extraction.get("references", []) or []
+            extraction["references"] = list(dict.fromkeys(refs + md_images))[:10]
+    elif src_url:
+        raw = _fetch_url(src_url)
+        extraction = _extract_with_sonnet(raw, [], src_url, existing_pages)
+    else:
+        raise HTTPException(400, "Cannot regenerate: item has neither raw_markdown nor url")
+
+    for k in ["title", "key_concepts", "summary", "suggested_page", "suggested_wikilinks", "tags", "references", "diagram"]:
+        updated[k] = extraction.get(k, updated.get(k))
+    updated["regenerated_at"] = datetime.now().isoformat()
+    updated["regenerated_mode"] = "full"
+    return updated
 
 def _is_ios_shortcut(request: Request) -> bool:
     """Detect iOS Shortcuts / Share Sheet callers by User-Agent."""
@@ -233,6 +483,94 @@ async def ingest(req: IngestRequest, request: Request):
             "synthesis": item.get("synthesis", ""),
             "open_questions": item.get("open_questions", []),
         },
+    }
+
+
+@app.post("/ingest-markdown")
+async def ingest_markdown(req: MarkdownIngestRequest):
+    item = _stage_markdown_clip(
+        markdown=req.markdown,
+        source_url=req.source_url or "",
+        clip_title=req.clip_title or "",
+        force=req.force,
+    )
+    return {
+        "id": item["id"],
+        "diff_preview": {
+            "title": item["title"],
+            "summary": item["summary"],
+            "suggested_page": item["suggested_page"],
+            "suggested_wikilinks": item["suggested_wikilinks"],
+            "tags": item["tags"],
+            "key_concepts": item["key_concepts"],
+            "references": item["references"],
+            "diagram": item["diagram"],
+        },
+    }
+
+
+@app.post("/inbox/process")
+async def process_inbox(req: InboxProcessRequest):
+    inbox = _inbox_path()
+    inbox.mkdir(parents=True, exist_ok=True)
+    _processed_inbox_path().mkdir(parents=True, exist_ok=True)
+
+    unique_files = []
+    seen = set()
+    for src_dir in _inbox_source_dirs():
+        if not src_dir.exists() or not src_dir.is_dir():
+            continue
+        for p in sorted(src_dir.glob("*.md")):
+            if not p.is_file():
+                continue
+            try:
+                key = str(p.resolve())
+            except Exception:
+                key = str(p.absolute())
+            if key in seen:
+                continue
+            seen.add(key)
+            unique_files.append(p)
+
+    files = unique_files[: max(1, min(req.limit, 200))]
+
+    queued = []
+    skipped = []
+    errors = []
+    for md_path in files:
+        try:
+            markdown = md_path.read_text(encoding="utf-8")
+            item = _stage_markdown_clip(
+                markdown=markdown,
+                source_url="",
+                clip_title=md_path.stem.replace("-", " ").strip(),
+                inbox_file=str(md_path),
+                force=req.force,
+            )
+            queued.append({"file": md_path.name, "id": item["id"], "suggested_page": item["suggested_page"]})
+        except HTTPException as e:
+            if e.status_code == 409:
+                skipped.append({"file": md_path.name, "reason": "already processed"})
+                try:
+                    dst = _processed_inbox_path() / md_path.name
+                    if dst.exists():
+                        dst = _processed_inbox_path() / f"{md_path.stem}-{int(datetime.now().timestamp())}.md"
+                    shutil.move(str(md_path), str(dst))
+                except Exception:
+                    pass
+            else:
+                errors.append({"file": md_path.name, "error": str(e.detail)})
+        except Exception as e:
+            errors.append({"file": md_path.name, "error": str(e)})
+
+    return {
+        "success": True,
+        "inbox_dir": str(inbox),
+        "scan_dirs": [str(p) for p in _inbox_source_dirs()],
+        "queued_count": len(queued),
+        "queued": queued,
+        "skipped": skipped,
+        "errors": errors,
     }
 
 
@@ -611,7 +949,43 @@ Rules:
             data["diagram"]
         )
 
+    # Fallback diagram: medium/long clips should still get a concept map even if LLM omits one.
+    if not data.get("diagram") and depth in {"medium", "long-form"}:
+        data["diagram"] = _fallback_diagram_from_summary(
+            title=data.get("title", "Concept"),
+            summary=data.get("summary", []),
+            key_concepts=data.get("key_concepts", []),
+        )
+
     return data
+
+
+def _safe_node_label(text: str, max_words: int = 6, max_chars: int = 44) -> str:
+    # Keep Mermaid-safe short labels
+    cleaned = _re.sub(r"[*_`#\\[\\]{}()<>|:\"']", " ", text or "")
+    cleaned = _re.sub(r"\s+", " ", cleaned).strip()
+    words = cleaned.split()[:max_words]
+    short = " ".join(words)[:max_chars].strip()
+    return short or "Insight"
+
+
+def _fallback_diagram_from_summary(title: str, summary: list, key_concepts: list) -> str:
+    center = _safe_node_label(title, max_words=5, max_chars=36)
+    bullets = [_safe_node_label(s, max_words=7, max_chars=44) for s in (summary or []) if str(s).strip()]
+    concepts = [_safe_node_label(c, max_words=3, max_chars=20) for c in (key_concepts or []) if str(c).strip()]
+
+    # Build a compact diagram: core -> insights, plus a concept cluster.
+    lines = ["flowchart LR", f'  C["{center}"]']
+    for i, b in enumerate(bullets[:5], 1):
+        lines.append(f'  I{i}["{b}"]')
+        lines.append(f"  C --> I{i}")
+    if concepts:
+        lines.append('  K["Key Concepts"]')
+        lines.append("  C --> K")
+        for i, c in enumerate(concepts[:4], 1):
+            lines.append(f'  K{i}["{c}"]')
+            lines.append(f"  K --> K{i}")
+    return "\n".join(lines)
 
 
 # ── /queue-url (iOS Share Sheet fast-path) ───────────────────────────────────
@@ -775,6 +1149,37 @@ async def get_queue():
     return {"items": queue_manager.get_all()}
 
 
+@app.post("/queue/regenerate/{item_id}")
+async def queue_regenerate(item_id: str, req: RegenerateRequest):
+    item = queue_manager.get_by_id(item_id)
+    if not item:
+        raise HTTPException(404, f"Item {item_id} not found in queue")
+    mode = (req.mode or "full").strip().lower()
+    if mode not in {"full", "diagram"}:
+        raise HTTPException(400, "mode must be one of: full, diagram")
+
+    updated = _regen_item(item, mode=mode)
+    ok = queue_manager.update(item_id, updated)
+    if not ok:
+        raise HTTPException(500, f"Failed to update queue item {item_id}")
+
+    return {
+        "success": True,
+        "mode": mode,
+        "id": item_id,
+        "diff_preview": {
+            "title": updated.get("title", ""),
+            "summary": updated.get("summary", []),
+            "suggested_page": updated.get("suggested_page", ""),
+            "suggested_wikilinks": updated.get("suggested_wikilinks", []),
+            "tags": updated.get("tags", []),
+            "key_concepts": updated.get("key_concepts", []),
+            "references": updated.get("references", []),
+            "diagram": updated.get("diagram", ""),
+        },
+    }
+
+
 # ── /approve/{item_id} ────────────────────────────────────────────────────────
 
 @app.post("/approve/{item_id}")
@@ -853,6 +1258,11 @@ async def approve(item_id: str, req: ApproveRequest):
         wiki_writer.fix_page_wikilinks(page_name)
     except Exception as _e:
         logger.warning("fix_page_wikilinks failed for %s: %s", page_name, _e)
+
+    try:
+        _record_processed_clip(item, file_path)
+    except Exception as _e:
+        logger.warning("_record_processed_clip failed for %s: %s", item_id, _e)
 
     # Classify any new tags so the frontend has colors for them
     try:
@@ -945,13 +1355,17 @@ def _semantic_page_select(message: str, page_summaries: str) -> list[str]:
         "If nothing is relevant, return [].\n\n"
         f"{page_summaries}"
     )
-    raw = llm_client.complete(
-        task="chat_select_pages",
-        model="claude-haiku-4-5-20251001",
-        max_tokens=200,
-        messages=[{"role": "user", "content": prompt}],
-        expect_json=True,
-    ).strip()
+    try:
+        raw = llm_client.complete(
+            task="chat_select_pages",
+            model="claude-haiku-4-5-20251001",
+            max_tokens=200,
+            messages=[{"role": "user", "content": prompt}],
+            expect_json=True,
+        ).strip()
+    except Exception as e:
+        logger.warning("chat_select_pages failed; falling back to keyword match: %s", e)
+        return []
     try:
         start = raw.find("[")
         end = raw.rfind("]") + 1
@@ -1050,6 +1464,178 @@ async def chat(req: ChatRequest):
         "pages_read": relevant_names,
         **({"knowledge_card": knowledge_card} if knowledge_card else {}),
     }
+
+
+# ── /interview ───────────────────────────────────────────────────────────────
+
+def _strip_code_fence(text: str) -> str:
+    text = text.strip()
+    if text.startswith("```"):
+        text = text[text.find("\n") + 1:]
+    if text.endswith("```"):
+        text = text[:text.rfind("```")]
+    return text.strip()
+
+
+def _run_verifier(question: str, wiki_answer: str) -> dict:
+    prompt = (
+        f"Interview question: {question}\n\n"
+        f"Knowledge base answer:\n{wiki_answer}\n\n"
+        "Evaluate this answer for interview-readiness. "
+        "Return ONLY valid JSON with no markdown fences:\n"
+        '{\n'
+        '  "score": <integer 1-10>,\n'
+        '  "verdict": "<one sentence>",\n'
+        '  "gaps": [\n'
+        '    {\n'
+        '      "concept": "<short concept name>",\n'
+        '      "gap": "<what is missing>",\n'
+        '      "what_to_add": "<the actual knowledge to add, 1-2 sentences>",\n'
+        '      "target_page": "<wiki page slug, e.g. kv-cache>"\n'
+        '    }\n'
+        '  ]\n'
+        '}'
+    )
+    raw = llm_client.complete(
+        task="interview_verify",
+        model=None,
+        max_tokens=1000,
+        messages=[{"role": "user", "content": prompt}],
+        expect_json=True,
+        required_json_keys=["score", "verdict", "gaps"],
+    )
+    return json.loads(_strip_code_fence(raw))
+
+
+def _run_grader(question: str, wiki_answer: str, user_answer: str) -> dict:
+    prompt = (
+        f"Interview question: {question}\n\n"
+        f"Reference answer:\n{wiki_answer}\n\n"
+        f"Candidate's answer:\n{user_answer}\n\n"
+        "Grade the candidate's answer. "
+        "Return ONLY valid JSON with no markdown fences:\n"
+        '{\n'
+        '  "score": <integer 1-10>,\n'
+        '  "what_you_got_right": ["<point>"],\n'
+        '  "what_you_missed": ["<point>"],\n'
+        '  "feedback": "<2-3 sentence assessment>"\n'
+        '}'
+    )
+    raw = llm_client.complete(
+        task="interview_grade",
+        model=None,
+        max_tokens=800,
+        messages=[{"role": "user", "content": prompt}],
+        expect_json=True,
+        required_json_keys=["score", "what_you_got_right", "what_you_missed", "feedback"],
+    )
+    return json.loads(_strip_code_fence(raw))
+
+
+@app.post("/interview")
+async def interview(req: InterviewRequest):
+    if not req.question or not req.question.strip():
+        raise HTTPException(400, "question cannot be empty")
+
+    # Stage 1: RAG — same page selection as /chat
+    all_pages = vault_reader.list_concept_pages()
+    page_summaries_parts = []
+    for p in all_pages:
+        content = vault_reader.read_page(p["name"]) or ""
+        body = _strip_frontmatter(content)
+        excerpt = body[:200].replace("\n", " ").strip()
+        page_summaries_parts.append(f"{p['name']} | {excerpt}")
+    page_summaries = "\n".join(page_summaries_parts)
+
+    loop = asyncio.get_event_loop()
+    relevant_names = await loop.run_in_executor(
+        None, _semantic_page_select, req.question, page_summaries
+    )
+    if not relevant_names:
+        relevant_names = vault_reader.find_relevant_pages(req.question)
+
+    pages_content = vault_reader.read_pages_content(relevant_names[:RAG_TOP_K])
+    context_parts = []
+    n_pages = len(pages_content)
+    per_page = RAG_CONTEXT_BUDGET // n_pages if n_pages else RAG_CONTEXT_BUDGET
+    for name, content in pages_content.items():
+        body = _strip_frontmatter(content)
+        context_parts.append(f"=== [[{name}]] ===\n{body[:per_page]}")
+    context = "\n\n".join(context_parts) if context_parts else "No matching pages found yet."
+
+    index_content = vault_reader.read_index()
+    system_block = [
+        {
+            "type": "text",
+            "text": (
+                "You are Saketh's personal AI knowledge assistant.\n\n"
+                "Answer the interview question using the wiki pages below. "
+                "Be structured and thorough — cover key concepts, mechanisms, and tradeoffs. "
+                "If the wiki is missing something important, note it at the end.\n\n"
+                f"Wiki index:\n{index_content[:800]}"
+            ),
+            "cache_control": {"type": "ephemeral"},
+        }
+    ]
+    user_content = [
+        {"type": "text", "text": f"Relevant wiki pages:\n{context}", "cache_control": {"type": "ephemeral"}},
+        {"type": "text", "text": f"Interview question: {req.question}"},
+    ]
+
+    wiki_answer = llm_client.complete(
+        task="chat_answer",
+        model="claude-haiku-4-5-20251001",
+        max_tokens=1500,
+        system=system_block,
+        messages=[{"role": "user", "content": user_content}],
+    )
+
+    # Stage 2: Verify with routed model (default: Ollama/Qwen3:14b via LLM_PROVIDER_INTERVIEW_VERIFY)
+    try:
+        verification = await loop.run_in_executor(
+            None, _run_verifier, req.question, wiki_answer
+        )
+    except Exception as e:
+        logger.warning("Interview verifier failed: %s", e)
+        verification = {"score": None, "verdict": "Verification unavailable", "gaps": []}
+
+    # Stage 3: Grade user's own answer if provided
+    user_grading = None
+    if req.user_answer and req.user_answer.strip():
+        try:
+            user_grading = await loop.run_in_executor(
+                None, _run_grader, req.question, wiki_answer, req.user_answer
+            )
+        except Exception as e:
+            logger.warning("Interview grader failed: %s", e)
+            user_grading = {"score": None, "feedback": "Grading unavailable", "what_you_got_right": [], "what_you_missed": []}
+
+    return {
+        "wiki_answer": wiki_answer,
+        "pages_read": relevant_names,
+        "verification": verification,
+        **({"user_grading": user_grading} if user_grading is not None else {}),
+    }
+
+
+@app.post("/queue-gap")
+async def queue_gap(req: GapQueueRequest):
+    """Stage a single knowledge gap from interview mode to the HITL queue."""
+    item = {
+        "id": str(uuid.uuid4()),
+        "source_type": "gap_fill",
+        "title": f"Gap: {req.concept}",
+        "suggested_page": req.target_page or _slug_text(req.concept),
+        "key_concepts": [req.concept],
+        "summary": [req.what_to_add],
+        "tags": req.tags,
+        "url": None,
+        "raw_text": f"Gap from interview practice:\n\n{req.gap}\n\nTo add:\n{req.what_to_add}",
+        "timestamp": datetime.utcnow().isoformat(),
+        "pending_extraction": False,
+    }
+    queue_manager.enqueue(item)
+    return {"id": item["id"], "status": "queued"}
 
 
 # ── /pages ───────────────────────────────────────────────────────────────────

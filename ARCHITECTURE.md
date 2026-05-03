@@ -239,6 +239,52 @@ Map each tag through synonym table (case-insensitive)
 Return { normalized: [...], mappings: {old: new, ...} }
 ```
 
+### 9. UX Packaging Layer (Focus Mode)
+
+**Goal:** Keep all existing capability while changing default interaction cost.
+
+```
+Focus Home Card
+    ↓
+Primary actions: Capture / Ask
+    ↓
+Secondary actions: Library / Insights
+    ↓
+Underlying systems unchanged:
+  - Ingestion queue + HITL
+  - Chat retrieval + answer generation
+  - Browse / Health automation
+  - Dashboard metrics
+```
+
+**Implementation details**
+- Toggle in app header: `Focus Mode` vs `Classic Tabs`
+- One-time onboarding state persisted in `localStorage` key `sw_focus_mode_onboarded`
+- Quick-action card drives tab routing instead of changing backend behavior
+
+### 10. Clip Inbox Refinement Pipeline
+
+**Goal:** Web clipping writes raw markdown; SakethWiki converts raw clips into evolving concept knowledge.
+
+```
+Web Clipper / pasted markdown
+    ↓
+_wiki/inbox/*.md or /ingest-markdown
+    ↓
+SakethWiki extraction + page-match suggestion
+    ↓
+HITL queue review (approve / skip)
+    ↓
+concept evolution write + trace append
+    ↓
+processed_clips index + inbox file archive
+```
+
+**Key paths**
+- Inbox source: `_wiki/inbox/`
+- Archived clips: `_wiki/inbox/processed/`
+- Processed clip index: `_wiki/meta/processed_clips.jsonl`
+
 **Frontend:** Tags auto-normalized before approve. Tag dropdown merges ontology canonical tags with VALID_TAGS. One-off vault cleanup script: `backend/normalize_vault_tags.py --dry-run`.
 
 **One-off script:** `python normalize_vault_tags.py` rewrites frontmatter tags across all concept pages using the ontology.

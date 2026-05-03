@@ -60,10 +60,18 @@ function MermaidDiagram({ chart }) {
 // ── helpers ───────────────────────────────────────────────────────────────────
 
 async function api(path, opts = {}) {
-  const res = await fetch(API + path, {
-    headers: { "Content-Type": "application/json" },
-    ...opts,
-  });
+  let res;
+  try {
+    res = await fetch(API + path, {
+      headers: { "Content-Type": "application/json" },
+      ...opts,
+    });
+  } catch (e) {
+    if (e?.message?.includes("Failed to fetch")) {
+      throw new Error(`Backend offline at ${API}. Start backend on port 8001.`);
+    }
+    throw e;
+  }
   if (!res.ok) {
     const err = await res.json().catch(() => ({ detail: res.statusText }));
     throw new Error(err.detail || res.statusText);
@@ -399,6 +407,19 @@ function looksLikeQuestion(text) {
   return false;
 }
 
+function looksLikeMarkdownClip(text) {
+  if (!text) return false;
+  const t = text.trim();
+  if (!t) return false;
+  const heading = /^#{1,6}\s+/m.test(t);
+  const linkRef = /\[[^\]]+\]\([^)]+\)/.test(t);
+  const bullet = /^[-*]\s+/m.test(t) || /^\d+\.\s+/m.test(t);
+  const codeFence = /```/.test(t);
+  const frontmatter = /^---\n[\s\S]*?\n---\n/m.test(t);
+  const longEnough = t.length > 180;
+  return frontmatter || (longEnough && ((heading && bullet) || (heading && linkRef) || (bullet && linkRef) || codeFence));
+}
+
 function IngestTab({ onApproved, onSwitchToChat }) {
   const [input, setInput] = useState("");
   const [images, setImages] = useState([]);
@@ -414,6 +435,9 @@ function IngestTab({ onApproved, onSwitchToChat }) {
   const [queueKey, setQueueKey] = useState(0);
   const [ontologyTags, setOntologyTags] = useState([]);
   const [dragOver, setDragOver] = useState(false);
+  const [processingInbox, setProcessingInbox] = useState(false);
+  const [inboxStatus, setInboxStatus] = useState(null);
+  const [regeneratingMode, setRegeneratingMode] = useState(null);
 
   useEffect(() => {
     api("/tag-ontology").then(d => setOntologyTags(Object.keys(d))).catch(() => {});
@@ -515,13 +539,45 @@ function IngestTab({ onApproved, onSwitchToChat }) {
       const body = {};
       const trimmed = input.trim();
       const firstLine = trimmed.split("\n")[0].trim();
-      if (firstLine.startsWith("http://") || firstLine.startsWith("https://")) body.url = firstLine;
-      else if (trimmed) body.text = trimmed;
-      if (images.length) body.images = images.map(({ data, mediaType }) => ({ data, mediaType }));
-      const data = await api("/ingest", { method: "POST", body: JSON.stringify(body) });
+      let data;
+      if (!images.length && looksLikeMarkdownClip(trimmed)) {
+        data = await api("/ingest-markdown", {
+          method: "POST",
+          body: JSON.stringify({ markdown: trimmed }),
+        });
+      } else {
+        if (firstLine.startsWith("http://") || firstLine.startsWith("https://")) body.url = firstLine;
+        else if (trimmed) body.text = trimmed;
+        if (images.length) body.images = images.map(({ data, mediaType }) => ({ data, mediaType }));
+        data = await api("/ingest", { method: "POST", body: JSON.stringify(body) });
+      }
       setPreview(data); setEdits(null);
     } catch (e) { setError(e.message); }
     finally { setLoading(false); }
+  }
+
+  async function handleProcessInbox() {
+    setProcessingInbox(true);
+    setError("");
+    try {
+      const data = await api("/inbox/process", { method: "POST", body: JSON.stringify({ limit: 25 }) });
+      setInboxStatus(data);
+      if (data.queued_count > 0) {
+        setDone(`Queued ${data.queued_count} clip${data.queued_count > 1 ? "s" : ""} from inbox`);
+        setQueueKey(k => k + 1);
+      } else {
+        const skipped = data.skipped?.length || 0;
+        if (skipped > 0) setDone(`No new clips queued (${skipped} skipped as already processed)`);
+        else setDone("No markdown clips found in scanned inbox folders");
+      }
+      if (data.errors?.length) {
+        setError(`Inbox processing errors: ${data.errors.slice(0, 2).map(e => e.file).join(", ")}`);
+      }
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setProcessingInbox(false);
+    }
   }
 
   async function handleApprove(approved) {
@@ -566,6 +622,26 @@ function IngestTab({ onApproved, onSwitchToChat }) {
   function setEdit(field, value) { setEdits(e => ({ ...e, [field]: value })); }
   const display = edits || preview?.diff_preview;
 
+  async function handleRegenerate(mode) {
+    if (!preview?.id) return;
+    setRegeneratingMode(mode);
+    setError("");
+    try {
+      const data = await api(`/queue/regenerate/${preview.id}`, {
+        method: "POST",
+        body: JSON.stringify({ mode }),
+      });
+      setPreview({ ...preview, diff_preview: data.diff_preview });
+      if (edits) setEdits(null);
+      setDone(mode === "diagram" ? "Diagram regenerated" : "Wiki extraction regenerated");
+      setQueueKey(k => k + 1);
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setRegeneratingMode(null);
+    }
+  }
+
   return (
     <div className="space-y-5">
       {done && (
@@ -598,7 +674,7 @@ function IngestTab({ onApproved, onSwitchToChat }) {
         {!dragOver && (
         <textarea
           className="w-full h-28 px-4 pt-4 text-sm text-stone-800 placeholder-stone-400 resize-none focus:outline-none"
-          placeholder="Paste a URL, tweet, article, or notes… or paste a screenshot directly here"
+          placeholder="Paste URL, markdown clip, notes, or screenshot"
           value={input}
           onChange={(e) => setInput(e.target.value)}
           onPaste={handlePaste}
@@ -638,6 +714,10 @@ function IngestTab({ onApproved, onSwitchToChat }) {
               className="text-stone-400 hover:text-stone-600 transition-colors">
               <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M15.172 7l-6.586 6.586a2 2 0 102.828 2.828l6.414-6.586a4 4 0 00-5.656-5.656l-6.415 6.585a6 6 0 108.486 8.486L20.5 13"/></svg>
             </button>
+            <button onClick={handleProcessInbox} disabled={processingInbox}
+              className="text-xs text-stone-500 hover:text-orange-600 transition-colors font-medium disabled:opacity-40">
+              {processingInbox ? "Scanning inbox…" : "Process inbox clips"}
+            </button>
           </div>
           <input ref={fileRef} type="file" accept="image/*" multiple className="hidden" onChange={handleImageUpload} />
 
@@ -670,6 +750,21 @@ function IngestTab({ onApproved, onSwitchToChat }) {
         <div className="flex items-start gap-2.5 bg-red-50 border border-red-100 text-red-600 rounded-2xl px-4 py-3 text-sm">
           <svg className="w-4 h-4 mt-0.5 shrink-0" fill="currentColor" viewBox="0 0 20 20"><path fillRule="evenodd" d="M18 10a8 8 0 11-16 0 8 8 0 0116 0zm-7 4a1 1 0 11-2 0 1 1 0 012 0zm-1-9a1 1 0 00-1 1v4a1 1 0 102 0V6a1 1 0 00-1-1z" clipRule="evenodd"/></svg>
           <span>{error}</span>
+        </div>
+      )}
+
+      {inboxStatus && (
+        <div className="bg-stone-50 border border-stone-200 rounded-xl px-3 py-2.5 text-xs text-stone-600">
+          <div className="flex flex-wrap gap-x-3 gap-y-1">
+            <span>Queued: <span className="font-medium text-stone-800">{inboxStatus.queued_count || 0}</span></span>
+            <span>Skipped: <span className="font-medium text-stone-800">{inboxStatus.skipped?.length || 0}</span></span>
+            <span>Errors: <span className="font-medium text-stone-800">{inboxStatus.errors?.length || 0}</span></span>
+          </div>
+          {Array.isArray(inboxStatus.scan_dirs) && inboxStatus.scan_dirs.length > 0 && (
+            <p className="mt-1.5 text-[11px] text-stone-500">
+              Scanned: {inboxStatus.scan_dirs.join(" • ")}
+            </p>
+          )}
         </div>
       )}
 
@@ -805,6 +900,18 @@ function IngestTab({ onApproved, onSwitchToChat }) {
                     );
                   })}
                 </div>
+                {display.references.filter(r => /\.(png|jpe?g|webp|gif)(\?.*)?$/i.test(r)).length > 0 && (
+                  <div className="pt-2">
+                    <p className="text-[11px] text-stone-400 mb-1">Image links found in clip</p>
+                    <div className="flex flex-wrap gap-2">
+                      {display.references.filter(r => /\.(png|jpe?g|webp|gif)(\?.*)?$/i.test(r)).slice(0, 4).map((img) => (
+                        <a key={img} href={img} target="_blank" rel="noopener noreferrer" className="block">
+                          <img src={img} alt="clip reference" className="w-16 h-16 object-cover rounded-lg border border-stone-200" />
+                        </a>
+                      ))}
+                    </div>
+                  </div>
+                )}
               </div>
             )}
 
@@ -833,6 +940,22 @@ function IngestTab({ onApproved, onSwitchToChat }) {
 
           {/* Actions */}
           <div className="px-5 py-4 border-t border-stone-100 bg-stone-50/40 space-y-3">
+            <div className="flex gap-2">
+              <button
+                onClick={() => handleRegenerate("full")}
+                disabled={!!regeneratingMode || approving}
+                className="text-xs px-3 py-1.5 rounded-lg border border-stone-200 text-stone-600 hover:bg-stone-100 disabled:opacity-40"
+              >
+                {regeneratingMode === "full" ? "Regenerating wiki…" : "Regenerate wiki"}
+              </button>
+              <button
+                onClick={() => handleRegenerate("diagram")}
+                disabled={!!regeneratingMode || approving}
+                className="text-xs px-3 py-1.5 rounded-lg border border-stone-200 text-stone-600 hover:bg-stone-100 disabled:opacity-40"
+              >
+                {regeneratingMode === "diagram" ? "Regenerating diagram…" : "Regenerate diagram"}
+              </button>
+            </div>
             <label className="flex items-center gap-2.5 cursor-pointer select-none group">
               <div className={`w-8 h-4 rounded-full transition-colors ${openThread ? "bg-orange-500" : "bg-stone-200"}`}
                 onClick={() => setOpenThread(v => !v)}>
@@ -3035,12 +3158,258 @@ function DashboardTab({ onNavigateToConcept }) {
 
 // ── APP SHELL ─────────────────────────────────────────────────────────────────
 
+// ── INTERVIEW TAB ─────────────────────────────────────────────────────────────
+
+function ScoreBadge({ score }) {
+  if (score === null || score === undefined) return null;
+  const color = score >= 8 ? "bg-emerald-100 text-emerald-700 ring-emerald-200"
+    : score >= 5 ? "bg-amber-100 text-amber-700 ring-amber-200"
+    : "bg-red-100 text-red-700 ring-red-200";
+  return (
+    <span className={`inline-flex items-center px-2.5 py-1 rounded-full text-sm font-semibold ring-1 ${color}`}>
+      {score}/10
+    </span>
+  );
+}
+
+function InterviewTab() {
+  const [question, setQuestion] = useState("");
+  const [myAnswer, setMyAnswer] = useState("");
+  const [showMyAnswer, setShowMyAnswer] = useState(false);
+  const [loading, setLoading] = useState(false);
+  const [stage, setStage] = useState(""); // "wiki" | "verifying" | ""
+  const [result, setResult] = useState(null);
+  const [gapStatus, setGapStatus] = useState({}); // index → "adding"|"added"|"error"
+  const [error, setError] = useState(null);
+
+  async function handleSubmit() {
+    if (!question.trim() || loading) return;
+    setLoading(true);
+    setResult(null);
+    setError(null);
+    setGapStatus({});
+    setStage("wiki");
+    try {
+      setStage("verifying");
+      const data = await api("/interview", {
+        method: "POST",
+        body: JSON.stringify({
+          question: question.trim(),
+          user_answer: showMyAnswer && myAnswer.trim() ? myAnswer.trim() : null,
+        }),
+      });
+      setResult(data);
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setLoading(false);
+      setStage("");
+    }
+  }
+
+  async function handleAddGap(gap, idx) {
+    setGapStatus(s => ({ ...s, [idx]: "adding" }));
+    try {
+      await api("/queue-gap", {
+        method: "POST",
+        body: JSON.stringify({
+          concept: gap.concept,
+          gap: gap.gap,
+          what_to_add: gap.what_to_add,
+          target_page: gap.target_page,
+          tags: [],
+        }),
+      });
+      setGapStatus(s => ({ ...s, [idx]: "added" }));
+    } catch {
+      setGapStatus(s => ({ ...s, [idx]: "error" }));
+    }
+  }
+
+  function handleKey(e) {
+    if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) handleSubmit();
+  }
+
+  const gaps = result?.verification?.gaps || [];
+  const grading = result?.user_grading;
+
+  return (
+    <div className="space-y-4 pb-8">
+      {/* Question input */}
+      <div className="bg-white rounded-xl border border-stone-200 p-4 space-y-3">
+        <p className="text-sm font-semibold text-stone-900">Interview Practice</p>
+        <textarea
+          value={question}
+          onChange={e => setQuestion(e.target.value)}
+          onKeyDown={handleKey}
+          placeholder="e.g. Explain how KV-cache works and why it matters for inference…"
+          rows={3}
+          className="w-full text-sm text-stone-800 border border-stone-200 rounded-lg px-3 py-2 resize-none focus:outline-none focus:ring-2 focus:ring-orange-300 placeholder-stone-400"
+        />
+
+        {/* My answer toggle */}
+        <div>
+          <button
+            onClick={() => setShowMyAnswer(v => !v)}
+            className="text-xs text-stone-500 hover:text-stone-700 flex items-center gap-1"
+          >
+            <svg className={`w-3.5 h-3.5 transition-transform ${showMyAnswer ? "rotate-90" : ""}`} fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7"/>
+            </svg>
+            {showMyAnswer ? "Hide my answer" : "Add my answer to get graded"}
+          </button>
+          {showMyAnswer && (
+            <textarea
+              value={myAnswer}
+              onChange={e => setMyAnswer(e.target.value)}
+              placeholder="Type your answer here — the wiki will grade it against what it knows…"
+              rows={4}
+              className="mt-2 w-full text-sm text-stone-800 border border-stone-200 rounded-lg px-3 py-2 resize-none focus:outline-none focus:ring-2 focus:ring-orange-300 placeholder-stone-400"
+            />
+          )}
+        </div>
+
+        <div className="flex items-center justify-between">
+          <p className="text-xs text-stone-400">⌘↵ to submit</p>
+          <button
+            onClick={handleSubmit}
+            disabled={loading || !question.trim()}
+            className="px-4 py-2 rounded-lg bg-orange-500 text-white text-sm font-medium hover:bg-orange-600 disabled:opacity-40 disabled:cursor-not-allowed"
+          >
+            {loading ? (stage === "wiki" ? "Searching wiki…" : "Verifying…") : "Run"}
+          </button>
+        </div>
+      </div>
+
+      {error && (
+        <div className="text-sm text-red-500 bg-red-50 border border-red-100 rounded-xl px-4 py-3">{error}</div>
+      )}
+
+      {result && (
+        <>
+          {/* Wiki answer */}
+          <div className="bg-white rounded-xl border border-stone-200 p-4 space-y-2">
+            <p className="text-xs font-semibold text-stone-400 uppercase tracking-wide">Wiki answer</p>
+            <div
+              className="text-sm text-stone-800 leading-relaxed prose prose-sm max-w-none
+                prose-headings:text-stone-900 prose-headings:font-semibold prose-headings:mt-3 prose-headings:mb-1
+                prose-p:my-1.5 prose-p:text-stone-700
+                prose-strong:text-stone-900 prose-strong:font-semibold
+                prose-ul:my-1.5 prose-ul:pl-4 prose-ol:my-1.5 prose-ol:pl-4
+                prose-li:my-0.5 prose-li:text-stone-700
+                prose-code:text-orange-600 prose-code:bg-orange-50 prose-code:rounded prose-code:px-1 prose-code:text-xs"
+              dangerouslySetInnerHTML={{ __html: DOMPurify.sanitize(marked.parse(result.wiki_answer)) }}
+            />
+            {result.pages_read?.length > 0 && (
+              <div className="flex flex-wrap gap-1 pt-1">
+                {result.pages_read.map(p => (
+                  <span key={p} className="text-[11px] text-stone-400 font-mono bg-stone-100 px-1.5 py-0.5 rounded-md">[[{p}]]</span>
+                ))}
+              </div>
+            )}
+          </div>
+
+          {/* Verification */}
+          <div className="bg-white rounded-xl border border-stone-200 p-4 space-y-3">
+            <div className="flex items-center justify-between">
+              <p className="text-xs font-semibold text-stone-400 uppercase tracking-wide">Verification</p>
+              <ScoreBadge score={result.verification?.score} />
+            </div>
+            {result.verification?.verdict && (
+              <p className="text-sm text-stone-700">{result.verification.verdict}</p>
+            )}
+            {gaps.length > 0 && (
+              <div className="space-y-2">
+                <p className="text-xs font-medium text-stone-500">Knowledge gaps</p>
+                {gaps.map((gap, i) => (
+                  <div key={i} className="rounded-lg border border-amber-100 bg-amber-50 px-3 py-2.5 space-y-1">
+                    <div className="flex items-start justify-between gap-2">
+                      <div className="flex-1 min-w-0">
+                        <p className="text-xs font-semibold text-amber-800">{gap.concept}</p>
+                        <p className="text-xs text-amber-700 mt-0.5">{gap.gap}</p>
+                        <p className="text-xs text-stone-600 mt-1 italic">{gap.what_to_add}</p>
+                      </div>
+                      <button
+                        onClick={() => handleAddGap(gap, i)}
+                        disabled={gapStatus[i] === "adding" || gapStatus[i] === "added"}
+                        className={`shrink-0 text-xs px-2.5 py-1 rounded-full border transition-colors whitespace-nowrap ${
+                          gapStatus[i] === "added"
+                            ? "border-emerald-200 text-emerald-600 bg-emerald-50"
+                            : gapStatus[i] === "error"
+                            ? "border-red-200 text-red-500 bg-red-50"
+                            : "border-amber-200 text-amber-700 hover:bg-amber-100"
+                        }`}
+                      >
+                        {gapStatus[i] === "adding" ? "…"
+                          : gapStatus[i] === "added" ? "✓ Queued"
+                          : gapStatus[i] === "error" ? "Failed"
+                          : "+ Add to wiki"}
+                      </button>
+                    </div>
+                    {gap.target_page && (
+                      <p className="text-[10px] text-stone-400 font-mono">→ [[{gap.target_page}]]</p>
+                    )}
+                  </div>
+                ))}
+              </div>
+            )}
+            {gaps.length === 0 && result.verification?.score !== null && (
+              <p className="text-xs text-emerald-600">No gaps found — wiki answer looks complete.</p>
+            )}
+          </div>
+
+          {/* User grading */}
+          {grading && (
+            <div className="bg-white rounded-xl border border-stone-200 p-4 space-y-3">
+              <div className="flex items-center justify-between">
+                <p className="text-xs font-semibold text-stone-400 uppercase tracking-wide">Your answer</p>
+                <ScoreBadge score={grading.score} />
+              </div>
+              {grading.feedback && (
+                <p className="text-sm text-stone-700">{grading.feedback}</p>
+              )}
+              {grading.what_you_got_right?.length > 0 && (
+                <div>
+                  <p className="text-xs font-medium text-emerald-700 mb-1">Got right</p>
+                  <ul className="space-y-0.5">
+                    {grading.what_you_got_right.map((pt, i) => (
+                      <li key={i} className="text-xs text-stone-600 flex gap-1.5">
+                        <span className="text-emerald-500 shrink-0">✓</span>{pt}
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+              {grading.what_you_missed?.length > 0 && (
+                <div>
+                  <p className="text-xs font-medium text-red-600 mb-1">Missed</p>
+                  <ul className="space-y-0.5">
+                    {grading.what_you_missed.map((pt, i) => (
+                      <li key={i} className="text-xs text-stone-600 flex gap-1.5">
+                        <span className="text-red-400 shrink-0">✗</span>{pt}
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+            </div>
+          )}
+        </>
+      )}
+    </div>
+  );
+}
+
+
 const TABS = [
   { id: "ingest", label: "Capture", icon: (
     <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M12 4v16m8-8H4"/></svg>
   )},
   { id: "chat", label: "Chat", icon: (
     <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M8 10h.01M12 10h.01M16 10h.01M9 16H5a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v8a2 2 0 01-2 2h-5l-5 5v-5z"/></svg>
+  )},
+  { id: "interview", label: "Interview", icon: (
+    <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"/></svg>
   )},
   { id: "browse", label: "Browse", icon: (
     <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10"/></svg>
@@ -3049,6 +3418,82 @@ const TABS = [
     <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z"/></svg>
   )},
 ];
+
+const FOCUS_PRIMARY_TABS = [
+  { id: "ingest", label: "Capture" },
+  { id: "chat", label: "Ask" },
+];
+
+const FOCUS_SECONDARY_TABS = [
+  { id: "interview", label: "Practice" },
+  { id: "browse", label: "Library" },
+  { id: "dashboard", label: "Insights" },
+];
+
+const FOCUS_ONBOARDING_KEY = "sw_focus_mode_onboarded";
+
+function FocusHomeCard({ onGoCapture, onGoAsk, onGoLibrary, onGoInsights }) {
+  const [showOnboarding, setShowOnboarding] = useState(false);
+
+  useEffect(() => {
+    try {
+      setShowOnboarding(localStorage.getItem(FOCUS_ONBOARDING_KEY) !== "1");
+    } catch {
+      setShowOnboarding(true);
+    }
+  }, []);
+
+  function dismissOnboarding() {
+    try {
+      localStorage.setItem(FOCUS_ONBOARDING_KEY, "1");
+    } catch {}
+    setShowOnboarding(false);
+  }
+
+  return (
+    <div className="mb-4 space-y-3">
+      {showOnboarding && (
+        <div className="rounded-xl border border-orange-200 bg-orange-50 px-4 py-3">
+          <div className="flex items-start justify-between gap-3">
+            <div>
+              <p className="text-sm font-semibold text-orange-900">Welcome to Focus Mode</p>
+              <p className="text-xs text-orange-800 mt-1">
+                Default daily loop is Capture then Ask. Library and Insights are secondary so the main flow stays fast.
+              </p>
+            </div>
+            <button
+              onClick={dismissOnboarding}
+              className="text-xs px-2 py-1 rounded-md bg-white/70 text-orange-700 hover:bg-white"
+            >
+              Dismiss
+            </button>
+          </div>
+        </div>
+      )}
+
+      <div className="rounded-xl border border-stone-200 bg-white p-4">
+        <p className="text-sm font-semibold text-stone-900">Capture. Understand. Act.</p>
+        <p className="text-xs text-stone-500 mt-1">
+          Save what you learned, ask the wiki what it knows, and keep cleanup actions close when needed.
+        </p>
+        <div className="mt-3 grid grid-cols-2 gap-2">
+          <button onClick={onGoCapture} className="px-3 py-2 rounded-lg bg-orange-500 text-white text-sm font-medium hover:bg-orange-600">
+            + Capture
+          </button>
+          <button onClick={onGoAsk} className="px-3 py-2 rounded-lg bg-stone-900 text-white text-sm font-medium hover:bg-stone-700">
+            Ask Wiki
+          </button>
+          <button onClick={onGoLibrary} className="px-3 py-2 rounded-lg border border-stone-200 text-stone-700 text-sm hover:bg-stone-50">
+            Open Library
+          </button>
+          <button onClick={onGoInsights} className="px-3 py-2 rounded-lg border border-stone-200 text-stone-700 text-sm hover:bg-stone-50">
+            View Insights
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
 
 function BackendStatus() {
   const [online, setOnline] = useState(null); // null=checking, true, false
@@ -3125,6 +3570,7 @@ export default function App() {
               <ChatTab />
             </div>
           )}
+          {tab === "interview" && <InterviewTab />}
           {tab === "browse" && (
             <div className="flex flex-col" style={{ height: "calc(100vh - 120px)" }}>
               <BrowseTab />

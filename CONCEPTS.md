@@ -285,6 +285,12 @@ Pattern: `write to path.tmp → os.rename(path.md)`. POSIX guarantees rename is 
 ### HITL Queue with UUID-keyed JSON
 Human review before any vault write prevents junk accumulating. `hitl_queue.json` is append-only, survives process restarts, and items are removed only on explicit approve/reject.
 
+### Packaging Is a Control Surface, Not a Capability Rewrite
+When a knowledge system becomes feature-rich, interaction friction becomes the bottleneck before model quality does. Focus Mode makes `Capture → Ask` the default loop and demotes `Browse/Dashboard` to secondary actions, without removing them. This preserves compounding behavior while reducing cognitive load and startup latency for daily use.
+
+### Clipping Is Transport, Refinement Is Value
+Raw markdown clipping is now treated as transport. The value layer is refinement: dedupe, page routing, synthesis update, and trace-backed evolution. This lets Obsidian Web Clipper own ingestion speed while SakethWiki owns knowledge compounding quality.
+
 ---
 
 ## Vault File Structure
