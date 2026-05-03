@@ -38,6 +38,19 @@ LOG_PATH     = VAULT_PATH / "_wiki" / "log.md"
 
 EVOLUTION_TYPES = ("extends", "refines", "supersedes", "duplicates", "contradicts")
 
+# Tags that signal a domain — used to route pages to the right subfolder
+_HUMANITIES_TAGS = {"History", "Geopolitics", "Politics", "Geography", "Philosophy", "Culture", "IR"}
+_SCIENCE_TAGS    = {"Physics", "Math", "Chemistry", "Biology", "Statistics"}
+
+def _domain_folder(item: dict) -> str:
+    """Derive vault subfolder from item tags. Defaults to 'cs'."""
+    tags = set(item.get("tags", []))
+    if tags & _HUMANITIES_TAGS:
+        return "humanities"
+    if tags & _SCIENCE_TAGS:
+        return "science"
+    return "cs"
+
 
 # ── public API ────────────────────────────────────────────────────────────────
 
@@ -47,13 +60,16 @@ def write_approved(item: dict) -> str:
     Returns the relative path of the file written plus evolution metadata.
     """
     vault = Path(os.environ.get("VAULT_PATH", "/Users/sakethv7/SakethVault"))
-    concepts_dir = vault / "_wiki" / "concepts"
-    sources_dir  = vault / "_wiki" / "sources"
-    concepts_dir.mkdir(parents=True, exist_ok=True)
+    domain      = item.get("domain") or _domain_folder(item)
+    domain_dir  = vault / "_wiki" / domain
+    sources_dir = vault / "_wiki" / "sources"
+    domain_dir.mkdir(parents=True, exist_ok=True)
     sources_dir.mkdir(parents=True, exist_ok=True)
 
     page_name = _slug(item.get("suggested_page", "general"))
-    page_path = concepts_dir / f"{page_name}.md"
+    # If page already exists in the legacy concepts/ folder, keep it there
+    legacy_path = vault / "_wiki" / "concepts" / f"{page_name}.md"
+    page_path   = legacy_path if legacy_path.exists() else domain_dir / f"{page_name}.md"
 
     section = _format_section(item)
 
@@ -80,7 +96,7 @@ def write_approved(item: dict) -> str:
     except Exception:
         pass
     try:
-        _update_index(concepts_dir, vault)
+        _update_index(domain_dir, vault)
     except Exception:
         pass
     _append_log(item, page_path, note=evolution.get("evolution_type", ""))

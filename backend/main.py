@@ -79,15 +79,26 @@ WEEKLY_ANALYSIS_INTERVAL_SECONDS = 3600  # scheduler checks every hour
 # ─────────────────────────────────────────────────────────────────────────────
 
 VALID_TAGS = [
-    # ML / AI
+    # AI / ML
     "RAG", "Agents", "Serving", "MLOps", "LLM", "Inference",
     "VectorDB", "Attention", "KVCache", "Quantization",
     "FineTuning", "Embeddings", "Agentic",
+    # DSA
+    "Graphs", "Trees", "DynamicProgramming", "Heaps", "BinarySearch",
+    "Sorting", "Arrays", "LinkedLists", "HashMaps", "Recursion",
+    # System Design
+    "Databases", "Caching", "LoadBalancing", "APIs", "Queues",
+    "Microservices", "Networking", "Distributed",
     # Tech / Engineering
     "Engineering", "Systems", "DevTools", "Product", "Security",
+    # Humanities
+    "History", "Geopolitics", "Politics", "Geography", "Philosophy",
+    "Culture", "IR",
+    # Science
+    "Physics", "Math", "Chemistry", "Biology", "Statistics",
     # Finance / Business
     "Finance", "Investing", "Business", "Startups", "Economics",
-    # Self-improvement / meta
+    # Meta
     "Productivity", "Learning", "Health", "Mental-models", "Career",
 ]
 
@@ -878,7 +889,7 @@ def _extract_with_sonnet(text: str, images: Optional[list], source_url: str,
     user_content.append({
         "type": "text",
         "text": f"""Extract structured metadata from this content for a personal knowledge wiki.
-This wiki covers anything educational: tech, ML/AI, finance, self-improvement, productivity, business, etc.
+This wiki covers anything educational: AI/ML, DSA, system design, engineering, humanities (history, geopolitics, politics, geography, philosophy), science (physics, math, chemistry), finance, and personal development.
 
 Source URL: {source_url}
 Content depth: {depth} ({content_len} chars)
@@ -1417,7 +1428,7 @@ async def chat(req: ChatRequest):
             "type": "text",
             "text": (
                 "You are Saketh's personal AI knowledge assistant for his SakethWiki"
-                " — ML/AI things learned in the wild.\n\n"
+                " — a second brain covering CS, AI/ML, DSA, system design, humanities, science, and more.\n\n"
                 "Answer from the wiki pages only. Be direct and specific. Use [[PageName]] notation."
                 " If the wiki doesn't cover the topic, say so clearly and suggest what to capture.\n\n"
                 f"Wiki index:\n{index_content[:800]}"
@@ -1568,9 +1579,10 @@ async def interview(req: InterviewRequest):
         {
             "type": "text",
             "text": (
-                "You are Saketh's personal AI knowledge assistant.\n\n"
+                "You are Saketh's personal AI knowledge assistant for interview preparation.\n\n"
                 "Answer the interview question using the wiki pages below. "
                 "Be structured and thorough — cover key concepts, mechanisms, and tradeoffs. "
+                "Content may span CS, DSA, system design, AI/ML, humanities, or science. "
                 "If the wiki is missing something important, note it at the end.\n\n"
                 f"Wiki index:\n{index_content[:800]}"
             ),

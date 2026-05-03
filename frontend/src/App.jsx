@@ -82,15 +82,26 @@ async function api(path, opts = {}) {
 
 // Semantic color groups — all Tailwind classes present in source so JIT keeps them
 const GROUP_COLORS = {
-  models:    "bg-indigo-50 text-indigo-600 ring-indigo-200",
-  training:  "bg-orange-50 text-orange-600 ring-orange-200",
-  attention: "bg-rose-50 text-rose-600 ring-rose-200",
-  inference: "bg-cyan-50 text-cyan-600 ring-cyan-200",
-  memory:    "bg-amber-50 text-amber-600 ring-amber-200",
-  data:      "bg-sky-50 text-sky-600 ring-sky-200",
-  agents:    "bg-violet-50 text-violet-600 ring-violet-200",
-  ops:       "bg-emerald-50 text-emerald-600 ring-emerald-200",
-  meta:      "bg-stone-100 text-stone-500 ring-stone-200",
+  // AI / ML
+  models:     "bg-indigo-50 text-indigo-600 ring-indigo-200",
+  training:   "bg-orange-50 text-orange-600 ring-orange-200",
+  attention:  "bg-rose-50 text-rose-600 ring-rose-200",
+  inference:  "bg-cyan-50 text-cyan-600 ring-cyan-200",
+  memory:     "bg-amber-50 text-amber-600 ring-amber-200",
+  data:       "bg-sky-50 text-sky-600 ring-sky-200",
+  agents:     "bg-violet-50 text-violet-600 ring-violet-200",
+  ops:        "bg-emerald-50 text-emerald-600 ring-emerald-200",
+  meta:       "bg-stone-100 text-stone-500 ring-stone-200",
+  // DSA
+  dsa:        "bg-blue-50 text-blue-600 ring-blue-200",
+  // System Design
+  sysdesign:  "bg-teal-50 text-teal-600 ring-teal-200",
+  // Humanities
+  humanities: "bg-purple-50 text-purple-600 ring-purple-200",
+  // Science
+  science:    "bg-lime-50 text-lime-700 ring-lime-200",
+  // Finance
+  finance:    "bg-green-50 text-green-700 ring-green-200",
 };
 const DEFAULT_TAG_COLOR = "bg-stone-100 text-stone-500 ring-stone-200";
 
@@ -118,15 +129,26 @@ function TagPill({ tag }) {
 
 // Keep in sync with backend VALID_TAGS in main.py
 const VALID_TAGS = [
-  // ML / AI
+  // AI / ML
   "RAG", "Agents", "Serving", "MLOps", "LLM", "Inference",
   "VectorDB", "Attention", "KVCache", "Quantization",
   "FineTuning", "Embeddings", "Agentic",
+  // DSA
+  "Graphs", "Trees", "DynamicProgramming", "Heaps", "BinarySearch",
+  "Sorting", "Arrays", "LinkedLists", "HashMaps", "Recursion",
+  // System Design
+  "Databases", "Caching", "LoadBalancing", "APIs", "Queues",
+  "Microservices", "Networking", "Distributed",
   // Tech / Engineering
   "Engineering", "Systems", "DevTools", "Product", "Security",
+  // Humanities
+  "History", "Geopolitics", "Politics", "Geography", "Philosophy",
+  "Culture", "IR",
+  // Science
+  "Physics", "Math", "Chemistry", "Biology", "Statistics",
   // Finance / Business
   "Finance", "Investing", "Business", "Startups", "Economics",
-  // Self-improvement / meta
+  // Meta
   "Productivity", "Learning", "Health", "Mental-models", "Career",
 ];
 

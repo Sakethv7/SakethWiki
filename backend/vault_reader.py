@@ -25,12 +25,25 @@ INDEX_PATH   = property(lambda: _vault() / "_wiki" / "index.md")
 def _dirs():
     wiki = _vault() / "_wiki"
     return {
-        "concepts":     wiki / "concepts",
+        "concepts":     wiki / "concepts",     # legacy — kept for backward compat
+        "cs":           wiki / "cs",
+        "humanities":   wiki / "humanities",
+        "science":      wiki / "science",
         "sources":      wiki / "sources",
         "insights":     wiki / "insights",
         "open-threads": wiki / "open-threads",
         "meta":         wiki / "meta",
     }
+
+def _concept_dirs() -> list:
+    """All dirs that hold concept pages (legacy + domain subfolders)."""
+    wiki = _vault() / "_wiki"
+    return [
+        wiki / "concepts",
+        wiki / "cs",
+        wiki / "humanities",
+        wiki / "science",
+    ]
 
 # Keep VAULT_PATH/WIKI_DIR/CONCEPTS_DIR/INDEX_PATH usable as simple names
 VAULT_PATH   = _vault()
@@ -70,8 +83,34 @@ def list_pages_in_folder(folder: str = "concepts") -> list[dict]:
 
 
 def list_concept_pages() -> list[dict]:
-    """Return metadata for all concept pages (backwards compat)."""
-    return list_pages_in_folder("concepts")
+    """Return metadata for all concept pages across all domain folders."""
+    vault = _vault()
+    pages = []
+    seen: set[str] = set()
+    for concept_dir in _concept_dirs():
+        if not concept_dir.exists():
+            continue
+        folder_name = concept_dir.name
+        for md_file in sorted(concept_dir.glob("*.md")):
+            if md_file.stem in seen:
+                continue
+            seen.add(md_file.stem)
+            try:
+                content = md_file.read_text(encoding="utf-8")
+            except OSError:
+                continue
+            meta = _parse_frontmatter(content)
+            pages.append({
+                "name": md_file.stem,
+                "folder": folder_name,
+                "file": str(md_file.relative_to(vault)),
+                "title": meta.get("title", md_file.stem),
+                "tags": meta.get("tags", []),
+                "last_updated": meta.get("last_updated", ""),
+                "entry_count": int(meta.get("entry_count", 1)),
+                "word_count": len(content.split()),
+            })
+    return pages
 
 
 def build_backlinks_index() -> dict[str, list[str]]:
@@ -79,20 +118,18 @@ def build_backlinks_index() -> dict[str, list[str]]:
     Scan all concept pages for [[wikilinks]] and build a reverse index.
     Returns {page_name: [list of page_names that link TO it]}.
     """
-    concepts_dir = _vault() / "_wiki" / "concepts"
-    if not concepts_dir.exists():
-        return {}
-
     # First pass: collect all outbound links per page
     outbound: dict[str, list[str]] = {}
-    for md_file in concepts_dir.glob("*.md"):
-        try:
-            content = md_file.read_text(encoding="utf-8")
-        except OSError:
+    for concept_dir in _concept_dirs():
+        if not concept_dir.exists():
             continue
-        links = re.findall(r"\[\[([^\]]+)\]\]", content)
-        # Normalise: lowercase, spaces→hyphens
-        outbound[md_file.stem] = [l.lower().replace(" ", "-") for l in links]
+        for md_file in concept_dir.glob("*.md"):
+            try:
+                content = md_file.read_text(encoding="utf-8")
+            except OSError:
+                continue
+            links = re.findall(r"\[\[([^\]]+)\]\]", content)
+            outbound[md_file.stem] = [l.lower().replace(" ", "-") for l in links]
 
     # Second pass: invert to backlinks
     backlinks: dict[str, list[str]] = {}
@@ -136,11 +173,10 @@ def build_graph() -> dict:
     Returns {nodes: [{id, title, tags, entry_count}], edges: [{source, target}]}.
     Edges are deduplicated and bidirectional (A→B and B→A both appear if both link).
     """
-    concepts_dir = _vault() / "_wiki" / "concepts"
-    if not concepts_dir.exists():
+    pages = list_concept_pages()
+    if not pages:
         return {"nodes": [], "edges": []}
 
-    pages = list_concept_pages()
     page_set = {p["name"] for p in pages}
 
     nodes = []
@@ -151,22 +187,25 @@ def build_graph() -> dict:
             "tags": p["tags"],
             "entry_count": p["entry_count"],
             "last_updated": p["last_updated"],
+            "domain": p["folder"],
         })
 
-    # Collect edges from wikilinks — only between known pages
+    # Collect edges from wikilinks across all concept dirs
     edge_set: set[tuple] = set()
-    for md_file in concepts_dir.glob("*.md"):
-        try:
-            content = md_file.read_text(encoding="utf-8")
-        except OSError:
+    for concept_dir in _concept_dirs():
+        if not concept_dir.exists():
             continue
-        source = md_file.stem
-        links = re.findall(r"\[\[([^\]]+)\]\]", content)
-        for link in links:
-            target = link.lower().replace(" ", "-")
-            if target in page_set and target != source:
-                # Store as sorted tuple to deduplicate A↔B
-                edge_set.add(tuple(sorted([source, target])))
+        for md_file in concept_dir.glob("*.md"):
+            try:
+                content = md_file.read_text(encoding="utf-8")
+            except OSError:
+                continue
+            source = md_file.stem
+            links = re.findall(r"\[\[([^\]]+)\]\]", content)
+            for link in links:
+                target = link.lower().replace(" ", "-")
+                if target in page_set and target != source:
+                    edge_set.add(tuple(sorted([source, target])))
 
     edges = [{"source": s, "target": t} for s, t in edge_set]
     return {"nodes": nodes, "edges": edges}
@@ -311,12 +350,9 @@ def find_relevant_pages(query: str, max_pages: int = 5) -> list[str]:
     Also expands common synonyms so "transformers" finds "attention" pages etc.
     Returns list of page names most likely relevant.
     """
-    concepts_dir = _vault() / "_wiki" / "concepts"
-    if not concepts_dir.exists():
-        return []
-
-    # Synonym expansion — common ML/AI term aliases
+    # Synonym expansion — cross-domain term aliases
     SYNONYMS: dict = {
+        # AI / ML
         "transformer": ["attention", "self-attention"],
         "transformers": ["attention", "self-attention"],
         "llm": ["language model", "gpt"],
@@ -335,17 +371,42 @@ def find_relevant_pages(query: str, max_pages: int = 5) -> list[str]:
         "agents": ["agent", "agentic", "tool-use"],
         "embedding": ["vector", "embeddings", "semantic search"],
         "embeddings": ["embedding", "vector"],
+        # DSA
+        "graph": ["graphs", "bfs", "dfs", "shortest path"],
+        "graphs": ["graph", "bfs", "dfs"],
+        "dp": ["dynamic programming", "memoization", "tabulation"],
+        "dynamic programming": ["dp", "memoization", "recursion"],
+        "tree": ["trees", "bst", "binary tree", "trie"],
+        "trees": ["tree", "bst", "binary tree"],
+        "heap": ["heaps", "priority queue"],
+        "heaps": ["heap", "priority queue"],
+        "sorting": ["sort", "quicksort", "mergesort"],
+        "binary search": ["binarysearch", "bisect"],
+        # Humanities
+        "geopolitics": ["geopolitical", "international relations", "ir"],
+        "history": ["historical", "ancient", "medieval", "modern"],
+        "politics": ["political", "government", "policy"],
+        # Science
+        "calculus": ["derivative", "integral", "differentiation"],
+        "probability": ["statistics", "bayesian", "distribution"],
+        "linear algebra": ["matrix", "vectors", "eigenvalues"],
     }
 
     raw_terms = set(re.sub(r"[^\w\s-]", "", query.lower()).split())
-    # Expand with synonyms
     expanded_terms = set(raw_terms)
     for term in raw_terms:
         expanded_terms.update(SYNONYMS.get(term, []))
 
     scored: list[tuple[float, str]] = []
+    seen: set[str] = set()
 
-    for md_file in concepts_dir.glob("*.md"):
+    for concept_dir in _concept_dirs():
+        if not concept_dir.exists():
+            continue
+        for md_file in concept_dir.glob("*.md"):
+            if md_file.stem in seen:
+                continue
+            seen.add(md_file.stem)
         content = md_file.read_text(encoding="utf-8")
         content_lower = content.lower()
         name_lower = md_file.stem.lower()  # e.g. "attention-residuals"
