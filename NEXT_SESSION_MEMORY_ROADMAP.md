@@ -46,9 +46,20 @@ Acceptance criteria:
 Detect duplicate pages and weakly overlapping pages automatically, then propose or apply merges where confidence is high.
 
 Acceptance criteria:
-- Vault scan surfaces near-duplicate pages.
-- Clear duplicate pairs can be merged automatically or with one confirmation step.
-- Weak overlaps are reported, not blindly merged.
+- ✅ Vault scan surfaces near-duplicate pages through `/consolidation-candidates`.
+- ✅ Clear duplicate pairs can be merged with one confirmation step through `/consolidate`.
+- ✅ Weak overlaps are reported, not blindly merged.
+
+Session progress:
+- Added `backend/consolidation.py`.
+- Candidate scan uses identity aliases first, then slug similarity plus concept-text overlap.
+- Added `/consolidation-candidates`.
+- Added a safety gate to `/consolidate`; non-high-confidence pairs require `force=true`.
+- Fixed alias-source consolidation semantics: the source page remains the concrete page to delete, while the target resolves canonical.
+
+Pushback:
+- Consolidation is not contradiction resolution. Conflicting pages should usually enter active review first.
+- Shared tags are not enough evidence to merge pages.
 
 ### 4. Long-Term Preference Memory
 Store user preferences about wording, correction patterns, and question style separately from page content.
@@ -60,9 +71,19 @@ Examples:
 - style preferences for summaries and synthesis
 
 Acceptance criteria:
-- Preference memory is not stored inside the concept pages.
-- Retrieval can use preference memory to shape extraction and responses.
-- User corrections update this memory over time.
+- ✅ Preference memory is not stored inside the concept pages.
+- ✅ Extraction and chat can use preference memory to shape future behavior.
+- ✅ User corrections update this memory over time through approval/rejection traces.
+
+Session progress:
+- Added `backend/preference_memory.py`, persisted at `_wiki/meta/preferences.json`.
+- Learned page corrections, tag corrections, rejected page slugs, and style preferences from trace events.
+- Injected preference hints into extraction prompts and chat system prompts.
+- Added `/preferences` for inspection.
+
+Pushback:
+- Do not store this in Markdown concept pages. That would mix behavioral memory with knowledge memory and pollute retrieval.
+- Do not infer broad personality preferences from one-off events. Start with explicit correction counts.
 
 ### 5. Active Review Loop
 Resurface weak, stale, or low-maturity concepts so the system compounds over time.
@@ -74,9 +95,18 @@ Signals:
 - conflicting definitions
 
 Acceptance criteria:
-- The system can generate a review queue from these signals.
-- The queue prioritizes concepts that need attention.
-- Review suggestions are visible in the UI or via an API endpoint.
+- ✅ The system can generate a review queue from these signals.
+- ✅ The queue prioritizes concepts that need attention.
+- ✅ Review suggestions are visible via `/active-review` and `/review-queue`.
+
+Session progress:
+- Added `backend/active_review.py`.
+- Scored review priority from maturity, backlinks, read/update recency, thin pages, entry count, and conflict markers.
+- Added reason strings, raw signal payloads, and suggested actions for each review item.
+- Upgraded `/review-queue` and added explicit `/active-review`.
+
+Pushback:
+- Do not treat age alone as review priority. Staleness matters only alongside maturity, graph position, and conflict/thinness signals.
 
 ## Suggested Build Order
 1. Identity resolution.

@@ -70,6 +70,108 @@ graph TB
 
 ---
 
+## Whole System Flow
+
+SakethWiki has two main user journeys: capture new knowledge and query existing memory. Everything else exists to improve those loops over time.
+
+```mermaid
+flowchart TD
+    U[User] --> FE[Frontend React app]
+
+    FE -->|Capture URL/text/image| ING[POST /ingest]
+    FE -->|Ask question| CHAT[POST /chat]
+    FE -->|Browse page| PAGE[GET /page/name]
+    FE -->|Health/review| REVIEW[GET /active-review\nGET /lint\nGET /consolidation-candidates]
+
+    ING --> FETCH{Input type}
+    FETCH -->|URL| HTML[httpx fetch\nBeautifulSoup parse]
+    FETCH -->|Text| RAW[raw text]
+    FETCH -->|Image| IMG[base64 image payload]
+    HTML --> EXTRACT[routed extraction LLM]
+    RAW --> EXTRACT
+    IMG --> EXTRACT
+
+    PREF[_wiki/meta/preferences.json] --> EXTRACT
+    INSIGHTS[_wiki/meta/system-insights.md] --> EXTRACT
+    ALIAS[identity.py aliases] --> EXTRACT
+
+    EXTRACT --> QUEUE[hitl_queue.json]
+    QUEUE --> FE_REVIEW[Frontend review card]
+    FE_REVIEW -->|Approve/edit| APPROVE[POST /approve/id]
+    FE_REVIEW -->|Reject| REJECT[trace rejection]
+
+    APPROVE --> CANON[canonicalize page + wikilinks]
+    CANON --> WRITE[wiki_writer.py]
+    WRITE --> EVOLVE{Existing page?}
+    EVOLVE -->|yes| CLASSIFY[evolution classify\nextends/refines/supersedes/contradicts/duplicate]
+    EVOLVE -->|no| CREATE[create concept page]
+    CLASSIFY --> VAULT[Markdown vault\n_wiki/cs science humanities]
+    CREATE --> VAULT
+    WRITE --> SOURCE[_wiki/sources/date-slug.md]
+    APPROVE --> TRACE[_wiki/meta/traces.jsonl]
+    REJECT --> TRACE
+    TRACE --> PREF
+
+    CHAT --> SYNC[memory_store.sync_index]
+    VAULT --> SYNC
+    SYNC --> DB[_wiki/meta/memory.db]
+    DB --> RETRIEVE[lexical retrieval\noptional embedding rerank]
+    ALIAS --> RETRIEVE
+    RETRIEVE --> ANSWER[routed chat LLM]
+    PREF --> ANSWER
+    ANSWER --> FE
+
+    PAGE --> PARSE[vault_reader.parse_concept_page]
+    PARSE --> FE
+
+    REVIEW --> REVIEWER[active_review.py\nlint\nconsolidation.py]
+    VAULT --> REVIEWER
+    DB --> REVIEWER
+    REVIEWER --> FE
+```
+
+### Capture Path
+
+The Capture tab sends URL, text, or images to `POST /ingest`. URL ingestion uses deterministic fetching and HTML parsing before any model call. The extractor then receives four kinds of context: source content, existing page hints, learned prompt hints from `system-insights.md`, and durable correction patterns from `preferences.json`.
+
+The extractor does not write the vault directly. It stages a queue item in `hitl_queue.json`. The frontend shows the diff card so the human can approve, reject, or edit page slug, tags, summary, wikilinks, and diagram.
+
+Approval writes through `wiki_writer.py`. Before writing, identity resolution canonicalizes the target page and wikilinks. If the page exists, evolution classification decides whether the new source extends, refines, supersedes, contradicts, or duplicates current understanding. If the page is new, the writer creates frontmatter and a current-understanding block. The source record is also written under `_wiki/sources/`.
+
+After approval or rejection, a trace goes to `_wiki/meta/traces.jsonl`. That same trace updates `_wiki/meta/preferences.json`, so repeated corrections shape future extraction without contaminating concept pages.
+
+### Query Path
+
+The Chat tab sends the user question to `POST /chat`. The backend syncs `_wiki/meta/memory.db` against Markdown first, so direct file edits and deletes are visible without restarting. Retrieval is local lexical by default. If `EMBED_ENABLED=true`, embeddings can rerank or supplement results, but they do not replace the local index.
+
+Identity resolution expands aliases before retrieval. A query like "retrieval augmented generation" can land on `rag`. The chat answer receives retrieved snippets, current understanding, source page names, wiki index context, and chat-style preferences. If the query asks "what do I know about X?", the response can include a structured knowledge card from `parse_concept_page`.
+
+### Browse Path
+
+The Browse tab calls `GET /pages` and `GET /page/{name}`. `vault_reader.py` searches the vault folders, resolves aliases, parses frontmatter, extracts the current-understanding block, source sections, related wikilinks, diagrams, maturity, and backlinks. Concept pages render as structured views; non-concept Markdown can still render as raw content.
+
+### Maintenance Path
+
+Maintenance is split into three safety levels.
+
+Active review is deterministic. `/active-review` ranks weak, stale, orphaned, thin, or conflicting pages using maturity, backlinks, read/update signals, entry count, word count, and warning markers. This tells you what to inspect next.
+
+Health check linting can call an LLM for higher-level inconsistencies and gaps, then combines that with deterministic link and identity audits. It should report issues before applying changes.
+
+Consolidation is conservative. `/consolidation-candidates` only proposes duplicate candidates. `/consolidate` is the destructive path and now has a safety gate; weak pairs require `force=true`.
+
+### Feedback Loops
+
+There are three feedback loops:
+
+- Trace loop: approvals/rejections write `traces.jsonl`, and weekly analysis turns patterns into `system-insights.md` prompt hints.
+- Preference loop: the same traces update `preferences.json`, which biases future page/tag choices and chat style.
+- Memory loop: Markdown writes resync into `memory.db`, which improves future chat retrieval.
+
+Mistake to avoid: thinking of this as a RAG app with a wiki attached. The Markdown vault is the source of truth. Retrieval, preferences, review queues, and consolidation are derived systems around it.
+
+---
+
 ## Data Flow: URL → Extract → HITL → Vault Write
 
 ```
@@ -191,6 +293,99 @@ The system is intentionally conservative:
 - `/lint` and `/aliases` report duplicate/redirect candidates; they do not merge pages automatically.
 
 Mistake to avoid: treating aliases, tags, and folders as the same problem. Aliases answer "what exact concept is this?" Tags answer "what cluster does this belong to?" Folders answer "where does it live?"
+
+---
+
+## Preference Memory
+
+Preference memory stores correction behavior separately from concept content.
+
+```mermaid
+graph TD
+    A[Human approve / reject] --> B[trace event]
+    B --> C[_wiki/meta/traces.jsonl]
+    B --> D[_wiki/meta/preferences.json]
+    D --> E[page correction patterns]
+    D --> F[tag correction patterns]
+    D --> G[rejected page slugs]
+    D --> H[response style hints]
+    E --> I[future extraction prompt]
+    F --> I
+    G --> I
+    H --> J[chat system prompt]
+```
+
+`preferences.json` is not knowledge. It records repeated user behavior such as "when the extractor suggests X page, Saketh keeps moving it to Y", "this tag gets corrected to that tag", and "this suggested page was rejected". Those preferences shape future extraction and chat, but they do not appear in concept pages or retrieval chunks.
+
+Implementation points:
+
+- Approval traces update preference memory deterministically in `backend/preference_memory.py`.
+- Extraction receives preference hints alongside `system-insights.md` prompt hints.
+- Chat receives response-style preferences such as starting with the answer and being direct.
+- `/preferences` exposes the current durable preference state for inspection.
+
+Mistake to avoid: using an LLM to infer preferences from vibes. Preferences should come from observed corrections first. LLM synthesis can summarize them later, but the raw memory should remain auditable.
+
+---
+
+## Active Review Queue
+
+The review queue is a prioritization system, not just a stale-page list.
+
+```mermaid
+graph LR
+    A[Concept pages] --> B[active_review.py]
+    C[Backlinks] --> B
+    D[reads.jsonl] --> B
+    E[frontmatter maturity] --> B
+    F[conflict markers] --> B
+    B --> G[priority score]
+    G --> H[/active-review]
+    G --> I[/review-queue]
+```
+
+Signals:
+
+- Low or missing `understanding_maturity`
+- No backlinks or only one backlink
+- No recent read/update signal
+- Single-entry or thin pages
+- Conflict markers such as `[!warning]`, `CONTRADICTION`, or `contradicts`
+
+This is deterministic because review selection should be explainable. Each item returns a score, priority, reasons, raw signals, and a suggested action. LLMs can help rewrite or synthesize a page after selection, but they should not be required to decide which pages need attention.
+
+Mistake to avoid: reviewing old pages just because they are old. A mature, well-linked old page can be stable. A new orphaned low-maturity page can be more urgent.
+
+---
+
+## Conservative Consolidation
+
+Consolidation has two separate phases:
+
+```mermaid
+graph LR
+    A[Vault pages] --> B[consolidation.py candidate scan]
+    B --> C{High confidence?}
+    C -- yes --> D[/consolidation-candidates safe_auto=true]
+    C -- no --> E[Report only]
+    D --> F[/consolidate confirmation]
+    F --> G[LLM merge + source delete]
+```
+
+The candidate scanner is deterministic and non-mutating. It uses identity aliases first, then slug similarity plus concept-text token overlap. The destructive `/consolidate` endpoint now has a safety gate: high-confidence pairs can proceed; weak pairs require `force=true` as an explicit manual override.
+
+Safe consolidation signals:
+
+- An alias page resolves to an existing canonical page.
+- Slugs are highly similar and concept text overlaps strongly.
+
+Unsafe consolidation signals:
+
+- Only vague semantic overlap.
+- Shared tags but different concepts.
+- Similar subject area without matching identity.
+
+Mistake to avoid: using consolidation as cleanup for every inconsistency. Contradictions usually need review, not merging. Merge only when the pages are actually duplicate identities.
 
 ---
 

@@ -40,9 +40,12 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
+import active_review
+import consolidation
 import identity
 import llm_client
 import memory_store
+import preference_memory
 import queue_manager
 import tag_classifier
 import vault_reader
@@ -188,6 +191,7 @@ class ApplyLinkFixesRequest(BaseModel):
 class ConsolidateRequest(BaseModel):
     source: str   # page to merge FROM (will be deleted after)
     target: str   # page to merge INTO (will be updated)
+    force: bool = False  # allow manual override for non-high-confidence pairs
 
 
 # ── /ingest ──────────────────────────────────────────────────────────────────
@@ -1000,6 +1004,8 @@ def _extract_with_sonnet(text: str, images: Optional[list], source_url: str,
     # Inject learned hints from system-insights.md (self-improvement loop)
     hints = _load_extraction_hints()
     hints_block = f"\nLearned extraction hints (from past corrections — follow these):\n{hints}\n" if hints else ""
+    preference_hints = preference_memory.prompt_hints()
+    preference_block = f"\nUser preference memory (durable correction patterns — follow these):\n{preference_hints}\n" if preference_hints else ""
 
     user_content: list = []
 
@@ -1079,7 +1085,7 @@ This wiki covers anything educational: AI/ML, DSA, system design, engineering, h
 
 Source URL: {source_url}
 Content depth: {depth} ({content_len} chars)
-{standards_block}{hints_block}
+{standards_block}{hints_block}{preference_block}
 {pages_hint}
 {user_notes_block}
 Content:
@@ -1150,6 +1156,11 @@ Rules:
 
     # Validate tags against allowed list
     data["tags"] = [t for t in data.get("tags", []) if t in VALID_TAGS]
+    data["suggested_page"] = preference_memory.preferred_page(data.get("suggested_page", "general"))
+    data["tags"] = [
+        tag for tag in preference_memory.preferred_tags(data["tags"])
+        if tag in VALID_TAGS
+    ]
     # Sanitize diagram: remove \n inside node labels — Mermaid doesn't support them
     if data.get("diagram"):
         import re as _re
@@ -1706,7 +1717,7 @@ async def approve(item_id: str, req: ApproveRequest):
     if not req.approved:
         queue_manager.remove(item_id)
         try:
-            _append_trace({
+            trace = {
                 "ts": datetime.now().isoformat(),
                 "url": item.get("url", ""),
                 "source_type": "tweet" if _is_tweet_url(item.get("url", "")) else ("text" if not item.get("url") else "url"),
@@ -1722,7 +1733,9 @@ async def approve(item_id: str, req: ApproveRequest):
                 "tags_corrected": False,
                 "wikilinks_suggested": item.get("suggested_wikilinks", []),
                 "deep_dive": False,
-            })
+            }
+            _append_trace(trace)
+            preference_memory.record_approval_trace(trace)
         except Exception:
             pass
         return {"success": True, "action": "rejected", "file_written": None}
@@ -1810,7 +1823,7 @@ async def approve(item_id: str, req: ApproveRequest):
 
     # Append trace for self-learning loop
     try:
-        _append_trace({
+        trace = {
             "ts": datetime.now().isoformat(),
             "url": item.get("url", ""),
             "source_type": "tweet" if _is_tweet_url(item.get("url", "")) else ("text" if not item.get("url") else "url"),
@@ -1826,7 +1839,9 @@ async def approve(item_id: str, req: ApproveRequest):
             "tags_corrected": item.get("_original_tags", item.get("tags", [])) != item.get("tags", []),
             "wikilinks_suggested": item.get("suggested_wikilinks", []),
             "deep_dive": deep_dive_tagged,
-        })
+        }
+        _append_trace(trace)
+        preference_memory.record_approval_trace(trace)
     except Exception as _e:
         logger.warning("_append_trace failed on approve: %s", _e)
 
@@ -1960,6 +1975,11 @@ async def chat(req: ChatRequest):
     context = "\n\n".join(context_parts) if context_parts else "No matching pages found yet."
 
     index_content = vault_reader.read_index()
+    chat_preferences = preference_memory.chat_hints()
+    preference_system_text = (
+        f"\n\nUser response preferences:\n{chat_preferences}"
+        if chat_preferences else ""
+    )
 
     # Prompt caching: system block cached across calls
     system_block = [
@@ -1970,6 +1990,7 @@ async def chat(req: ChatRequest):
                 " — a second brain covering CS, AI/ML, DSA, system design, humanities, science, and more.\n\n"
                 "Answer from the wiki pages only. Be direct and specific. Use [[PageName]] notation."
                 " If the wiki doesn't cover the topic, say so clearly and suggest what to capture.\n\n"
+                f"{preference_system_text}\n\n"
                 f"Wiki index:\n{index_content[:800]}"
             ),
             "cache_control": {"type": "ephemeral"},
@@ -2228,6 +2249,16 @@ async def get_aliases():
     return {
         "aliases": identity.alias_map(),
         "duplicate_candidates": identity.duplicate_candidates(pages),
+    }
+
+
+@app.get("/preferences")
+async def get_preferences():
+    data = preference_memory.load()
+    return {
+        "path": str(preference_memory.path()),
+        "preferences": data,
+        "prompt_hints": preference_memory.prompt_hints(),
     }
 
 
@@ -2710,9 +2741,24 @@ async def get_backlinks(page_name: str):
 # ── /review-queue ─────────────────────────────────────────────────────────────
 
 @app.get("/review-queue")
-async def review_queue(days: int = 30):
-    """Return concept pages not updated in more than `days` days."""
-    return {"pages": vault_reader.get_review_queue(days)}
+async def review_queue(limit: int = 50, min_priority: str = "low"):
+    """Return active review queue ranked by maturity, staleness, backlinks, and conflicts."""
+    pages = active_review.build_queue(limit=limit, min_priority=min_priority)
+    return {"pages": pages, "total": len(pages)}
+
+
+@app.get("/active-review")
+async def active_review_queue(limit: int = 50, min_priority: str = "low"):
+    """Explicit active review endpoint for weak, stale, orphaned, or conflicting concepts."""
+    pages = active_review.build_queue(limit=limit, min_priority=min_priority)
+    return {"pages": pages, "total": len(pages)}
+
+
+@app.get("/consolidation-candidates")
+async def consolidation_candidates(limit: int = 50, include_weak: bool = False):
+    """Return conservative duplicate/merge candidates without mutating the vault."""
+    candidates = consolidation.find_candidates(limit=limit, include_weak=include_weak)
+    return {"candidates": candidates, "total": len(candidates)}
 
 
 # ── /quick-note ───────────────────────────────────────────────────────────────
@@ -3529,8 +3575,17 @@ async def consolidate(req: ConsolidateRequest):
                 return c
         return None
 
-    source = identity.resolve_slug(req.source)
+    source = identity.slugify(req.source)
     target = identity.resolve_slug(req.target)
+    safety = consolidation.validate_pair(source, target)
+    if not req.force and not safety.get("safe_auto"):
+        raise HTTPException(
+            400,
+            {
+                "message": "Consolidation is not high-confidence. Re-run with force=true for a manual override.",
+                "safety": safety,
+            },
+        )
     source_path = _find_page(source)
     target_path = _find_page(target)
 

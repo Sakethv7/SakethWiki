@@ -4,18 +4,21 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import memory_store
+import preference_memory
+import active_review
+import consolidation
 import vault_reader
 
 
-def _write_page(path: Path, title: str, tags: str, body: str) -> None:
+def _write_page(path: Path, title: str, tags: str, body: str, extra_frontmatter: str = "") -> None:
+    extra = f"{extra_frontmatter.rstrip()}\n" if extra_frontmatter else ""
     path.write_text(
         f"""---
 title: "{title}"
 tags: [{tags}]
 last_updated: 2026-07-04
 entry_count: 1
----
-
+{extra}---
 # {title}
 
 {body}
@@ -130,3 +133,107 @@ def test_find_relevant_pages_scores_all_files(monkeypatch, tmp_path):
 
     hits = vault_reader.find_relevant_pages("factory calibration loop", max_pages=2)
     assert hits[0] == "aaa-target"
+
+
+def test_preference_memory_learns_from_corrections(monkeypatch, tmp_path):
+    vault = tmp_path / "vault"
+    (vault / "_wiki" / "meta").mkdir(parents=True)
+    monkeypatch.setenv("VAULT_PATH", str(vault))
+
+    preference_memory.record_approval_trace(
+        {
+            "approved": True,
+            "url": "https://example.com/rag",
+            "suggested_page": "language-model-memory",
+            "final_page": "rag",
+            "page_corrected": True,
+            "tags_suggested": ["Agentic"],
+            "tags_final": ["Agents", "RAG"],
+            "tags_corrected": True,
+        }
+    )
+    preference_memory.record_approval_trace(
+        {
+            "approved": False,
+            "title": "Rejected page",
+            "suggested_page": "random-slug",
+            "tags_suggested": ["Product"],
+        }
+    )
+
+    data = preference_memory.load()
+    assert data["page_corrections"]["language-model-memory"]["rag"]["count"] == 1
+    assert data["tag_corrections"]["Agentic"]["Agents"]["count"] == 1
+    assert data["tag_corrections"]["Agentic"]["RAG"]["count"] == 1
+    assert data["rejected_pages"]["random-slug"]["count"] == 1
+
+    assert preference_memory.preferred_page("language model memory") == "rag"
+    assert preference_memory.preferred_tags(["Agentic"]) == ["RAG"]
+
+    hints = preference_memory.prompt_hints()
+    assert "Prefer page `rag` instead of `language-model-memory`" in hints
+    assert "Prefer tag `RAG` instead of `Agentic`" in hints
+    assert "Be cautious about creating or using page `random-slug`" in hints
+
+
+def test_active_review_prioritizes_weak_orphaned_pages(monkeypatch, tmp_path):
+    vault = tmp_path / "vault"
+    (vault / "_wiki" / "cs").mkdir(parents=True)
+    monkeypatch.setenv("VAULT_PATH", str(vault))
+
+    _write_page(
+        vault / "_wiki" / "cs" / "weak-concept.md",
+        "Weak Concept",
+        "Learning",
+        "Thin note. [!warning] Contradiction needs review.",
+        extra_frontmatter="understanding_maturity: 25",
+    )
+    _write_page(
+        vault / "_wiki" / "cs" / "mature-concept.md",
+        "Mature Concept",
+        "Learning",
+        "This is a stronger concept page with enough body text to avoid thin-page treatment. "
+        "It also links to [[weak-concept]] so the weak page has at least one inbound signal.",
+        extra_frontmatter="understanding_maturity: 85",
+    )
+
+    queue = active_review.build_queue(limit=10)
+    assert queue[0]["name"] == "weak-concept"
+    assert queue[0]["priority"] == "high"
+    assert "unresolved conflict" in " ".join(queue[0]["reasons"])
+    assert queue[0]["signals"]["maturity"] == 25
+
+
+def test_consolidation_candidates_are_conservative(monkeypatch, tmp_path):
+    vault = tmp_path / "vault"
+    (vault / "_wiki" / "cs").mkdir(parents=True)
+    (vault / "_wiki" / "meta").mkdir(parents=True)
+    monkeypatch.setenv("VAULT_PATH", str(vault))
+
+    _write_page(
+        vault / "_wiki" / "cs" / "rag.md",
+        "RAG",
+        "RAG",
+        "Retrieval augmented generation grounds answers in retrieved context.",
+    )
+    _write_page(
+        vault / "_wiki" / "cs" / "retrieval-augmented-generation.md",
+        "Retrieval Augmented Generation",
+        "RAG",
+        "Retrieval augmented generation uses retrieval before generation.",
+    )
+    _write_page(
+        vault / "_wiki" / "cs" / "binary-search.md",
+        "Binary Search",
+        "BinarySearch",
+        "Binary search halves a sorted search interval.",
+    )
+
+    candidates = consolidation.find_candidates()
+    alias_candidate = next(c for c in candidates if c["source"] == "retrieval-augmented-generation")
+    assert alias_candidate["target"] == "rag"
+    assert alias_candidate["safe_auto"] is True
+    assert alias_candidate["confidence"] == "high"
+
+    unsafe = consolidation.validate_pair("binary-search", "rag")
+    assert unsafe["safe_auto"] is False
