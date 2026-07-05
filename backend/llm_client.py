@@ -92,13 +92,23 @@ def _fallback_enabled(task: str) -> bool:
     return key in CRITICAL_TASKS
 
 
+def _strip_fences(text: str) -> str:
+    t = text.strip()
+    if t.startswith("```"):
+        lines = t.split("\n", 1)
+        t = lines[1] if len(lines) > 1 else ""
+        if t.endswith("```"):
+            t = t[: t.rfind("```")]
+    return t.strip()
+
+
 def _valid_contract(text: str, expect_json: bool, required_keys: Optional[list[str]]) -> bool:
     if not text or not text.strip():
         return False
     if not expect_json:
         return True
     try:
-        parsed = json.loads(text)
+        parsed = json.loads(_strip_fences(text))
     except Exception:
         return False
     if not required_keys:
@@ -174,13 +184,28 @@ def _anthropic_complete(
     import anthropic
 
     client = anthropic.Anthropic(api_key=api_key or os.environ.get("ANTHROPIC_API_KEY"))
+
+    # Add prompt caching to system prompt — stable instructions cached at 10% input cost after first hit
+    system_param = system
+    if system:
+        if isinstance(system, str) and len(system) > 200:
+            system_param = [{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}]
+        elif isinstance(system, list):
+            # Mark the last text block as cacheable
+            system_param = []
+            for i, block in enumerate(system):
+                if isinstance(block, dict) and block.get("type") == "text" and i == len(system) - 1:
+                    system_param.append({**block, "cache_control": {"type": "ephemeral"}})
+                else:
+                    system_param.append(block)
+
     kwargs: dict[str, Any] = {
         "model": model,
         "max_tokens": max_tokens,
         "messages": messages,
     }
-    if system:
-        kwargs["system"] = system
+    if system_param:
+        kwargs["system"] = system_param
     resp = client.messages.create(**kwargs)
     text_parts: list[str] = []
     for block in getattr(resp, "content", []):
@@ -261,6 +286,12 @@ def complete(
     has_images = _has_image_blocks(messages)
     key = _task_key(task)
     provider = _provider_for_task(task)
+
+    # Ollama can't handle images — route vision tasks directly to Anthropic
+    # Cloud providers (openai_compat covers Gemini/OpenAI/DeepSeek) handle vision themselves
+    if has_images and provider == "ollama":
+        provider = "anthropic"
+
     resolved_model = _model_for_task(task, provider, model, has_images)
     primary_err: Optional[Exception] = None
     primary_text = ""
@@ -309,3 +340,28 @@ def complete(
     raise RuntimeError(
         f"LLM fallback contract failed for task={key} provider={provider}→anthropic model={resolved_model}→{fallback_model}"
     )
+
+
+def get_openai_api_key() -> str:
+    """Return OpenAI key for embeddings/reranking flows."""
+    return (
+        os.environ.get("OPENAI_API_KEY", "").strip()
+        or os.environ.get("OPENAI_COMPAT_API_KEY", "").strip()
+    )
+
+
+def get_embedding_config() -> dict[str, Any]:
+    """Read embedding settings from environment."""
+    provider = os.environ.get("EMBED_PROVIDER", "openai").strip().lower()
+    model = os.environ.get("EMBED_MODEL", "text-embedding-3-small").strip()
+    batch_size_raw = os.environ.get("EMBED_BATCH_SIZE", "64").strip()
+    try:
+        batch_size = max(1, int(batch_size_raw))
+    except ValueError:
+        batch_size = 64
+    return {
+        "provider": provider,
+        "model": model,
+        "batch_size": batch_size,
+        "api_key": get_openai_api_key(),
+    }

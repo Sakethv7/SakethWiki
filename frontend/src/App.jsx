@@ -22,7 +22,26 @@ function sanitizeMermaid(chart) {
 let _mermaidReady = false;
 function ensureMermaid() {
   if (!_mermaidReady) {
-    mermaid.initialize({ startOnLoad: false, theme: "neutral", securityLevel: "antiscript" });
+    mermaid.initialize({
+      startOnLoad: false,
+      securityLevel: "antiscript",
+      theme: "base",
+      themeVariables: {
+        background: "#fafaf9",
+        primaryColor: "#f5f0eb",
+        primaryTextColor: "#1a1a1a",
+        primaryBorderColor: "transparent",
+        lineColor: "#999999",
+        secondaryColor: "#f5f0eb",
+        tertiaryColor: "#f0ede8",
+        edgeLabelBackground: "#ece8e3",
+        clusterBkg: "#f0ede8",
+        clusterBorder: "#d6cfc8",
+        titleColor: "#1a1a1a",
+        fontFamily: "ui-sans-serif, system-ui, -apple-system, sans-serif",
+        fontSize: "14px",
+      },
+    });
     _mermaidReady = true;
   }
 }
@@ -52,7 +71,7 @@ function MermaidDiagram({ chart }) {
   );
   if (!svg) return <div className="text-xs text-stone-400 py-2">Rendering diagram…</div>;
   return (
-    <div className="w-full overflow-x-auto rounded-xl bg-white border border-stone-100 p-4 [&_svg]:max-w-full [&_svg]:h-auto"
+    <div className="w-full overflow-x-auto rounded-xl bg-stone-50 border border-stone-100 p-4 [&_svg]:max-w-full [&_svg]:h-auto"
       dangerouslySetInnerHTML={{ __html: svg }} />
   );
 }
@@ -355,10 +374,27 @@ function QueueSection({ onApproved, onExtractPreview }) {
                       </button>
                     </>
                   ) : (
+                    <>
+                    <button
+                      onClick={() => onExtractPreview?.({
+                        id: item.id,
+                        diff_preview: {
+                          title: item.title || "",
+                          summary: item.summary || [],
+                          tags: item.tags || [],
+                          suggested_page: item.suggested_page || "",
+                          suggested_wikilinks: item.suggested_wikilinks || [],
+                          diagram: item.diagram || "",
+                        }
+                      })}
+                      className="px-3 py-2 border border-orange-200 text-orange-600 rounded-xl text-xs font-medium hover:bg-orange-50 transition-colors">
+                      Review
+                    </button>
                     <button onClick={() => handleApprove(item.id)} disabled={isBusy}
                       className="flex-1 py-2 bg-stone-900 text-white rounded-xl text-xs font-semibold hover:bg-stone-800 disabled:opacity-40 transition-colors">
                       {approvingId === item.id ? "Saving…" : "Save to wiki"}
                     </button>
+                    </>
                   )}
                   <button onClick={() => handleReject(item.id)} disabled={isBusy}
                     className="px-4 py-2 border border-stone-200 text-stone-500 rounded-xl text-xs font-medium hover:bg-stone-50 disabled:opacity-40 transition-colors">
@@ -445,6 +481,8 @@ function looksLikeMarkdownClip(text) {
 function IngestTab({ onApproved, onSwitchToChat }) {
   const [input, setInput] = useState("");
   const [images, setImages] = useState([]);
+  const [userNotes, setUserNotes] = useState("");
+  const [showQr, setShowQr] = useState(false);
   const [loading, setLoading] = useState(false);
   const [preview, setPreview] = useState(null);
   const [edits, setEdits] = useState(null);
@@ -459,7 +497,13 @@ function IngestTab({ onApproved, onSwitchToChat }) {
   const [dragOver, setDragOver] = useState(false);
   const [processingInbox, setProcessingInbox] = useState(false);
   const [inboxStatus, setInboxStatus] = useState(null);
+  const [savingImage, setSavingImage] = useState(false);
+  const [savedImages, setSavedImages] = useState(null);
   const [regeneratingMode, setRegeneratingMode] = useState(null);
+  const [polishing, setPolishing] = useState(false);
+  const [expanding, setExpanding] = useState(false);
+  const [expandOpen, setExpandOpen] = useState(false);
+  const [expandDirection, setExpandDirection] = useState("");
 
   useEffect(() => {
     api("/tag-ontology").then(d => setOntologyTags(Object.keys(d))).catch(() => {});
@@ -568,10 +612,31 @@ function IngestTab({ onApproved, onSwitchToChat }) {
           body: JSON.stringify({ markdown: trimmed }),
         });
       } else {
+        const hasText = !!(firstLine.startsWith("http://") || firstLine.startsWith("https://") || trimmed);
         if (firstLine.startsWith("http://") || firstLine.startsWith("https://")) body.url = firstLine;
         else if (trimmed) body.text = trimmed;
-        if (images.length) body.images = images.map(({ data, mediaType }) => ({ data, mediaType }));
-        data = await api("/ingest", { method: "POST", body: JSON.stringify(body) });
+
+        if (images.length && hasText) {
+          // Hybrid: process text normally + save images as assets in parallel
+          const [ingestData, imageData] = await Promise.all([
+            api("/ingest", { method: "POST", body: JSON.stringify(body) }),
+            api("/store-image", { method: "POST", body: JSON.stringify({ images: images.map(({ data, mediaType }) => ({ data, mediaType })) }) }),
+          ]);
+          const embeds = (imageData.saved || []).map(s => s.obsidian_embed);
+          if (embeds.length && ingestData.diff_preview) {
+            ingestData.diff_preview.summary = [...(ingestData.diff_preview.summary || []), ...embeds];
+          }
+          data = ingestData;
+          setImages([]);
+        } else if (images.length) {
+          // Pure image(s): vision extraction
+          body.images = images.map(({ data, mediaType }) => ({ data, mediaType }));
+          body.source_type = "lecture";
+          if (userNotes.trim()) body.user_notes = userNotes.trim();
+          data = await api("/ingest", { method: "POST", body: JSON.stringify(body) });
+        } else {
+          data = await api("/ingest", { method: "POST", body: JSON.stringify(body) });
+        }
       }
       setPreview(data); setEdits(null);
     } catch (e) { setError(e.message); }
@@ -623,7 +688,7 @@ function IngestTab({ onApproved, onSwitchToChat }) {
         ? `Saved to ${data.file_written}${evoMsg}${data.deep_dive_tagged ? " · 🔍 tagged for deeper research" : ""}`
         : "Skipped.";
       setDone(doneMsg);
-      setPreview(null); setEdits(null); setInput(""); setImages([]); setOpenThread(false);
+      setPreview(null); setEdits(null); setInput(""); setImages([]); setUserNotes(""); setOpenThread(false);
       if (approved) {
         onApproved?.();
         // Fire-and-forget: update maturity score for the saved page
@@ -643,6 +708,66 @@ function IngestTab({ onApproved, onSwitchToChat }) {
   }
   function setEdit(field, value) { setEdits(e => ({ ...e, [field]: value })); }
   const display = edits || preview?.diff_preview;
+
+  async function handlePolish() {
+    if (!display) return;
+    setPolishing(true);
+    setError("");
+    try {
+      const data = await api("/rewrite-notes", {
+        method: "POST",
+        body: JSON.stringify({
+          bullets: display.summary,
+          title: display.title || "",
+        }),
+      });
+      // Update bullets in-place — don't open full edit mode / expose diagram textarea
+      if (edits) {
+        setEdits(e => ({ ...e, summary: data.bullets }));
+      } else {
+        setPreview(p => ({ ...p, diff_preview: { ...p.diff_preview, summary: data.bullets } }));
+      }
+    } catch (e) { setError(e.message); }
+    finally { setPolishing(false); }
+  }
+
+  async function handleExpand() {
+    if (!display || !expandDirection.trim()) return;
+    setExpanding(true);
+    setError("");
+    try {
+      const data = await api("/expand-notes", {
+        method: "POST",
+        body: JSON.stringify({
+          bullets: display.summary,
+          title: display.title || "",
+          direction: expandDirection.trim(),
+        }),
+      });
+      if (edits) {
+        setEdits(e => ({ ...e, summary: data.bullets }));
+      } else {
+        setPreview(p => ({ ...p, diff_preview: { ...p.diff_preview, summary: data.bullets } }));
+      }
+      setExpandOpen(false);
+      setExpandDirection("");
+    } catch (e) { setError(e.message); }
+    finally { setExpanding(false); }
+  }
+
+  async function handleSaveImage() {
+    if (!images.length) return;
+    setSavingImage(true); setError("");
+    try {
+      const data = await api("/store-image", {
+        method: "POST",
+        body: JSON.stringify({ images: images.map(({ data, mediaType }) => ({ data, mediaType })) }),
+      });
+      setSavedImages(data.saved);
+      setImages([]);
+    } catch (e) { setError(e.message); }
+    finally { setSavingImage(false); }
+  }
 
   async function handleRegenerate(mode) {
     if (!preview?.id) return;
@@ -704,23 +829,37 @@ function IngestTab({ onApproved, onSwitchToChat }) {
         )}
 
         {images.length > 0 && (
-          <div className="flex flex-wrap gap-2 px-4 pb-3">
-            {images.map((img, i) => (
-              <div key={i} className="relative group w-16 h-16 rounded-xl overflow-hidden border border-stone-200 cursor-pointer"
-                onClick={() => window.open(img.previewUrl, "_blank")}>
-                <img src={img.previewUrl} alt={img.name} className="w-full h-full object-cover" />
-                <button onClick={e => { e.stopPropagation(); removeImage(i); }}
-                  className="absolute top-0.5 right-0.5 bg-stone-900/70 text-white rounded-full w-4 h-4 text-[10px] hidden group-hover:flex items-center justify-center">
-                  ×
-                </button>
-              </div>
-            ))}
-            {/* Paste another via clipboard */}
-            <button onClick={handleClipboardPaste} title="Paste image from clipboard (or click to browse)"
-              className="w-16 h-16 rounded-xl border-2 border-dashed border-stone-200 text-stone-300 hover:border-orange-300 hover:text-orange-400 transition-colors flex items-center justify-center text-xl">
-              +
-            </button>
-          </div>
+          <>
+            <div className="flex flex-wrap gap-2 px-4 pb-3">
+              {images.map((img, i) => (
+                <div key={i} className="relative group w-16 h-16 rounded-xl overflow-hidden border border-stone-200 cursor-pointer"
+                  onClick={() => window.open(img.previewUrl, "_blank")}>
+                  <img src={img.previewUrl} alt={img.name} className="w-full h-full object-cover" />
+                  <button onClick={e => { e.stopPropagation(); removeImage(i); }}
+                    className="absolute top-0.5 right-0.5 bg-stone-900/70 text-white rounded-full w-4 h-4 text-[10px] hidden group-hover:flex items-center justify-center">
+                    ×
+                  </button>
+                </div>
+              ))}
+              {/* Paste another via clipboard */}
+              <button onClick={handleClipboardPaste} title="Paste image from clipboard (or click to browse)"
+                className="w-16 h-16 rounded-xl border-2 border-dashed border-stone-200 text-stone-300 hover:border-orange-300 hover:text-orange-400 transition-colors flex items-center justify-center text-xl">
+                +
+              </button>
+            </div>
+            {/* Your understanding field — shown when images are attached */}
+            <div className="px-4 pb-3 border-t border-stone-100 pt-3">
+              <label className="block text-[11px] font-semibold text-stone-400 uppercase tracking-wide mb-1.5">
+                Your understanding <span className="font-normal normal-case">(optional — helps AI fill gaps)</span>
+              </label>
+              <textarea
+                className="w-full h-16 text-sm text-stone-800 placeholder-stone-400 resize-none focus:outline-none focus:ring-1 focus:ring-orange-300 rounded-xl border border-stone-200 px-3 py-2 bg-white"
+                placeholder="What do you already understand about this? e.g. 'I know KV cache stores keys/values but not why it's slow for long contexts'"
+                value={userNotes}
+                onChange={e => setUserNotes(e.target.value)}
+              />
+            </div>
+          </>
         )}
 
         <div className="flex items-center justify-between gap-3 px-4 py-3 border-t border-stone-100 bg-stone-50/50">
@@ -740,20 +879,74 @@ function IngestTab({ onApproved, onSwitchToChat }) {
               className="text-xs text-stone-500 hover:text-orange-600 transition-colors font-medium disabled:opacity-40">
               {processingInbox ? "Scanning inbox…" : "Process inbox clips"}
             </button>
+            {/* QR code for mobile upload */}
+            <button onClick={() => setShowQr(q => !q)} title="Upload from phone"
+              className="text-xs text-stone-500 hover:text-orange-600 transition-colors font-medium flex items-center gap-1">
+              <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M12 18h.01M8 21h8a2 2 0 002-2V5a2 2 0 00-2-2H8a2 2 0 00-2 2v14a2 2 0 002 2z"/></svg>
+              Mobile
+            </button>
           </div>
           <input ref={fileRef} type="file" accept="image/*" multiple className="hidden" onChange={handleImageUpload} />
 
-          <button onClick={handleProcess} disabled={loading || (!input.trim() && !images.length)}
-            className="px-5 py-2 bg-orange-500 text-white rounded-xl text-sm font-medium hover:bg-orange-600 disabled:opacity-40 disabled:cursor-not-allowed transition-colors shadow-sm">
-            {loading ? (
-              <span className="flex items-center gap-2">
-                <svg className="w-3.5 h-3.5 animate-spin" fill="none" viewBox="0 0 24 24"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"/><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/></svg>
-                {"Processing…"}
-              </span>
-            ) : "Process"}
-          </button>
+          <div className="flex items-center gap-2">
+            {images.length > 0 && (
+              <button onClick={handleSaveImage} disabled={savingImage}
+                className="px-4 py-2 bg-stone-700 text-white rounded-xl text-sm font-medium hover:bg-stone-800 disabled:opacity-40 disabled:cursor-not-allowed transition-colors shadow-sm">
+                {savingImage ? (
+                  <span className="flex items-center gap-2">
+                    <svg className="w-3.5 h-3.5 animate-spin" fill="none" viewBox="0 0 24 24"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"/><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/></svg>
+                    Saving…
+                  </span>
+                ) : "Save image"}
+              </button>
+            )}
+            <button onClick={handleProcess} disabled={loading || (!input.trim() && !images.length)}
+              className="px-5 py-2 bg-orange-500 text-white rounded-xl text-sm font-medium hover:bg-orange-600 disabled:opacity-40 disabled:cursor-not-allowed transition-colors shadow-sm">
+              {loading ? (
+                <span className="flex items-center gap-2">
+                  <svg className="w-3.5 h-3.5 animate-spin" fill="none" viewBox="0 0 24 24"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"/><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/></svg>
+                  {"Processing…"}
+                </span>
+              ) : "Process"}
+            </button>
+          </div>
         </div>
       </div>
+
+      {savedImages && savedImages.length > 0 && (
+        <div className="bg-white border border-stone-200 rounded-2xl p-4 shadow-sm space-y-3">
+          <div className="flex items-center justify-between">
+            <span className="text-sm font-semibold text-stone-700">Saved {savedImages.length} image{savedImages.length > 1 ? "s" : ""} to vault</span>
+            <button onClick={() => setSavedImages(null)} className="text-stone-400 hover:text-stone-600 text-lg leading-none">×</button>
+          </div>
+          {savedImages.map((img, i) => (
+            <div key={i} className="flex items-start gap-3 p-3 bg-stone-50 rounded-xl">
+              <div className="text-lg">🖼️</div>
+              <div className="flex-1 min-w-0">
+                <div className="text-xs font-medium text-stone-700 truncate">{img.filename}</div>
+                {img.caption && <div className="text-xs text-stone-500 mt-0.5">{img.caption}</div>}
+                <button
+                  onClick={() => navigator.clipboard.writeText(img.obsidian_embed)}
+                  className="mt-1.5 text-[11px] font-mono bg-stone-200 hover:bg-orange-100 hover:text-orange-700 text-stone-600 px-2 py-0.5 rounded-md transition-colors">
+                  {img.obsidian_embed}
+                </button>
+              </div>
+            </div>
+          ))}
+          <p className="text-[11px] text-stone-400">Click the embed path to copy it, then paste into any note.</p>
+        </div>
+      )}
+
+      {showQr && (
+        <div className="bg-white border border-stone-200 rounded-2xl p-4 flex flex-col items-center gap-3 shadow-sm">
+          <div className="flex items-center justify-between w-full">
+            <span className="text-sm font-semibold text-stone-700">📱 Mobile upload</span>
+            <button onClick={() => setShowQr(false)} className="text-stone-400 hover:text-stone-600 text-lg leading-none">×</button>
+          </div>
+          <img src={`${API}/qr-code`} alt="QR code for mobile upload" className="w-40 h-40 rounded-xl" />
+          <p className="text-xs text-stone-500 text-center">Scan with your phone — take photos of lecture slides and they'll queue here automatically.</p>
+        </div>
+      )}
 
       {questionNudge && (
         <div className="flex items-center justify-between gap-3 bg-stone-50 border border-stone-200 rounded-2xl px-4 py-3">
@@ -795,6 +988,22 @@ function IngestTab({ onApproved, onSwitchToChat }) {
 
       {preview && display && (
         <div className="bg-white rounded-2xl border border-stone-200 shadow-sm overflow-hidden">
+
+          {/* Sliced content banner */}
+          {preview.sliced && preview.slice_count > 1 && (
+            <div className="flex items-start gap-2.5 px-5 py-3 bg-violet-50 border-b border-violet-100">
+              <span className="text-violet-500 text-sm leading-none mt-0.5">⎇</span>
+              <div className="flex-1 min-w-0">
+                <span className="text-xs font-semibold text-violet-700">Split into {preview.slice_count} notes</span>
+                <p className="text-xs text-violet-500 mt-0.5">
+                  Reviewing note 1 — {preview.slice_count - 1} more queued below:{" "}
+                  {(preview.slice_titles || []).map((t, i) => (
+                    <span key={i} className="italic">{i > 0 ? ", " : ""}{t}</span>
+                  ))}
+                </p>
+              </div>
+            </div>
+          )}
 
           {/* Share Sheet badge — only shown if background extraction hasn't finished yet */}
           {preview.pending_extraction && (
@@ -841,7 +1050,49 @@ function IngestTab({ onApproved, onSwitchToChat }) {
           <div className="px-5 py-4 space-y-5">
             {/* Summary bullets */}
             <div>
-              <p className="text-xs font-semibold text-stone-400 uppercase tracking-wider mb-2.5">Key insights</p>
+              <div className="flex items-center justify-between mb-2.5">
+                <p className="text-xs font-semibold text-stone-400 uppercase tracking-wider">Key insights</p>
+                <div className="flex items-center gap-1.5">
+                  <button
+                    onClick={() => { setExpandOpen(o => !o); setExpandDirection(""); }}
+                    disabled={expanding || polishing}
+                    title="Add new bullets in a direction you specify"
+                    className="text-xs px-2 py-0.5 rounded-lg border border-emerald-200 text-emerald-600 hover:bg-emerald-50 disabled:opacity-40 transition-colors"
+                  >
+                    + Expand
+                  </button>
+                  <button
+                    onClick={handlePolish}
+                    disabled={polishing || expanding}
+                    title="Rewrite as neutral technical notes (Lilian Weng style)"
+                    className="text-xs px-2 py-0.5 rounded-lg border border-violet-200 text-violet-600 hover:bg-violet-50 disabled:opacity-40 transition-colors flex items-center gap-1"
+                  >
+                    {polishing
+                      ? <><svg className="w-3 h-3 animate-spin" fill="none" viewBox="0 0 24 24"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"/><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/></svg> Rewriting…</>
+                      : "✦ Polish"}
+                  </button>
+                </div>
+              </div>
+              {expandOpen && (
+                <div className="mb-3 flex gap-2 items-center">
+                  <input
+                    autoFocus
+                    type="text"
+                    value={expandDirection}
+                    onChange={e => setExpandDirection(e.target.value)}
+                    onKeyDown={e => { if (e.key === "Enter") handleExpand(); if (e.key === "Escape") setExpandOpen(false); }}
+                    placeholder="What should I add? e.g. 'add a point about gradient accumulation'"
+                    className="flex-1 text-xs border border-emerald-200 rounded-lg px-3 py-1.5 focus:outline-none focus:ring-1 focus:ring-emerald-300 placeholder-stone-400"
+                  />
+                  <button
+                    onClick={handleExpand}
+                    disabled={expanding || !expandDirection.trim()}
+                    className="text-xs px-3 py-1.5 bg-emerald-500 text-white rounded-lg hover:bg-emerald-600 disabled:opacity-40 transition-colors flex items-center gap-1"
+                  >
+                    {expanding ? <><svg className="w-3 h-3 animate-spin" fill="none" viewBox="0 0 24 24"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"/><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/></svg> Adding…</> : "Add"}
+                  </button>
+                </div>
+              )}
               <ul className="space-y-2.5">
                 {display.summary.map((b, i) => (
                   <li key={i} className="flex gap-3">
@@ -1819,7 +2070,7 @@ function LintPanel({ onClose, onConsolidate, onFix }) {
       .then(data => { if (data) setReport(data); })
       .catch(() => {});
     // Fetch known page slugs so we can filter out actions on non-existent pages
-    fetch(`${API}/pages?folder=concepts`)
+    fetch(`${API}/pages?folder=cs`)
       .then(r => r.json())
       .then(d => setExistingPages(new Set((d.pages || []).map(p => p.name))))
       .catch(() => {});
@@ -2447,14 +2698,17 @@ function InsightsPanel({ onClose }) {
 }
 
 const FOLDERS = [
-  { key: "concepts", label: "Concepts" },
+  { key: "recent", label: "🕐 Recent" },
+  { key: "cs", label: "CS / ML" },
+  { key: "science", label: "Science" },
+  { key: "humanities", label: "Humanities" },
   { key: "sources", label: "Sources" },
   { key: "insights", label: "Insights" },
   { key: "open-threads", label: "🔍 Threads" },
 ];
 
 function BrowseTab() {
-  const [folder, setFolder] = useState("concepts");
+  const [folder, setFolder] = useState("cs");
   const [pages, setPages] = useState([]);
   const [search, setSearch] = useState("");
   const [deepDiveFilter, setDeepDiveFilter] = useState(false);
@@ -2463,12 +2717,12 @@ function BrowseTab() {
   const [pageLoading, setPageLoading] = useState(false);
   const [showLint, setShowLint] = useState(false);
   const [showInsights, setShowInsights] = useState(false);
-  const [showGraph, setShowGraph] = useState(false);
   const [reviewFilter, setReviewFilter] = useState(false);
   const [reviewPages, setReviewPages] = useState([]);
   const [consolidateModal, setConsolidateModal] = useState(null);
   const [fixing, setFixing] = useState({});
   const [deleting, setDeleting] = useState(null);
+  const [closingThread, setClosingThread] = useState(false);
   const [sortBy, setSortBy] = useState("updated"); // "updated", "name", "entry_count"
   const [selectedTags, setSelectedTags] = useState(new Set()); // for tag filtering
   const [showTagFilter, setShowTagFilter] = useState(false);
@@ -2476,13 +2730,39 @@ function BrowseTab() {
   const [summaryModal, setSummaryModal] = useState(null); // page name or null
   const [ontologyTagList, setOntologyTagList] = useState([]); // canonical tags from ontology
   const [minMaturity, setMinMaturity] = useState(0); // maturity range filter (0 = off)
+  const [polishTask, setPolishTask] = useState(null); // null | { task_id, status, pages_total, pages_done, bullets_done, current_page, message }
+  const polishPollRef = useRef(null);
 
   useEffect(() => {
     api("/tag-ontology").then(d => setOntologyTagList(Object.keys(d))).catch(() => {});
   }, []);
 
+  async function startVaultPolish() {
+    if (!confirm("Rewrite all first-person POV bullets across the vault as neutral technical notes? This edits vault files directly.")) return;
+    try {
+      const { task_id } = await api("/vault/rewrite-pov-notes", { method: "POST" });
+      setPolishTask({ task_id, status: "scanning", pages_total: 0, pages_done: 0, bullets_done: 0, current_page: null, message: null });
+      polishPollRef.current = setInterval(async () => {
+        try {
+          const s = await api(`/vault/rewrite-pov-notes/status/${task_id}`);
+          setPolishTask(s);
+          if (s.status === "done") {
+            clearInterval(polishPollRef.current);
+            polishPollRef.current = null;
+          }
+        } catch {
+          clearInterval(polishPollRef.current);
+          polishPollRef.current = null;
+        }
+      }, 1500);
+    } catch (e) {
+      setPolishTask({ status: "done", message: `Error: ${e.message}` });
+    }
+  }
+
   function reloadPages(f = folder) {
-    api(`/pages?folder=${f}`).then(d => setPages(d.pages)).catch(() => {});
+    const url = f === "recent" ? `/vault/recent-pages` : `/pages?folder=${f}`;
+    api(url).then(d => setPages(d.pages)).catch(() => {});
   }
 
   function switchFolder(f) {
@@ -2499,8 +2779,9 @@ function BrowseTab() {
   useEffect(() => {
     // Retry on mount — keeps retrying every 2s until pages load (handles slow app startup)
     let attempts = 0;
+    const pagesUrl = folder === "recent" ? `/vault/recent-pages` : `/pages?folder=${folder}`;
     const tryLoad = () => {
-      api(`/pages?folder=${folder}`)
+      api(pagesUrl)
         .then(d => { if (d.pages?.length > 0) setPages(d.pages); else if (attempts++ < 15) setTimeout(tryLoad, 2000); })
         .catch(() => { if (attempts++ < 15) setTimeout(tryLoad, 2000); });
     };
@@ -2510,7 +2791,8 @@ function BrowseTab() {
   useEffect(() => {
     // Poll every 10s to pick up newly approved items
     const interval = setInterval(() => {
-      api(`/pages?folder=${folder}`)
+      const pagesUrl = folder === "recent" ? `/vault/recent-pages` : `/pages?folder=${folder}`;
+      api(pagesUrl)
         .then(d => { if (d.pages) setPages(d.pages); })
         .catch(() => {});
     }, 10000);
@@ -2574,6 +2856,17 @@ function BrowseTab() {
     finally { setFixing(p => ({ ...p, [name]: false })); }
   }
 
+  async function handleCloseThread(name) {
+    setClosingThread(true);
+    try {
+      await api(`/close-open-thread/${name}`, { method: "POST" });
+      reloadPages();
+      setSelected(null);
+      setParsedPage(null);
+    } catch (e) { alert(`Close thread failed: ${e.message}`); }
+    finally { setClosingThread(false); }
+  }
+
   const reviewPageNames = new Set(reviewPages.map(p => p.name));
   const filtered = (reviewFilter ? reviewPages : pages)
     .filter(p => !(folder === "insights" && p.name.includes("lint-report")))
@@ -2590,7 +2883,7 @@ function BrowseTab() {
     })
     .filter(p => {
       // Maturity filter: only applies to concepts folder when minMaturity > 0
-      if (folder !== "concepts" || minMaturity === 0) return true;
+      if (!["cs", "science", "humanities"].includes(folder) || minMaturity === 0) return true;
       return (p.understanding_maturity ?? 0) >= minMaturity;
     })
     .sort((a, b) => {
@@ -2647,8 +2940,14 @@ function BrowseTab() {
           <span className="text-stone-300 mx-1">/</span>
           <span className="text-sm font-medium text-stone-700 flex-1 truncate">{selected}</span>
           <div className="flex items-center gap-1">
-            {folder === "concepts" && (
+            {["cs", "science", "humanities"].includes(folder) && (
               <>
+                {parsedPage?.tags?.some(t => t.toLowerCase() === "deep-dive") && (
+                  <button onClick={() => handleCloseThread(selected)} disabled={closingThread}
+                    className="text-xs px-2.5 py-1 border border-emerald-200 text-emerald-600 rounded-lg hover:bg-emerald-50 disabled:opacity-40 transition-colors">
+                    {closingThread ? "…" : "✓ Close thread"}
+                  </button>
+                )}
                 <button onClick={() => handleFix(selected)} disabled={fixing[selected]}
                   className="text-xs px-2.5 py-1 border border-stone-200 text-stone-500 rounded-lg hover:bg-stone-50 disabled:opacity-40 transition-colors">
                   {fixing[selected] ? "…" : "Fix"}
@@ -2678,7 +2977,7 @@ function BrowseTab() {
               <svg className="w-4 h-4 animate-spin" fill="none" viewBox="0 0 24 24"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"/><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/></svg>
               Loading…
             </div>
-          ) : parsedPage && folder === "concepts" ? (
+          ) : parsedPage && ["cs", "science", "humanities"].includes(folder) ? (
             <ConceptPageView page={{ ...parsedPage, _onOpenPage: openPage }} />
           ) : (
             <div className="space-y-3">
@@ -2721,7 +3020,7 @@ function BrowseTab() {
           <p className="text-xs text-stone-400 mt-0.5">{filtered.length} page{filtered.length !== 1 ? "s" : ""}{deepDiveFilter ? " flagged for deeper research" : reviewFilter ? " not reviewed in 30+ days" : ` in ${folder}`}</p>
         </div>
         <div className="flex gap-1.5">
-          {folder === "concepts" && (
+          {["cs", "science", "humanities"].includes(folder) && (
             <>
               <button onClick={handleRandom}
                 className="text-xs px-3 py-1.5 rounded-xl border border-stone-200 text-stone-500 hover:bg-stone-50 transition-colors">
@@ -2735,32 +3034,70 @@ function BrowseTab() {
                 className={`text-xs px-3 py-1.5 rounded-xl border transition-colors ${reviewFilter ? "bg-amber-500 text-white border-amber-500" : "border-amber-200 text-amber-600 hover:bg-amber-50"}`}>
                 🕰 Review
               </button>
-              <button onClick={() => { setShowGraph(v => !v); setShowInsights(false); setShowLint(false); }}
-                className={`text-xs px-3 py-1.5 rounded-xl border transition-colors ${showGraph ? "bg-violet-600 text-white border-violet-600" : "border-violet-200 text-violet-600 hover:bg-violet-50"}`}>
-                🕸 Graph
-              </button>
             </>
           )}
-          <button onClick={() => { setShowInsights(v => !v); setShowLint(false); setShowGraph(false); }}
+          <button onClick={() => { setShowInsights(v => !v); setShowLint(false); }}
             className={`text-xs px-3 py-1.5 rounded-xl border transition-colors ${showInsights ? "bg-indigo-600 text-white border-indigo-600" : "border-indigo-200 text-indigo-500 hover:bg-indigo-50"}`}>
             🧠 Learn
           </button>
-          <button onClick={() => { setShowLint(v => !v); setShowInsights(false); setShowGraph(false); }}
+          <button onClick={() => { setShowLint(v => !v); setShowInsights(false); }}
             className={`text-xs px-3 py-1.5 rounded-xl border transition-colors ${showLint ? "bg-stone-900 text-white border-stone-900" : "border-stone-200 text-stone-500 hover:bg-stone-50"}`}>
             Health
           </button>
+          <button
+            onClick={startVaultPolish}
+            disabled={polishTask?.status === "running" || polishTask?.status === "scanning"}
+            title="Rewrite all first-person POV notes across the vault as neutral technical prose"
+            className="text-xs px-3 py-1.5 rounded-xl border border-violet-200 text-violet-600 hover:bg-violet-50 disabled:opacity-40 transition-colors"
+          >
+            ✦ Polish vault
+          </button>
         </div>
       </div>
+
+      {polishTask && (
+        <div className="mb-3 px-4 py-3 rounded-xl bg-violet-50 border border-violet-200 text-xs text-violet-800 space-y-1.5">
+          <div className="flex items-center justify-between">
+            <span className="font-semibold">
+              {polishTask.status === "scanning" && "Scanning vault…"}
+              {polishTask.status === "running" && "Polishing notes…"}
+              {polishTask.status === "done" && (polishTask.message || "Done.")}
+            </span>
+            {polishTask.status === "done" && (
+              <button onClick={() => setPolishTask(null)} className="text-violet-400 hover:text-violet-600 ml-2">×</button>
+            )}
+          </div>
+          {polishTask.status !== "done" && polishTask.pages_total > 0 && (
+            <>
+              <div className="flex items-center justify-between text-violet-600">
+                <span>
+                  Page {polishTask.pages_done + 1} of {polishTask.pages_total}
+                  {polishTask.current_page && <span className="font-mono ml-1 opacity-70"> · {polishTask.current_page}</span>}
+                </span>
+                <span>{polishTask.bullets_done} bullet{polishTask.bullets_done !== 1 ? "s" : ""} rewritten</span>
+              </div>
+              <div className="w-full bg-violet-200 rounded-full h-1 overflow-hidden">
+                <div
+                  className="bg-violet-500 h-1 rounded-full transition-all duration-500"
+                  style={{ width: `${Math.round((polishTask.pages_done / polishTask.pages_total) * 100)}%` }}
+                />
+              </div>
+            </>
+          )}
+          {polishTask.status !== "done" && polishTask.pages_total === 0 && (
+            <div className="flex items-center gap-2 text-violet-500">
+              <svg className="w-3 h-3 animate-spin" fill="none" viewBox="0 0 24 24"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"/><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/></svg>
+              <span>Scanning for POV bullets…</span>
+            </div>
+          )}
+        </div>
+      )}
 
       {showInsights && (
         <InsightsPanel onClose={() => setShowInsights(false)} />
       )}
 
-      {showGraph && (
-        <GraphPanel onClose={() => setShowGraph(false)} onOpenPage={name => { setShowGraph(false); openPage(name); }} />
-      )}
-
-      {showLint && (
+{showLint && (
         <LintPanel onClose={() => setShowLint(false)}
           onConsolidate={(s, t) => setConsolidateModal({ source: s, target: t })}
           onFix={name => handleFix(name)} />
@@ -2856,8 +3193,8 @@ function BrowseTab() {
           </select>
         </div>
 
-        {/* Maturity range filter — only shown on Concepts folder */}
-        {folder === "concepts" && (
+        {/* Maturity range filter — only shown on domain folders */}
+        {["cs", "science", "humanities"].includes(folder) && (
           <div className="flex items-center gap-3 px-3 py-2 bg-white border border-stone-200 rounded-xl">
             <span className="text-xs text-stone-500 whitespace-nowrap">Maturity ≥</span>
             <input
@@ -2911,10 +3248,13 @@ function BrowseTab() {
                   </div>
                 )}
                 {page.last_updated && (
-                  <p className="text-xs text-stone-400 mt-1.5">
+                  <p className="text-xs text-stone-400 mt-1.5 flex items-center gap-2">
                     {page.last_updated}
                     {reviewFilter && page.days_since_update && (
-                      <span className="ml-2 text-amber-500 font-medium">{page.days_since_update}d ago</span>
+                      <span className="text-amber-500 font-medium">{page.days_since_update}d ago</span>
+                    )}
+                    {folder === "recent" && page.folder && (
+                      <span className="text-[10px] px-1.5 py-0.5 rounded-md bg-stone-100 text-stone-500 font-medium uppercase tracking-wide">{page.folder}</span>
                     )}
                   </p>
                 )}
@@ -2922,7 +3262,7 @@ function BrowseTab() {
 
               <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity shrink-0"
                 onClick={e => e.stopPropagation()}>
-                {folder === "concepts" && (
+                {["cs", "science", "humanities"].includes(folder) && (
                   <button onClick={() => handleFix(page.name)} disabled={fixing[page.name]}
                     title="Fix wikilinks" className="w-7 h-7 flex items-center justify-center text-stone-400 hover:text-stone-700 hover:bg-stone-100 rounded-lg text-xs transition-colors">
                     {fixing[page.name] ? "…" : "✦"}

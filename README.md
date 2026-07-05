@@ -11,7 +11,8 @@ A personal knowledge system for capturing things learned in the wild — X/Twitt
 - **Backend:** FastAPI + Python, running on port 8001
 - **Frontend:** React + Vite, Tailwind CSS (CDN), running on port 5173
 - **LLMs:** Provider-routed by task (`anthropic` / `ollama` / `qwen` / OpenAI-compatible)
-- **Storage:** Flat Markdown files — no database, no embeddings
+- **Storage:** Markdown source of truth + SQLite memory index (`_wiki/meta/memory.db`)
+- **Retrieval:** Chunked lexical memory by default, optional embeddings when `OPENAI_API_KEY` is set
 
 ---
 
@@ -70,6 +71,19 @@ Task keys currently used in code include:
 `INGEST_EXTRACT`, `CHAT_SELECT_PAGES`, `CHAT_ANSWER`, `EVOLUTION_CLASSIFY`,
 `TAG_CLASSIFY`, `ANALYZE_TRACES`, `LINT_SCAN`, `LINT_JSON_FIX`,
 `CONSOLIDATE_PAGES`, `KNOWLEDGE_GAPS`.
+
+Embedding-backed memory retrieval is optional and opt-in:
+
+```bash
+EMBED_ENABLED=true
+OPENAI_API_KEY=...
+EMBED_PROVIDER=openai
+EMBED_MODEL=text-embedding-3-small
+```
+
+Without an embedding key, SakethWiki still builds the persistent SQLite memory
+index and uses lexical chunk retrieval. With `EMBED_ENABLED=true`, the same
+index stores vectors and blends semantic + lexical search at query time.
 
 ### Recommended hybrid profile (quality + cost)
 
@@ -168,7 +182,7 @@ cd frontend && npm run build
 | POST | `/inbox/process` | Scan `_wiki/inbox/*.md` and stage clips to queue |
 | GET | `/queue` | List all pending review items |
 | POST | `/approve/{id}` | Approve or reject a queued item |
-| POST | `/chat` | Chat with your wiki (keyword-matched context + routed LLM) |
+| POST | `/chat` | Chat with your wiki through the persistent memory index |
 | GET | `/pages?folder=` | List pages in a folder (concepts, sources, insights, meta) |
 | GET | `/page/{name}` | Full content + parsed structured data for a page |
 | DELETE | `/page/{name}` | Delete a page |
@@ -190,6 +204,8 @@ cd frontend && npm run build
 | **GET** | **`/tag-ontology`** | **Return the canonical tag ontology** |
 | **GET** | **`/random-concept`** | **Return a random concept page name** |
 | **POST** | **`/knowledge-gaps/{page_name}`** | **Generate 5 unanswered questions, prerequisites, and a concept diagram** |
+| **GET** | **`/memory/status`** | **Inspect SQLite memory index state (pages, chunks, embeddings enabled)** |
+| **POST** | **`/memory/reindex`** | **Rebuild or refresh the persistent memory index from markdown pages** |
 
 ### POST /ingest
 

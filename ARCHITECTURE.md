@@ -25,8 +25,9 @@
 └──────────────────────────────────────────────────────────────────┘
                               ↓
 ┌──────────────────────────────────────────────────────────────────┐
-│                  Vault (Markdown + JSON)                        │
-│              ~/SakethVault/_wiki/concepts/*.md                  │
+│        Vault + Memory Substrate (Markdown + SQLite + JSON)      │
+│              ~/SakethVault/_wiki/cs|science|humanities/*.md     │
+│              ~/SakethVault/_wiki/meta/memory.db                 │
 │              ~/SakethVault/_wiki/meta/traces.jsonl              │
 │              ~/SakethVault/_wiki/meta/system-insights.md        │
 └──────────────────────────────────────────────────────────────────┘
@@ -149,19 +150,22 @@ File modifications on disk + ackedMap updated
 ```
 User question
     ↓
-Is it a knowledge query? (regex + keyword match)
+sync_index() → detect changed/deleted pages and refresh memory.db
     ↓
-YES: find_relevant_pages() → parse_concept_page()
-     Returns: knowledge_card {concept, understanding, related, evidence}
+SQLite memory search over chunked notes
     ↓
-NO: keyword_match_context() → raw markdown snippets
+optional embedding rerank (only if EMBED_ENABLED=true)
     ↓
-Routed chat model answers with context
+top page hits + snippets + current understanding
+    ↓
+routed chat model answers from memory context
+    ↓
+knowledge queries additionally parse top concept page into knowledge_card
     ↓
 Return: {answer, knowledge_card?, sources}
 ```
 
-**Optimization:** Pre-filtered context (keyword search → top 5 pages) before LLM. Chat can run on local Ollama/Qwen; critical integrity tasks remain Anthropic by default.
+**Design shift:** Markdown is still the source of truth, but it is no longer the retrieval index. The durable retrieval layer lives in `_wiki/meta/memory.db`, which stores page metadata plus chunked snippets and optional embeddings.
 
 ### 5. Learning Dashboard
 
