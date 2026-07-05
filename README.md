@@ -85,26 +85,27 @@ Without an embedding key, SakethWiki still builds the persistent SQLite memory
 index and uses lexical chunk retrieval. With `EMBED_ENABLED=true`, the same
 index stores vectors and blends semantic + lexical search at query time.
 
-### Recommended hybrid profile (quality + cost)
+### Recommended hybrid profile (speed + judgment)
 
-For local-Qwen + Anthropic guardrails:
+Use Gemini Flash for fast reversible UX paths, and Anthropic for source-of-truth
+judgment paths:
 
 ```bash
-LLM_PROVIDER=ollama
-OLLAMA_BASE_URL=http://localhost:11434/v1
-OLLAMA_MODEL_TEXT=qwen3:14b
-OLLAMA_MODEL_VISION=qwen2.5vl:7b
+LLM_PROVIDER=openai_compat
+OPENAI_COMPAT_BASE_URL=https://generativelanguage.googleapis.com/v1beta/openai
+OPENAI_COMPAT_MODEL_TEXT=gemini-2.5-flash
+OPENAI_COMPAT_MODEL_VISION=gemini-2.5-flash
 
 # Critical integrity paths on Anthropic
-LLM_PROVIDER_INGEST_EXTRACT=anthropic
 LLM_PROVIDER_LINT_SCAN=anthropic
 LLM_PROVIDER_LINT_JSON_FIX=anthropic
 LLM_PROVIDER_CONSOLIDATE_PAGES=anthropic
 LLM_PROVIDER_KNOWLEDGE_GAPS=anthropic
+LLM_PROVIDER_EVOLUTION_CLASSIFY=anthropic
 
-# Optional speed tuning for low-risk tasks
-LLM_MODEL_CHAT_SELECT_PAGES=qwen3:8b
-LLM_MODEL_TAG_CLASSIFY=qwen3:8b
+# Keep embeddings explicit. The Markdown vault and SQLite lexical index work
+# without vectors; semantic embeddings are an opt-in derived index.
+EMBED_ENABLED=false
 ```
 
 Contract fallback guardrail (implemented in `llm_client`):

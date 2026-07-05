@@ -7,6 +7,7 @@ import memory_store
 import preference_memory
 import active_review
 import consolidation
+import main
 import vault_reader
 
 
@@ -163,9 +164,18 @@ def test_preference_memory_learns_from_corrections(monkeypatch, tmp_path):
 
     data = preference_memory.load()
     assert data["page_corrections"]["language-model-memory"]["rag"]["count"] == 1
+    assert data["page_corrections"]["language-model-memory"]["rag"]["status"] == "candidate"
     assert data["tag_corrections"]["Agentic"]["Agents"]["count"] == 1
     assert data["tag_corrections"]["Agentic"]["RAG"]["count"] == 1
     assert data["rejected_pages"]["random-slug"]["count"] == 1
+
+    assert preference_memory.preferred_page("language model memory") == "language-model-memory"
+    assert preference_memory.preferred_tags(["Agentic"]) == ["Agentic"]
+    assert any(item["type"] == "page_correction" for item in preference_memory.review_candidates())
+
+    preference_memory.set_preference_status("page_correction", "language-model-memory", "rag", "active")
+    preference_memory.set_preference_status("tag_correction", "Agentic", "RAG", "active")
+    preference_memory.set_preference_status("rejected_page", "random-slug", "random-slug", "active")
 
     assert preference_memory.preferred_page("language model memory") == "rag"
     assert preference_memory.preferred_tags(["Agentic"]) == ["RAG"]
@@ -174,6 +184,51 @@ def test_preference_memory_learns_from_corrections(monkeypatch, tmp_path):
     assert "Prefer page `rag` instead of `language-model-memory`" in hints
     assert "Prefer tag `RAG` instead of `Agentic`" in hints
     assert "Be cautious about creating or using page `random-slug`" in hints
+
+
+def test_preference_memory_auto_activates_repeated_evidence(monkeypatch, tmp_path):
+    vault = tmp_path / "vault"
+    (vault / "_wiki" / "meta").mkdir(parents=True)
+    monkeypatch.setenv("VAULT_PATH", str(vault))
+
+    trace = {
+        "approved": True,
+        "url": "https://example.com/rag",
+        "suggested_page": "language-model-memory",
+        "final_page": "rag",
+        "page_corrected": True,
+        "tags_suggested": ["Agentic"],
+        "tags_final": ["RAG"],
+        "tags_corrected": True,
+    }
+    preference_memory.record_approval_trace(trace)
+    preference_memory.record_approval_trace(trace)
+
+    data = preference_memory.load()
+    assert data["page_corrections"]["language-model-memory"]["rag"]["status"] == "active"
+    assert data["tag_corrections"]["Agentic"]["RAG"]["status"] == "active"
+    assert preference_memory.preferred_page("language model memory") == "rag"
+    assert preference_memory.preferred_tags(["Agentic"]) == ["RAG"]
+
+
+def test_preference_review_can_keep_candidate_from_auto_applying(monkeypatch, tmp_path):
+    vault = tmp_path / "vault"
+    (vault / "_wiki" / "meta").mkdir(parents=True)
+    monkeypatch.setenv("VAULT_PATH", str(vault))
+
+    trace = {
+        "approved": True,
+        "url": "https://example.com/rag",
+        "suggested_page": "language-model-memory",
+        "final_page": "rag",
+        "page_corrected": True,
+    }
+    preference_memory.record_approval_trace(trace)
+    preference_memory.record_approval_trace(trace)
+    preference_memory.set_preference_status("page_correction", "language-model-memory", "rag", "candidate")
+
+    assert preference_memory.load()["page_corrections"]["language-model-memory"]["rag"]["status"] == "candidate"
+    assert preference_memory.preferred_page("language model memory") == "language-model-memory"
 
 
 def test_active_review_prioritizes_weak_orphaned_pages(monkeypatch, tmp_path):
@@ -237,3 +292,19 @@ def test_consolidation_candidates_are_conservative(monkeypatch, tmp_path):
 
     unsafe = consolidation.validate_pair("binary-search", "rag")
     assert unsafe["safe_auto"] is False
+
+
+def test_expand_notes_parser_accepts_markdown_and_json():
+    assert main._parse_bullet_array('["A new point.", "Another point."]') == [
+        "A new point.",
+        "Another point.",
+    ]
+    assert main._parse_bullet_array(
+        "```json\n[\"Fenced point.\"]\n```"
+    ) == ["Fenced point."]
+    assert main._parse_bullet_array(
+        "- Recovery is CPU-intensive.\n- Parity count changes decode cost."
+    ) == [
+        "Recovery is CPU-intensive.",
+        "Parity count changes decode cost.",
+    ]

@@ -305,26 +305,43 @@ graph TD
     A[Human approve / reject] --> B[trace event]
     B --> C[_wiki/meta/traces.jsonl]
     B --> D[_wiki/meta/preferences.json]
-    D --> E[page correction patterns]
-    D --> F[tag correction patterns]
-    D --> G[rejected page slugs]
-    D --> H[response style hints]
-    E --> I[future extraction prompt]
-    F --> I
-    G --> I
-    H --> J[chat system prompt]
+    D --> E[candidate preference evidence]
+    E --> F[active or rejected review state]
+    F --> G[page correction patterns]
+    F --> H[tag correction patterns]
+    F --> I[rejected page slugs]
+    D --> L[response style hints]
+    G --> J[future extraction prompt]
+    H --> J
+    I --> J
+    L --> K[chat system prompt]
 ```
 
-`preferences.json` is not knowledge. It records repeated user behavior such as "when the extractor suggests X page, Saketh keeps moving it to Y", "this tag gets corrected to that tag", and "this suggested page was rejected". Those preferences shape future extraction and chat, but they do not appear in concept pages or retrieval chunks.
+`preferences.json` is not knowledge. It records reviewed or repeated user behavior such as "when the extractor suggests X page, Saketh keeps moving it to Y", "this tag gets corrected to that tag", and "this suggested page was rejected". One-off corrections stay as candidates. A correction starts shaping extraction only after repeated evidence or explicit review approval.
 
 Implementation points:
 
 - Approval traces update preference memory deterministically in `backend/preference_memory.py`.
-- Extraction receives preference hints alongside `system-insights.md` prompt hints.
+- Extraction receives only active/stable preference hints alongside `system-insights.md` prompt hints.
 - Chat receives response-style preferences such as starting with the answer and being direct.
-- `/preferences` exposes the current durable preference state for inspection.
+- `/preferences` exposes the durable preference state and pending review candidates.
+- `/preferences/review` can mark a candidate `active`, `candidate`, or `rejected`.
 
 Mistake to avoid: using an LLM to infer preferences from vibes. Preferences should come from observed corrections first. LLM synthesis can summarize them later, but the raw memory should remain auditable.
+
+## LLM Routing Channels
+
+SakethWiki uses task routing, not one fixed model per feature.
+
+```mermaid
+flowchart TD
+    A[Fast reversible UX] --> B[Gemini 2.5 Flash via openai_compat]
+    C[Source-of-truth judgment] --> D[Anthropic Claude]
+    E[Local experiments] --> F[Ollama qwen2.5:7b]
+    G[Semantic index opt-in] --> I[OpenAI embeddings]
+```
+
+Gemini is the default route for fast chat, rewrite, expand, and normal capture. Claude is pinned for linting, consolidation, knowledge-gap analysis, and evolution classification because those tasks can affect durable vault state. Ollama remains useful for local experiments, but it should not judge source-of-truth memory yet. Embeddings stay explicit with `EMBED_ENABLED=false` by default; the Markdown vault and SQLite lexical index remain the stable base.
 
 ---
 

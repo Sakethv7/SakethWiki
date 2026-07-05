@@ -159,6 +159,13 @@ class ChatRequest(BaseModel):
     history: list = []
 
 
+class PreferenceReviewRequest(BaseModel):
+    kind: str
+    key: str
+    value: str = ""
+    status: str
+
+
 class InterviewRequest(BaseModel):
     question: str
     user_answer: Optional[str] = None
@@ -2258,8 +2265,31 @@ async def get_preferences():
     return {
         "path": str(preference_memory.path()),
         "preferences": data,
+        "review_candidates": preference_memory.review_candidates(),
         "prompt_hints": preference_memory.prompt_hints(),
+        "chat_hints": preference_memory.chat_hints(),
     }
+
+
+@app.post("/preferences/review")
+async def review_preference(req: PreferenceReviewRequest):
+    try:
+        data = preference_memory.set_preference_status(
+            req.kind,
+            req.key,
+            req.value,
+            req.status,
+        )
+        return {
+            "ok": True,
+            "preferences": data,
+            "review_candidates": preference_memory.review_candidates(),
+            "prompt_hints": preference_memory.prompt_hints(),
+        }
+    except KeyError as e:
+        raise HTTPException(404, str(e))
+    except ValueError as e:
+        raise HTTPException(400, str(e))
 
 
 @app.post("/memory/reindex")
@@ -4581,15 +4611,53 @@ Return ONLY a JSON array of the NEW bullets (not the existing ones), e.g.:
             model=None,
             max_tokens=600,
             messages=[{"role": "user", "content": prompt}],
-            expect_json=True,
+            expect_json=False,
         ).strip()
-        start = raw.find("[")
-        end = raw.rfind("]") + 1
-        new_bullets = json.loads(raw[start:end]) if start >= 0 else []
+        new_bullets = _parse_bullet_array(raw)
     except Exception as e:
         raise HTTPException(500, f"Expand failed: {e}")
 
+    if not new_bullets:
+        raise HTTPException(500, "Expand failed: model returned no usable bullets")
+
     return {"bullets": req.bullets + new_bullets}
+
+
+def _parse_bullet_array(raw: str) -> list[str]:
+    """
+    Best-effort parser for note-generation endpoints.
+    Accepts strict JSON arrays, fenced JSON, or plain markdown bullets.
+    """
+    text = (raw or "").strip()
+    if not text:
+        return []
+
+    if text.startswith("```"):
+        parts = text.split("```")
+        for part in parts[1::2]:
+            candidate = part.strip()
+            if candidate.startswith("json"):
+                candidate = candidate[4:].strip()
+            if candidate:
+                text = candidate
+                break
+
+    start = text.find("[")
+    end = text.rfind("]") + 1
+    if start >= 0 and end > start:
+        try:
+            parsed = json.loads(text[start:end])
+            if isinstance(parsed, list):
+                return [str(item).strip() for item in parsed if str(item).strip()]
+        except json.JSONDecodeError:
+            pass
+
+    lines = []
+    for line in text.splitlines():
+        cleaned = _re.sub(r"^\s*(?:[-*•]|\d+[.)])\s+", "", line).strip()
+        if cleaned and cleaned.lower() not in {"json", "new bullets:"}:
+            lines.append(cleaned)
+    return lines[:4]
 
 
 @app.post("/rewrite-notes")
