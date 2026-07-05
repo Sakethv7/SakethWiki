@@ -28,6 +28,7 @@ if _env_path.exists():
             if _v:
                 os.environ[_k] = _v
 
+import identity
 import llm_client
 
 VAULT_PATH   = Path(os.environ.get("VAULT_PATH", "/Users/sakethv7/SakethVault"))
@@ -66,10 +67,14 @@ def write_approved(item: dict) -> str:
     domain_dir.mkdir(parents=True, exist_ok=True)
     sources_dir.mkdir(parents=True, exist_ok=True)
 
-    page_name = _slug(item.get("suggested_page", "general"))
-    # If page already exists in the legacy concepts/ folder, keep it there
-    legacy_path = vault / "_wiki" / "concepts" / f"{page_name}.md"
-    page_path   = legacy_path if legacy_path.exists() else domain_dir / f"{page_name}.md"
+    page_name = identity.resolve_slug(item.get("suggested_page", "general"))
+    # Check legacy folders (concepts/, lectures/) in case a file predates domain routing
+    page_path = domain_dir / f"{page_name}.md"
+    for legacy_dir in ["concepts", "lectures"]:
+        candidate = vault / "_wiki" / legacy_dir / f"{page_name}.md"
+        if candidate.exists():
+            page_path = candidate
+            break
 
     section = _format_section(item)
 
@@ -100,6 +105,13 @@ def write_approved(item: dict) -> str:
     except Exception:
         pass
     _append_log(item, page_path, note=evolution.get("evolution_type", ""))
+
+    # Lecture archive: write a browsable record to _wiki/lectures/ for image-sourced items
+    if item.get("source_type") == "lecture":
+        try:
+            _write_lecture_archive(item, vault)
+        except Exception:
+            pass
 
     # Attach evolution info to item so callers can surface it
     item["_evolution"] = evolution
@@ -526,10 +538,7 @@ def _strip_frontmatter(content: str) -> str:
 
 
 def _wikilink_to_kebab(text: str) -> str:
-    text = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "-", text)
-    text = re.sub(r"[\s_]+", "-", text)
-    text = re.sub(r"[^\w-]", "", text)
-    return text.lower().strip("-")
+    return identity.resolve_slug(text)
 
 
 def _distill_insight(bullets: list) -> str:
@@ -557,11 +566,63 @@ def _atomic_write(path: Path, content: str) -> None:
 
 
 def _slug(text: str) -> str:
-    text = text.lower()
-    text = re.sub(r"[^\w\s-]", "", text)
-    text = re.sub(r"[\s_]+", "-", text)
-    text = text.strip("-")
-    return text or "general"
+    return identity.slugify(text)
+
+
+def _write_lecture_archive(item: dict, vault: Path) -> None:
+    """Write a browsable lecture record to _wiki/lectures/YYYY-MM-DD-slug.md."""
+    lectures_dir = vault / "_wiki" / "lectures"
+    lectures_dir.mkdir(parents=True, exist_ok=True)
+
+    today = datetime.now().strftime("%Y-%m-%d")
+    slug = _slug(item.get("title", "lecture"))
+    path = lectures_dir / f"{today}-{slug}.md"
+
+    # Don't overwrite if we already archived this one today
+    if path.exists():
+        return
+
+    title = item.get("title", "Lecture Note")
+    tags = item.get("tags", [])
+    tags_str = json.dumps(tags)
+    page_ref = item.get("suggested_page", "")
+    user_notes = item.get("user_notes", "").strip()
+    summary = item.get("summary", [])
+    key_concepts = item.get("key_concepts", [])
+    diagram = item.get("diagram", "").strip()
+
+    user_notes_block = (
+        f"\n> **Your understanding**\n> {user_notes}\n"
+        if user_notes else ""
+    )
+
+    summary_block = "\n".join(f"- {b}" for b in summary) if summary else ""
+    concepts_block = "\n".join(
+        f"- [[{c}]]" for c in key_concepts
+    ) if key_concepts else ""
+    diagram_block = (
+        f"\n## Diagram\n\n```mermaid\n{diagram}\n```\n"
+        if diagram else ""
+    )
+    page_link = f"\n→ Concept page: [[{page_ref}]]\n" if page_ref else ""
+
+    content = (
+        f"---\n"
+        f'title: "{title}"\n'
+        f"date: {today}\n"
+        f"tags: {tags_str}\n"
+        f"source_type: lecture\n"
+        f'concept_page: "{page_ref}"\n'
+        f"---\n\n"
+        f"# {title}\n"
+        f"{page_link}"
+        f"{user_notes_block}\n"
+        f"## Summary\n\n{summary_block}\n\n"
+        f"## Key Concepts\n\n{concepts_block}\n"
+        f"{diagram_block}"
+    )
+
+    _atomic_write(path, content)
 
 
 def _parse_frontmatter(content: str) -> dict:

@@ -8,6 +8,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
+import identity
+
 _DEFAULT_VAULT = "/Users/sakethv7/SakethVault"
 
 def _vault() -> Path:
@@ -25,7 +27,6 @@ INDEX_PATH   = property(lambda: _vault() / "_wiki" / "index.md")
 def _dirs():
     wiki = _vault() / "_wiki"
     return {
-        "concepts":     wiki / "concepts",     # legacy — kept for backward compat
         "cs":           wiki / "cs",
         "humanities":   wiki / "humanities",
         "science":      wiki / "science",
@@ -36,10 +37,9 @@ def _dirs():
     }
 
 def _concept_dirs() -> list:
-    """All dirs that hold concept pages (legacy + domain subfolders)."""
+    """All dirs that hold concept pages (domain subfolders)."""
     wiki = _vault() / "_wiki"
     return [
-        wiki / "concepts",
         wiki / "cs",
         wiki / "humanities",
         wiki / "science",
@@ -48,7 +48,7 @@ def _concept_dirs() -> list:
 # Keep VAULT_PATH/WIKI_DIR/CONCEPTS_DIR/INDEX_PATH usable as simple names
 VAULT_PATH   = _vault()
 WIKI_DIR     = VAULT_PATH / "_wiki"
-CONCEPTS_DIR = WIKI_DIR / "concepts"
+CONCEPTS_DIR = WIKI_DIR / "cs"
 INDEX_PATH   = WIKI_DIR / "index.md"
 
 
@@ -129,7 +129,7 @@ def build_backlinks_index() -> dict[str, list[str]]:
             except OSError:
                 continue
             links = re.findall(r"\[\[([^\]]+)\]\]", content)
-            outbound[md_file.stem] = [l.lower().replace(" ", "-") for l in links]
+            outbound[md_file.stem] = [identity.resolve_slug(l) for l in links]
 
     # Second pass: invert to backlinks
     backlinks: dict[str, list[str]] = {}
@@ -203,7 +203,7 @@ def build_graph() -> dict:
             source = md_file.stem
             links = re.findall(r"\[\[([^\]]+)\]\]", content)
             for link in links:
-                target = link.lower().replace(" ", "-")
+                target = identity.resolve_slug(link)
                 if target in page_set and target != source:
                     edge_set.add(tuple(sorted([source, target])))
 
@@ -213,12 +213,14 @@ def build_graph() -> dict:
 
 def read_page(page_name: str) -> Optional[str]:
     """Return full content of a page, searching all vault folders."""
-    for folder_dir in _dirs().values():
-        if not folder_dir.exists():
-            continue
-        for md_file in folder_dir.glob("*.md"):
-            if md_file.stem.lower() == page_name.lower():
-                return md_file.read_text(encoding="utf-8")
+    candidates = list(dict.fromkeys([identity.resolve_slug(page_name), identity.slugify(page_name)]))
+    for candidate_name in candidates:
+        for folder_dir in _dirs().values():
+            if not folder_dir.exists():
+                continue
+            for md_file in folder_dir.glob("*.md"):
+                if md_file.stem.lower() == candidate_name.lower():
+                    return md_file.read_text(encoding="utf-8")
     return None
 
 
@@ -228,6 +230,7 @@ def parse_concept_page(page_name: str) -> Optional[dict]:
     Returns dict with: meta, current_understanding, sections, diagrams.
     Returns None if page not found.
     """
+    page_name = identity.resolve_slug(page_name)
     content = read_page(page_name)
     if not content:
         return None
@@ -278,15 +281,29 @@ def parse_concept_page(page_name: str) -> Optional[dict]:
         elif plain:
             title, date = plain.group(1), plain.group(2)
 
-        # Extract bullets
-        bullets = re.findall(r"^- (.+)$", sec, re.MULTILINE)
+        # Extract bullets — skip bare wikilink lines, Related: lines, and Key insight: lines
+        # (those are handled separately as chips/key_insight)
+        _BARE_WIKILINK = re.compile(r"^\[\[[^\]]+\]\]\s*$")
+        _RELATED_LINE  = re.compile(r"^Related:\s*\[")
+        _KEY_INSIGHT   = re.compile(r"^\*\*Key insight:\*\*")
+        bullets = [
+            b for b in re.findall(r"^- (.+)$", sec, re.MULTILINE)
+            if not _BARE_WIKILINK.match(b.strip())
+            and not _RELATED_LINE.match(b.strip())
+            and not _KEY_INSIGHT.match(b.strip())
+        ]
 
         # Extract key insight
         ki_match = re.search(r"\*\*Key insight:\*\*\s*(.+)", sec)
         key_insight = ki_match.group(1).strip() if ki_match else ""
 
-        # Extract related wikilinks
-        related = re.findall(r"\[\[([^\]]+)\]\]", sec)
+        # Extract related wikilinks — deduplicated, preserving order
+        seen_wl: set = set()
+        related = []
+        for wl in re.findall(r"\[\[([^\]]+)\]\]", sec):
+            if wl not in seen_wl:
+                seen_wl.add(wl)
+                related.append(wl)
 
         # Extract mermaid diagram
         diagram = ""
@@ -392,6 +409,7 @@ def find_relevant_pages(query: str, max_pages: int = 5) -> list[str]:
         "linear algebra": ["matrix", "vectors", "eigenvalues"],
     }
 
+    query = identity.expand_query(query)
     raw_terms = set(re.sub(r"[^\w\s-]", "", query.lower()).split())
     expanded_terms = set(raw_terms)
     for term in raw_terms:
@@ -407,33 +425,33 @@ def find_relevant_pages(query: str, max_pages: int = 5) -> list[str]:
             if md_file.stem in seen:
                 continue
             seen.add(md_file.stem)
-        content = md_file.read_text(encoding="utf-8")
-        content_lower = content.lower()
-        name_lower = md_file.stem.lower()  # e.g. "attention-residuals"
-        name_words = set(name_lower.replace("-", " ").split())
+            content = md_file.read_text(encoding="utf-8")
+            content_lower = content.lower()
+            name_lower = md_file.stem.lower()  # e.g. "attention-residuals"
+            name_words = set(name_lower.replace("-", " ").split())
 
-        # Parse tags from frontmatter for tag-match scoring
-        meta = _parse_frontmatter(content)
-        tags_lower = " ".join(t.lower() for t in meta.get("tags", []))
+            # Parse tags from frontmatter for tag-match scoring
+            meta = _parse_frontmatter(content)
+            tags_lower = " ".join(t.lower() for t in meta.get("tags", []))
 
-        score: float = 0
-        for term in expanded_terms:
-            # Strongest signal: term matches page slug words
-            if term in name_lower or term in name_words:
-                score += 15
-            # Strong: term matches a tag
-            if term in tags_lower:
-                score += 8
-            # Medium: term appears in content (TF-style, diminishing returns)
-            count = content_lower.count(term)
-            if count > 0:
-                score += min(count, 10)  # cap at 10 to avoid keyword stuffing
+            score: float = 0
+            for term in expanded_terms:
+                # Strongest signal: term matches page slug words
+                if term in name_lower or term in name_words:
+                    score += 15
+                # Strong: term matches a tag
+                if term in tags_lower:
+                    score += 8
+                # Medium: term appears in content (TF-style, diminishing returns)
+                count = content_lower.count(term)
+                if count > 0:
+                    score += min(count, 10)  # cap at 10 to avoid keyword stuffing
 
-        if score > 0:
-            scored.append((score, md_file.stem))
+            if score > 0:
+                scored.append((score, identity.resolve_slug(md_file.stem)))
 
     scored.sort(reverse=True)
-    return [name for _, name in scored[:max_pages]]
+    return list(dict.fromkeys(name for _, name in scored))[:max_pages]
 
 
 def read_pages_content(page_names: list[str]) -> dict[str, str]:

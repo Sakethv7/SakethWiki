@@ -40,7 +40,9 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
+import identity
 import llm_client
+import memory_store
 import queue_manager
 import tag_classifier
 import vault_reader
@@ -53,15 +55,19 @@ from contextlib import asynccontextmanager
 
 @asynccontextmanager
 async def lifespan(app):
-    """Start background weekly analysis scheduler on app startup."""
+    """Start background tasks on app startup."""
+    memory_store.initialize()
     asyncio.create_task(_weekly_analysis_scheduler())
+    # Start folder watcher for screenshot inbox
+    import image_watcher
+    image_watcher.start()
     yield
 
 app = FastAPI(title="SakethWiki API", version="1.0.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_origins=["*"],   # LAN access needed for mobile upload page
     allow_methods=["GET", "POST", "DELETE"],
     allow_headers=["Content-Type"],
 )
@@ -110,6 +116,8 @@ class IngestRequest(BaseModel):
     text: Optional[str] = None
     image_base64: Optional[str] = None        # legacy single image
     images: Optional[list] = None             # [{data: b64, mediaType: "image/png"}, ...]
+    user_notes: Optional[str] = None          # user's own understanding (shapes extraction)
+    source_type: Optional[str] = None         # "lecture" | "url" | "text" | "screenshot"
     force: bool = False
 
 
@@ -171,6 +179,10 @@ class SaveAnswerRequest(BaseModel):
 class LintRequest(BaseModel):
     save: bool = False  # write lint report to _wiki/insights/ if True
     force_refresh: bool = False  # if True, bypass cache and re-run Sonnet scan
+
+
+class ApplyLinkFixesRequest(BaseModel):
+    dry_run: bool = False
 
 
 class ConsolidateRequest(BaseModel):
@@ -367,7 +379,7 @@ def _regen_item(item: dict, mode: str = "full") -> dict:
     existing_pages = [p["name"] for p in vault_reader.list_concept_pages()]
 
     if mode == "diagram":
-        updated["diagram"] = _fallback_diagram_from_summary(
+        updated["diagram"] = _llm_diagram(
             title=updated.get("title", "Concept"),
             summary=updated.get("summary", []),
             key_concepts=updated.get("key_concepts", []),
@@ -444,10 +456,11 @@ async def ingest(req: IngestRequest, request: Request):
         }}
 
     raw_text = ""
+    loop = asyncio.get_running_loop()
 
     # Step 1: fetch URL with httpx + parse with BeautifulSoup (zero LLM)
     if req.url:
-        raw_text = _fetch_url(req.url)
+        raw_text = await loop.run_in_executor(None, _fetch_url, req.url)
 
     if req.text:
         raw_text = (raw_text + "\n\n" + req.text).strip()
@@ -457,53 +470,94 @@ async def ingest(req: IngestRequest, request: Request):
     if req.image_base64 and not all_images:
         all_images = [{"data": req.image_base64, "mediaType": "image/png"}]
 
-    # Step 2: call Sonnet to extract structured info (vault-aware)
+    # Step 2: extract — image payloads skip slicing (already atomic)
     existing_pages = [p["name"] for p in vault_reader.list_concept_pages()]
-    extraction = _extract_with_sonnet(raw_text, all_images, source_url, existing_pages)
+    source_type = req.source_type or ("lecture" if all_images else ("url" if req.url else "text"))
 
-    # Step 3: stage to queue
-    item_id = str(uuid.uuid4())
-    item = {
-        "id": item_id,
-        "url": source_url,
-        "title": extraction["title"],
-        "key_concepts": extraction["key_concepts"],
-        "summary": extraction["summary"],
-        "suggested_page": extraction["suggested_page"],
-        "suggested_wikilinks": extraction["suggested_wikilinks"],
-        "tags": extraction["tags"],
-        "references": extraction.get("references", []),
-        "diagram": extraction.get("diagram", ""),
-        "staged_at": datetime.now().isoformat(),
-        "status": "pending",
-    }
-    queue_manager.enqueue(item)
+    if all_images:
+        def _image_pipeline():
+            uncertainties = _extract_image_uncertainties(all_images, req.user_notes or "")
+            search_context = _tavily_search(uncertainties) if uncertainties else ""
+            enriched_text = (raw_text + "\n\n" + search_context).strip() if search_context else raw_text
+            return _extract_with_sonnet(
+                enriched_text, all_images, source_url, existing_pages, user_notes=req.user_notes
+            )
+        slices = [{"title": "", "text": raw_text, "concept_hint": ""}]
+        extractions = [await loop.run_in_executor(None, _image_pipeline)]
+    else:
+        # Slice step: decide if content splits into multiple conceptual notes
+        slices = await loop.run_in_executor(None, _slice_content, raw_text, source_url, existing_pages)
 
+        # Extract each slice in parallel
+        from concurrent.futures import ThreadPoolExecutor
+        def _extract_slice(sl: dict):
+            ex = _extract_with_sonnet(sl["text"], [], source_url, existing_pages)
+            # If slicer gave us a chapter title, prefer it over the LLM's extracted title
+            if sl.get("title"):
+                ex["title"] = sl["title"]
+            # If slicer identified a matching vault page, bias suggested_page toward it
+            if sl.get("concept_hint") and not ex.get("suggested_page"):
+                ex["suggested_page"] = sl["concept_hint"]
+            return ex
+        with ThreadPoolExecutor(max_workers=min(len(slices), 4)) as pool:
+            extractions = list(pool.map(_extract_slice, slices))
+
+    # Step 3: stage all slices to queue
+    items = []
+    for extraction in extractions:
+        item_id = str(uuid.uuid4())
+        item = {
+            "id": item_id,
+            "url": source_url,
+            "source_type": source_type,
+            "user_notes": req.user_notes or "",
+            "title": extraction["title"],
+            "key_concepts": extraction["key_concepts"],
+            "summary": extraction["summary"],
+            "suggested_page": extraction["suggested_page"],
+            "suggested_wikilinks": extraction["suggested_wikilinks"],
+            "tags": extraction["tags"],
+            "references": extraction.get("references", []),
+            "diagram": extraction.get("diagram", ""),
+            "staged_at": datetime.now().isoformat(),
+            "status": "pending",
+        }
+        queue_manager.enqueue(item)
+        items.append(item)
+
+    first = items[0]
     return {
-        "id": item_id,
+        "id": first["id"],
+        "sliced": len(items) > 1,
+        "slice_count": len(items),
+        "slice_titles": [it["title"] for it in items[1:]],
         "diff_preview": {
-            "title": item["title"],
-            "summary": item["summary"],
-            "suggested_page": item["suggested_page"],
-            "suggested_wikilinks": item["suggested_wikilinks"],
-            "tags": item["tags"],
-            "key_concepts": item["key_concepts"],
-            "references": item["references"],
-            "diagram": item["diagram"],
-            "lenses": item.get("lenses", {}),
-            "synthesis": item.get("synthesis", ""),
-            "open_questions": item.get("open_questions", []),
+            "title": first["title"],
+            "summary": first["summary"],
+            "suggested_page": first["suggested_page"],
+            "suggested_wikilinks": first["suggested_wikilinks"],
+            "tags": first["tags"],
+            "key_concepts": first["key_concepts"],
+            "references": first["references"],
+            "diagram": first["diagram"],
+            "lenses": first.get("lenses", {}),
+            "synthesis": first.get("synthesis", ""),
+            "open_questions": first.get("open_questions", []),
         },
     }
 
 
 @app.post("/ingest-markdown")
 async def ingest_markdown(req: MarkdownIngestRequest):
-    item = _stage_markdown_clip(
-        markdown=req.markdown,
-        source_url=req.source_url or "",
-        clip_title=req.clip_title or "",
-        force=req.force,
+    loop = asyncio.get_running_loop()
+    item = await loop.run_in_executor(
+        None,
+        lambda: _stage_markdown_clip(
+            markdown=req.markdown,
+            source_url=req.source_url or "",
+            clip_title=req.clip_title or "",
+            force=req.force,
+        ),
     )
     return {
         "id": item["id"],
@@ -545,34 +599,37 @@ async def process_inbox(req: InboxProcessRequest):
 
     files = unique_files[: max(1, min(req.limit, 200))]
 
-    queued = []
-    skipped = []
-    errors = []
-    for md_path in files:
-        try:
-            markdown = md_path.read_text(encoding="utf-8")
-            item = _stage_markdown_clip(
-                markdown=markdown,
-                source_url="",
-                clip_title=md_path.stem.replace("-", " ").strip(),
-                inbox_file=str(md_path),
-                force=req.force,
-            )
-            queued.append({"file": md_path.name, "id": item["id"], "suggested_page": item["suggested_page"]})
-        except HTTPException as e:
-            if e.status_code == 409:
-                skipped.append({"file": md_path.name, "reason": "already processed"})
-                try:
-                    dst = _processed_inbox_path() / md_path.name
-                    if dst.exists():
-                        dst = _processed_inbox_path() / f"{md_path.stem}-{int(datetime.now().timestamp())}.md"
-                    shutil.move(str(md_path), str(dst))
-                except Exception:
-                    pass
-            else:
-                errors.append({"file": md_path.name, "error": str(e.detail)})
-        except Exception as e:
-            errors.append({"file": md_path.name, "error": str(e)})
+    def _process_files(files, force):
+        queued, skipped, errors = [], [], []
+        for md_path in files:
+            try:
+                markdown = md_path.read_text(encoding="utf-8")
+                item = _stage_markdown_clip(
+                    markdown=markdown,
+                    source_url="",
+                    clip_title=md_path.stem.replace("-", " ").strip(),
+                    inbox_file=str(md_path),
+                    force=force,
+                )
+                queued.append({"file": md_path.name, "id": item["id"], "suggested_page": item["suggested_page"]})
+            except HTTPException as e:
+                if e.status_code == 409:
+                    skipped.append({"file": md_path.name, "reason": "already processed"})
+                    try:
+                        dst = _processed_inbox_path() / md_path.name
+                        if dst.exists():
+                            dst = _processed_inbox_path() / f"{md_path.stem}-{int(datetime.now().timestamp())}.md"
+                        shutil.move(str(md_path), str(dst))
+                    except Exception:
+                        pass
+                else:
+                    errors.append({"file": md_path.name, "error": str(e.detail)})
+            except Exception as e:
+                errors.append({"file": md_path.name, "error": str(e)})
+        return queued, skipped, errors
+
+    loop = asyncio.get_running_loop()
+    queued, skipped, errors = await loop.run_in_executor(None, lambda: _process_files(files, req.force))
 
     return {
         "success": True,
@@ -809,9 +866,115 @@ def _top_matching_pages(query_text: str, all_pages: list, max_pages: int = 10) -
     top = [s for _, s in scored[:max_pages]]
     return top
 
+def _normalize_slug(text: str) -> str:
+    return identity.resolve_slug(text)
+
+
+def _filter_suggested_wikilinks(
+    suggested: list,
+    title: str,
+    summary: list,
+    key_concepts: list,
+    existing_pages: list,
+    max_links: int = 6,
+) -> list[str]:
+    if not suggested:
+        return []
+
+    scope_text = " ".join([title or ""] + [str(x) for x in (summary or [])] + [str(x) for x in (key_concepts or [])]).lower()
+    scope_tokens = set(_re.findall(r"[a-z0-9]+", scope_text))
+    if not scope_tokens:
+        return []
+
+    existing_set = set(existing_pages or [])
+    out = []
+    seen = set()
+
+    for raw in suggested:
+        slug = _normalize_slug(str(raw))
+        if not slug or slug in seen:
+            continue
+        seen.add(slug)
+
+        slug_tokens = set(t for t in slug.split("-") if t)
+        overlap = len(slug_tokens & scope_tokens)
+        token_count = len(slug_tokens)
+
+        # Stronger acceptance for non-existing pages to avoid hallucinated side quests.
+        if slug in existing_set:
+            keep = overlap >= 1
+        else:
+            keep = overlap >= 2 if token_count >= 2 else overlap >= 1
+
+        if keep:
+            out.append(slug)
+        if len(out) >= max_links:
+            break
+
+    return out
+
+
+
+def _tavily_search(queries: list[str]) -> str:
+    """Run up to 3 Tavily searches in parallel. Returns a context block string."""
+    api_key = os.environ.get("TAVILY_API_KEY", "")
+    if not api_key or not queries:
+        return ""
+    try:
+        from tavily import TavilyClient
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        client = TavilyClient(api_key=api_key)
+
+        def _search(q: str) -> list[dict]:
+            try:
+                resp = client.search(q, max_results=2, search_depth="basic")
+                return resp.get("results", [])
+            except Exception:
+                return []
+
+        results = []
+        with ThreadPoolExecutor(max_workers=len(queries)) as pool:
+            for res in pool.map(_search, queries[:3]):
+                results.extend(res)
+
+        if not results:
+            return ""
+        lines = [f"- [{r.get('title','')}]: {r.get('content','')[:200]}" for r in results]
+        return "Web search context (use to fill gaps in the screenshot):\n" + "\n".join(lines)
+    except Exception as e:
+        logger.warning(f"Tavily search failed: {e}")
+        return ""
+
+
+def _extract_image_uncertainties(images: list, user_notes: str) -> list[str]:
+    """Quick Haiku pass: extract 3 uncertain concepts that need web lookup."""
+    user_block = f"\nStudent's current understanding: \"{user_notes}\"" if user_notes else ""
+    content = []
+    for img in images[:2]:
+        content.append({"type": "image", "source": {"type": "base64",
+            "media_type": img.get("mediaType", "image/png"), "data": img["data"]}})
+    content.append({"type": "text", "text":
+        f"Look at these lecture screenshot(s).{user_block}\n\n"
+        "List up to 3 specific technical concepts or terms that are mentioned but not fully explained "
+        "and would benefit from a quick web lookup to give more context. "
+        "Return ONLY a JSON array of short query strings, e.g. [\"KV cache in transformers\", \"softmax temperature\"]. "
+        "Return [] if everything is self-contained."})
+    try:
+        raw = llm_client.complete(
+            task="ingest_extract",
+            model=None,  # vision model selected by provider routing
+            max_tokens=200,
+            messages=[{"role": "user", "content": content}],
+        ).strip()
+        raw = raw[raw.find("["):raw.rfind("]") + 1]
+        return json.loads(raw) if raw else []
+    except Exception:
+        return []
+
 
 def _extract_with_sonnet(text: str, images: Optional[list], source_url: str,
-                         existing_pages: Optional[list] = None) -> dict:
+                         existing_pages: Optional[list] = None,
+                         user_notes: Optional[str] = None) -> dict:
     """Extract structured metadata from content for the wiki.
 
     Model selection:
@@ -855,36 +1018,59 @@ def _extract_with_sonnet(text: str, images: Optional[list], source_url: str,
     content_len = len(text) if text else 0
     has_images = bool(images)
 
-    if content_len > 4000 or has_images:
+    if has_images:
         depth = "long-form"
-        model = "claude-sonnet-4-6"   # complex reasoning / vision needed
-        bullet_rule = "EXACTLY 5 bullets — the 5 most important, distinct, specific insights. Each 1-2 sentences. First-person ('I learned...'). No filler, no repetition."
+        model = None  # routes to vision model for active provider (gemini-2.5-flash or claude-sonnet)
+        bullet_rule = "EXACTLY 5 bullets — the 5 most important, distinct, specific insights. Each 1-2 sentences. Write as neutral, precise technical notes (no first-person, no 'I learned', no opinion). State facts, mechanisms, and implications directly — like a Lilian Weng blog post. No filler, no repetition."
+        diagram_rule = (
+            "The image(s) likely show a diagram, architecture, or visual structure — reproduce it faithfully in Mermaid. "
+            "Mirror the actual layout: if it shows nodes with labels (e.g. GPU 0..N, Parameter Server, Worker nodes), "
+            "use those exact labels. If it shows a pipeline with arrows, reproduce the arrows. "
+            "flowchart LR (or TD if the image is top-down). Up to 12 nodes if needed to be accurate. "
+            "Short labels — 2-5 words max per node. No quotes, colons, or special chars in labels. "
+            "Add 'classDef accent fill:#c4573a,color:#fff,font-weight:bold' and apply :::accent to 1-3 key nodes (entry point, critical component, or final output). "
+            "If the image has no structural diagram (e.g. pure text slide, photo), return \"\"."
+        )
+        content_budget = 10000
+        max_out = 1500
+    elif content_len > 8000:
+        depth = "long-form"
+        model = "claude-haiku-4-5-20251001"   # Haiku handles long text fine; Sonnet only needed for images
+        bullet_rule = "EXACTLY 5 bullets — the 5 most important, distinct, specific insights. Each 1-2 sentences. Write as neutral, precise technical notes (no first-person, no 'I learned', no opinion). State facts, mechanisms, and implications directly. No filler, no repetition."
         diagram_rule = (
             "ONLY include a diagram if the content has a clear visual structure worth showing "
             "(e.g. architecture, pipeline, hierarchy, decision flow). "
             "If it's a simple concept, a person's opinion, or a news item — return empty string \"\". "
-            "If you do draw one: flowchart LR, 5-8 nodes max, short labels (2-4 words each)."
+            "If you do draw one: flowchart LR, 5-8 nodes max, short labels (2-4 words each). "
+            "Add 'classDef accent fill:#c4573a,color:#fff,font-weight:bold' and apply :::accent to 1-2 key nodes (entry or critical output)."
         )
         content_budget = 10000
         max_out = 1500
     elif content_len > 1500:
         depth = "medium"
         model = "claude-haiku-4-5-20251001"  # structured extraction, no deep reasoning
-        bullet_rule = "3-4 bullets — each a distinct, specific insight. First-person ('I learned...'). No filler."
+        bullet_rule = "3-4 bullets — each a distinct, specific insight. Neutral, precise technical prose (no first-person, no 'I learned'). State facts and mechanisms directly. No filler."
         diagram_rule = (
             "ONLY include a diagram if the content has a clear structure worth visualising. "
             "Most medium articles do NOT need one — return \"\" if unsure. "
-            "If you do: flowchart LR, 4-6 nodes, short labels."
+            "If you do: flowchart LR, 4-6 nodes, short labels. Do not mix runtime flow with taxonomy in one diagram. "
+            "Add 'classDef accent fill:#c4573a,color:#fff,font-weight:bold' and apply :::accent to 1-2 key nodes."
         )
         content_budget = 6000
         max_out = 1200
     else:
         depth = "short"
         model = "claude-haiku-4-5-20251001"  # short structured extraction
-        bullet_rule = "2-3 bullets — each a sharp, distinct insight. First-person."
+        bullet_rule = "2-3 bullets — each a sharp, distinct insight. Neutral, precise technical prose (no first-person, no 'I learned')."
         diagram_rule = 'Return "" — short content rarely benefits from a diagram.'
         content_budget = 3000
         max_out = 800
+
+    user_notes_block = (
+        f"\nStudent's own understanding (build on this, correct gaps, don't repeat what they already know):\n"
+        f"\"{user_notes}\"\n"
+        if user_notes else ""
+    )
 
     user_content.append({
         "type": "text",
@@ -895,7 +1081,7 @@ Source URL: {source_url}
 Content depth: {depth} ({content_len} chars)
 {standards_block}{hints_block}
 {pages_hint}
-
+{user_notes_block}
 Content:
 {text[:content_budget]}
 
@@ -921,23 +1107,26 @@ Rules:
 - diagram: {diagram_rule} Escape all newlines as \\n in the JSON string. No special chars in node labels.""",
     })
 
-    raw = llm_client.complete(
-        task="ingest_extract",
-        model=model,
-        max_tokens=max_out,
-        messages=[{"role": "user", "content": user_content}],
-        expect_json=True,
-        required_json_keys=[
-            "title",
-            "key_concepts",
-            "summary",
-            "suggested_page",
-            "suggested_wikilinks",
-            "tags",
-            "references",
-            "diagram",
-        ],
-    ).strip()
+    try:
+        raw = llm_client.complete(
+            task="ingest_extract",
+            model=model,
+            max_tokens=max_out,
+            messages=[{"role": "user", "content": user_content}],
+            expect_json=True,
+            required_json_keys=[
+                "title",
+                "key_concepts",
+                "summary",
+                "suggested_page",
+                "suggested_wikilinks",
+                "tags",
+                "references",
+                "diagram",
+            ],
+        ).strip()
+    except Exception as e:
+        raise HTTPException(500, f"LLM extraction failed: {e}")
     if raw.startswith("```"):
         raw = raw.split("```")[1]
         if raw.startswith("json"):
@@ -948,6 +1137,16 @@ Rules:
         data = json.loads(raw)
     except json.JSONDecodeError as e:
         raise HTTPException(500, f"LLM returned invalid JSON: {e}\nRaw: {raw[:300]}")
+
+    # Enforce wikilink relevance and kebab-case normalization.
+    data["suggested_wikilinks"] = _filter_suggested_wikilinks(
+        suggested=data.get("suggested_wikilinks", []),
+        title=data.get("title", ""),
+        summary=data.get("summary", []),
+        key_concepts=data.get("key_concepts", []),
+        existing_pages=existing_pages,
+        max_links=6,
+    )
 
     # Validate tags against allowed list
     data["tags"] = [t for t in data.get("tags", []) if t in VALID_TAGS]
@@ -960,42 +1159,339 @@ Rules:
             data["diagram"]
         )
 
-    # Fallback diagram: medium/long clips should still get a concept map even if LLM omits one.
-    if not data.get("diagram") and depth in {"medium", "long-form"}:
-        data["diagram"] = _fallback_diagram_from_summary(
-            title=data.get("title", "Concept"),
-            summary=data.get("summary", []),
-            key_concepts=data.get("key_concepts", []),
-        )
+    should_diagram = _should_generate_diagram(
+        source_text=text,
+        summary=data.get("summary", []),
+        key_concepts=data.get("key_concepts", []),
+        depth=depth,
+    )
+
+    # Keep diagrams only when content has clear structural signal.
+    if not should_diagram:
+        data["diagram"] = ""
+    elif _diagram_quality_low(data.get("diagram", "")):
+        # When images were provided, try a dedicated vision-to-Mermaid call before
+        # falling back to the generic text-based template — it can reproduce the
+        # actual architecture shown in the screenshot.
+        if has_images:
+            vision_diag = _vision_diagram(
+                images=images,
+                title=data.get("title", "Concept"),
+                summary=data.get("summary", []),
+            )
+            data["diagram"] = vision_diag or _fallback_diagram_from_summary(
+                title=data.get("title", "Concept"),
+                summary=data.get("summary", []),
+                key_concepts=data.get("key_concepts", []),
+            )
+        else:
+            data["diagram"] = _fallback_diagram_from_summary(
+                title=data.get("title", "Concept"),
+                summary=data.get("summary", []),
+                key_concepts=data.get("key_concepts", []),
+            )
 
     return data
 
 
+def _slice_content(text: str, source_url: str, existing_pages: list) -> list[dict]:
+    """
+    Decide whether long content should become multiple vault notes.
+    Returns a list of {title, text, concept_hint} dicts — one per chapter.
+    Returns a single-item list (no split) if the content is short or unified.
+
+    Approach:
+    1. Number every paragraph so the LLM can group by index — avoids fragile text matching.
+    2. Ask Haiku to assign paragraphs to chapters based on conceptual coherence,
+       chronological flow, and overlap with existing vault pages.
+    3. Reconstruct chapter texts from the paragraph groups.
+    """
+    paragraphs = [p.strip() for p in _re.split(r"\n\n+", text) if p.strip()]
+    no_split = [{"title": "", "text": text, "concept_hint": ""}]
+
+    # Don't slice short content or content with fewer than 4 paragraphs
+    if len(text) < 2500 or len(paragraphs) < 4:
+        return no_split
+
+    # Cap what we send to the LLM — beyond ~8000 chars the paragraph list itself
+    # gives enough signal for boundary detection without sending the full body.
+    numbered = "\n\n".join(f"[{i}] {p[:400]}" for i, p in enumerate(paragraphs[:60]))
+    pages_hint = ", ".join(existing_pages[:30]) if existing_pages else "none yet"
+
+    prompt = f"""You are organizing a long article/thread/video into coherent wiki notes.
+
+Existing vault pages (route overlapping content to these instead of creating new ones):
+{pages_hint}
+
+Read the numbered paragraphs below and decide how to split them into 2–5 independent notes.
+Each note should cover ONE distinct concept and make sense read alone.
+
+Rules:
+- Only split if there are genuinely distinct concepts. If it is all one topic, return 1 chapter.
+- Preserve logical / chronological order — do not reorder paragraphs.
+- If a chapter overlaps an existing vault page, set concept_hint to that page slug.
+- Every paragraph index must appear in exactly one chapter.
+
+Return ONLY a JSON array, no markdown fences:
+[
+  {{"title": "Short chapter title", "paragraphs": [0, 1, 2], "concept_hint": "existing-page-slug-or-empty"}},
+  ...
+]
+
+Paragraphs:
+{numbered}"""
+
+    try:
+        raw = llm_client.complete(
+            task="slice_content",
+            model=None,
+            max_tokens=700,
+            messages=[{"role": "user", "content": prompt}],
+            expect_json=True,
+        ).strip()
+        start = raw.find("[")
+        end   = raw.rfind("]") + 1
+        chapters = json.loads(raw[start:end]) if start >= 0 else None
+    except Exception:
+        return no_split
+
+    if not chapters or len(chapters) <= 1:
+        return no_split
+
+    # Reconstruct full chapter texts (use original paragraphs, not the truncated preview)
+    result = []
+    for ch in chapters:
+        indices = [i for i in (ch.get("paragraphs") or []) if isinstance(i, int) and i < len(paragraphs)]
+        if not indices:
+            continue
+        chapter_text = "\n\n".join(paragraphs[i] for i in sorted(indices))
+        if chapter_text.strip():
+            result.append({
+                "title": (ch.get("title") or "").strip(),
+                "text":  chapter_text,
+                "concept_hint": (ch.get("concept_hint") or "").strip(),
+            })
+
+    return result if len(result) > 1 else no_split
+
+
 def _safe_node_label(text: str, max_words: int = 6, max_chars: int = 44) -> str:
-    # Keep Mermaid-safe short labels
-    cleaned = _re.sub(r"[*_`#\\[\\]{}()<>|:\"']", " ", text or "")
+    # Treat em-dash/en-dash as a natural break — take only the part before it
+    for dash in (" — ", " – ", " - "):
+        if dash in (text or ""):
+            text = text.split(dash)[0]
+            break
+    # Strip Mermaid-unsafe chars
+    cleaned = _re.sub(r"[*_`#\[\]{}()<>|:\"']", " ", text or "")
     cleaned = _re.sub(r"\s+", " ", cleaned).strip()
     words = cleaned.split()[:max_words]
     short = " ".join(words)[:max_chars].strip()
+    # Strip trailing punctuation that makes labels look mid-sentence
+    short = short.rstrip(",:;–—-")
     return short or "Insight"
+
+
+def _should_generate_diagram(
+    source_text: str,
+    summary: list[str],
+    key_concepts: list[str],
+    depth: str,
+) -> bool:
+    if depth == "short":
+        return False
+
+    joined = " ".join(
+        [source_text[:5000]] + [str(s) for s in (summary or [])] + [str(k) for k in (key_concepts or [])]
+    ).lower()
+    tokens = set(_re.findall(r"[a-z0-9\-]+", joined))
+
+    structure_keywords = {
+        "architecture", "pipeline", "workflow", "flow", "tier", "layer", "system",
+        "service", "server", "client", "api", "gateway", "queue", "broker",
+        "database", "storage", "cache", "ingestion", "retrieval", "embedding",
+        "inference", "agent", "orchestrator", "router", "scheduler", "monitoring",
+    }
+    flow_verbs = {
+        "sends", "routes", "calls", "writes", "reads", "returns", "processes",
+        "fetches", "stores", "retrieves", "syncs", "triggers", "transforms",
+    }
+
+    kw_hits = len(tokens.intersection(structure_keywords))
+    verb_hits = len(tokens.intersection(flow_verbs))
+    signal = kw_hits * 2 + verb_hits
+
+    # Medium content needs stronger evidence; long-form tolerates lower signal.
+    threshold = 7 if depth == "medium" else 5
+    return signal >= threshold
+
+
+def _diagram_quality_low(diagram: str) -> bool:
+    if not diagram:
+        return True
+    lines = [ln.strip() for ln in diagram.splitlines() if ln.strip()]
+    edge_lines = [ln for ln in lines if "-->" in ln or "---" in ln]
+    node_ids = set(_re.findall(r"\b[A-Za-z][A-Za-z0-9_]*\b(?=\s*\[)", diagram))
+    return len(edge_lines) < 4 or len(node_ids) < 4
+
+
+def _distill_bullet(text: str) -> str:
+    """Strip 'I learned that' style openers so bullets work as diagram labels."""
+    text = str(text).strip()
+    for opener in ("I learned that ", "This shows that ", "I learned ", "This shows "):
+        if text.startswith(opener):
+            text = text[len(opener):]
+            break
+    return text
+
+
+def _vision_diagram(images: list, title: str, summary: list) -> str:
+    """
+    Dedicated Sonnet call: look at the image(s) and reproduce the visual
+    architecture/topology as a Mermaid diagram.  Used when the extraction
+    pass produced a low-quality diagram despite having image input.
+    """
+    if not images:
+        return ""
+
+    content: list = []
+    for img in images[:3]:
+        content.append({
+            "type": "image",
+            "source": {"type": "base64",
+                       "media_type": img.get("mediaType", "image/png"),
+                       "data": img["data"]},
+        })
+
+    bullets = "\n".join(f"- {s}" for s in (summary or []))
+    content.append({"type": "text", "text": f"""Convert the visual diagram/architecture in the image(s) into a Mermaid flowchart.
+
+Topic: {title}
+Context bullets:
+{bullets}
+
+Rules:
+- Use the actual node labels, component names, and arrow directions you see in the image
+- If the image shows GPU 0..N, write those nodes. If it shows a parameter server, name it that.
+- flowchart LR (left-to-right) or TD (top-down) — match the image orientation
+- Up to 14 nodes if necessary to be accurate
+- Node labels: 2-5 words max, no special chars (no quotes, colons, brackets inside labels)
+- If the image has no structural diagram, return exactly: NONE
+
+Return ONLY the raw Mermaid code (no markdown fences, no explanation)."""})
+
+    try:
+        raw = llm_client.complete(
+            task="diagram",
+            model=None,  # routes to vision model for active provider (gemini-2.5-flash or claude-sonnet)
+            max_tokens=600,
+            messages=[{"role": "user", "content": content}],
+        ).strip()
+        raw = _re.sub(r"^```(?:mermaid)?\s*", "", raw)
+        raw = _re.sub(r"\s*```$", "", raw).strip()
+        if raw and raw != "NONE" and not _diagram_quality_low(raw):
+            return raw
+    except Exception:
+        pass
+    return ""
+
+
+def _llm_diagram(title: str, summary: list, key_concepts: list) -> str:
+    """
+    Ask Haiku to generate a Mermaid diagram appropriate for the content structure.
+    Detects sequential pipelines, taxonomies, architectures, etc.
+    Falls back to _fallback_diagram_from_summary if LLM output is unusable.
+    """
+    bullets = "\n".join(f"- {s}" for s in (summary or []))
+    concepts = ", ".join(str(c) for c in (key_concepts or []))
+    prompt = f"""You are generating a Mermaid flowchart for a personal knowledge wiki page.
+
+Title: {title}
+Key concepts: {concepts}
+Summary bullets:
+{bullets}
+
+Instructions:
+- Detect the structure type first:
+  * SEQUENTIAL PIPELINE (numbered steps, "then", "next", "followed by", "step N"): use a left-to-right chain — A --> B --> C --> D
+  * HIERARCHY / TAXONOMY (types, categories, "types of", "kinds of"): use a top-down tree
+  * ARCHITECTURE (components, services, layers, tiers): use Input→Processing→Output tiers
+  * COMPARISON (X vs Y, tradeoffs): use two parallel columns
+- flowchart LR (or TD for hierarchies)
+- 5-8 nodes max, labels 2-4 words each
+- No special chars in labels: no quotes, colons, semicolons, pipes, brackets inside labels
+- Return ONLY the raw Mermaid code, nothing else, no markdown fences
+
+Mermaid code:"""
+
+    try:
+        raw = llm_client.complete(
+            task="diagram",
+            model=None,
+            max_tokens=400,
+            messages=[{"role": "user", "content": prompt}],
+        ).strip()
+        # Strip markdown fences if present
+        raw = _re.sub(r"^```(?:mermaid)?\s*", "", raw)
+        raw = _re.sub(r"\s*```$", "", raw).strip()
+        if raw and not _diagram_quality_low(raw):
+            return raw
+    except Exception:
+        pass
+    return _fallback_diagram_from_summary(title, summary, key_concepts)
 
 
 def _fallback_diagram_from_summary(title: str, summary: list, key_concepts: list) -> str:
     center = _safe_node_label(title, max_words=5, max_chars=36)
-    bullets = [_safe_node_label(s, max_words=7, max_chars=44) for s in (summary or []) if str(s).strip()]
-    concepts = [_safe_node_label(c, max_words=3, max_chars=20) for c in (key_concepts or []) if str(c).strip()]
+    # Processing Tier: key_concepts are short names — far better than full sentences
+    concepts = [_safe_node_label(c, max_words=4, max_chars=30) for c in (key_concepts or []) if str(c).strip()]
+    # Output Tier: distilled summary phrases (opener stripped)
+    outcomes = [
+        _safe_node_label(_distill_bullet(s), max_words=5, max_chars=32)
+        for s in (summary or []) if str(s).strip()
+    ]
 
-    # Build a compact diagram: core -> insights, plus a concept cluster.
-    lines = ["flowchart LR", f'  C["{center}"]']
-    for i, b in enumerate(bullets[:5], 1):
-        lines.append(f'  I{i}["{b}"]')
-        lines.append(f"  C --> I{i}")
-    if concepts:
-        lines.append('  K["Key Concepts"]')
-        lines.append("  C --> K")
-        for i, c in enumerate(concepts[:4], 1):
-            lines.append(f'  K{i}["{c}"]')
-            lines.append(f"  K --> K{i}")
+    context = " ".join([title or ""] + [str(x) for x in (summary or [])] + [str(x) for x in (key_concepts or [])]).lower()
+    has_web_stack = any(k in context for k in ["dns", "web server", "browser", "mobile", "api"]) and "database" in context
+    has_db_taxonomy = any(k in context for k in ["relational", "nosql", "mysql", "postgres", "cassandra", "dynamodb"])
+
+    if has_web_stack and has_db_taxonomy:
+        return "\n".join([
+            "flowchart LR",
+            '  U["User Browser or App"] --> D["DNS Lookup"]',
+            '  D --> W["Web API Server"]',
+            '  W <--> DB["Database Tier"]',
+            '  DB --> CH["DB Choice"]',
+            '  CH --> R["Relational SQL"]',
+            '  CH --> N["NoSQL"]',
+        ])
+
+    # Pair P-nodes with O-nodes exactly — prevents orphan nodes that Mermaid
+    # renders as floating ghosts outside subgraphs.
+    n = min(len(concepts), len(outcomes), 4)
+    p_nodes = concepts[:n] if n else ["Key concepts"]
+    o_nodes = outcomes[:n] if n else (outcomes[:1] if outcomes else ["Key outcomes"])
+    n = len(p_nodes)
+
+    lines = [
+        "flowchart LR",
+        '  subgraph IN["Input Tier"]',
+        f'    C["{center}"]',
+        "  end",
+        '  subgraph P["Processing Tier"]',
+    ]
+    for i, b in enumerate(p_nodes, 1):
+        lines.append(f'    P{i}["{b}"]')
+    lines.append("  end")
+    lines.append('  subgraph O["Output Tier"]')
+    for i, c in enumerate(o_nodes, 1):
+        lines.append(f'    O{i}["{c}"]')
+    lines.append("  end")
+
+    for i in range(1, n + 1):
+        lines.append(f"  C --> P{i}")
+    for i in range(1, n + 1):
+        lines.append(f"  P{i} --> O{i}")
+
     return "\n".join(lines)
 
 
@@ -1103,7 +1599,8 @@ async def ingest_direct(req: IngestRequest):
         if duplicate:
             raise HTTPException(409, f"Already ingested: {duplicate}")
 
-    raw_text = _fetch_url(req.url) if req.url else ""
+    loop = asyncio.get_running_loop()
+    raw_text = await loop.run_in_executor(None, _fetch_url, req.url) if req.url else ""
     if req.text:
         raw_text = (raw_text + "\n\n" + req.text).strip()
 
@@ -1112,7 +1609,9 @@ async def ingest_direct(req: IngestRequest):
         all_images = [{"data": req.image_base64, "mediaType": "image/png"}]
 
     existing_pages = [p["name"] for p in vault_reader.list_concept_pages()]
-    extraction = _extract_with_sonnet(raw_text, all_images, source_url, existing_pages)
+    extraction = await loop.run_in_executor(
+        None, _extract_with_sonnet, raw_text, all_images, source_url, existing_pages
+    )
 
     item = {
         "id": str(uuid.uuid4()),
@@ -1137,6 +1636,10 @@ async def ingest_direct(req: IngestRequest):
         wiki_writer.fix_page_wikilinks(Path(file_path).stem)
     except Exception:
         pass
+    try:
+        memory_store.index_page(Path(file_path).stem)
+    except Exception as e:
+        logger.warning("memory index update failed for %s: %s", file_path, e)
 
     try:
         api_key = os.environ.get("ANTHROPIC_API_KEY", "")
@@ -1169,7 +1672,8 @@ async def queue_regenerate(item_id: str, req: RegenerateRequest):
     if mode not in {"full", "diagram"}:
         raise HTTPException(400, "mode must be one of: full, diagram")
 
-    updated = _regen_item(item, mode=mode)
+    loop = asyncio.get_running_loop()
+    updated = await loop.run_in_executor(None, lambda: _regen_item(item, mode=mode))
     ok = queue_manager.update(item_id, updated)
     if not ok:
         raise HTTPException(500, f"Failed to update queue item {item_id}")
@@ -1226,9 +1730,12 @@ async def approve(item_id: str, req: ApproveRequest):
     # If queued via Share Sheet (pending_extraction=True), run extraction now
     if item.get("pending_extraction") and item.get("url"):
         try:
-            raw_text = _fetch_url(item["url"])
+            _approve_loop = asyncio.get_running_loop()
+            raw_text = await _approve_loop.run_in_executor(None, _fetch_url, item["url"])
             existing_pages = [p["name"] for p in vault_reader.list_concept_pages()]
-            extraction = _extract_with_sonnet(raw_text, [], item["url"], existing_pages)
+            extraction = await _approve_loop.run_in_executor(
+                None, _extract_with_sonnet, raw_text, [], item["url"], existing_pages
+            )
             item.update({
                 "title": extraction["title"],
                 "key_concepts": extraction.get("key_concepts", []),
@@ -1253,6 +1760,10 @@ async def approve(item_id: str, req: ApproveRequest):
         for k, v in req.edits.items():
             if k in allowed and v is not None:
                 item[k] = v
+    item["suggested_page"] = identity.resolve_slug(item.get("suggested_page", "general"))
+    item["suggested_wikilinks"] = [
+        identity.resolve_slug(link) for link in item.get("suggested_wikilinks", [])
+    ]
 
     # Write to vault (atomic — either fully succeeds or raises, queue untouched)
     try:
@@ -1269,6 +1780,10 @@ async def approve(item_id: str, req: ApproveRequest):
         wiki_writer.fix_page_wikilinks(page_name)
     except Exception as _e:
         logger.warning("fix_page_wikilinks failed for %s: %s", page_name, _e)
+    try:
+        memory_store.index_page(page_name)
+    except Exception as _e:
+        logger.warning("memory index update failed for %s: %s", page_name, _e)
 
     try:
         _record_processed_clip(item, file_path)
@@ -1344,6 +1859,9 @@ def _extract_topic(msg: str, relevant_names: list) -> Optional[str]:
     Prefers pages whose slug words appear directly in the message."""
     if not relevant_names:
         return None
+    alias_topic = identity.resolve_slug(msg)
+    if alias_topic in relevant_names:
+        return alias_topic
     msg_lower = msg.lower()
     # Score each candidate: how many slug words appear in the message
     def slug_score(name: str) -> int:
@@ -1369,7 +1887,7 @@ def _semantic_page_select(message: str, page_summaries: str) -> list[str]:
     try:
         raw = llm_client.complete(
             task="chat_select_pages",
-            model="claude-haiku-4-5-20251001",
+            model=None,
             max_tokens=200,
             messages=[{"role": "user", "content": prompt}],
             expect_json=True,
@@ -1390,34 +1908,55 @@ async def chat(req: ChatRequest):
     if not req.message or not req.message.strip():
         raise HTTPException(400, "message cannot be empty")
 
-    # Stage 1: build a cheap summary of all pages (name + first 200 chars of understanding)
-    all_pages = vault_reader.list_concept_pages()
-    page_summaries_parts = []
-    for p in all_pages:
-        content = vault_reader.read_page(p["name"]) or ""
-        body = _strip_frontmatter(content)
-        # Grab just enough to let the model recognise the topic
-        excerpt = body[:200].replace("\n", " ").strip()
-        page_summaries_parts.append(f"{p['name']} | {excerpt}")
-    page_summaries = "\n".join(page_summaries_parts)
-
-    # Stage 1: Haiku picks relevant pages semantically
     loop = asyncio.get_event_loop()
-    relevant_names = await loop.run_in_executor(
-        None, _semantic_page_select, req.message, page_summaries
-    )
-    # Fallback to keyword match if semantic stage returns nothing
+    memory_hits = []
+    try:
+        memory_hits = await loop.run_in_executor(None, memory_store.search, req.message, RAG_TOP_K)
+    except Exception as e:
+        logger.warning("memory search failed; falling back to semantic page selection: %s", e)
+
+    relevant_names = [hit["page_name"] for hit in memory_hits]
+
+    # Fallback: original page-selection path
+    if not relevant_names:
+        all_pages = vault_reader.list_concept_pages()
+        page_summaries_parts = []
+        for p in all_pages:
+            content = vault_reader.read_page(p["name"]) or ""
+            body = _strip_frontmatter(content)
+            excerpt = body[:200].replace("\n", " ").strip()
+            page_summaries_parts.append(f"{p['name']} | {excerpt}")
+        page_summaries = "\n".join(page_summaries_parts)
+        relevant_names = await loop.run_in_executor(
+            None, _semantic_page_select, req.message, page_summaries
+        )
     if not relevant_names:
         relevant_names = vault_reader.find_relevant_pages(req.message)
 
-    # Stage 2: load full content for selected pages
-    pages_content = vault_reader.read_pages_content(relevant_names[:RAG_TOP_K])
     context_parts = []
-    n_pages = len(pages_content)
-    per_page = RAG_CONTEXT_BUDGET // n_pages if n_pages else RAG_CONTEXT_BUDGET
-    for name, content in pages_content.items():
-        body = _strip_frontmatter(content)
-        context_parts.append(f"=== [[{name}]] ===\n{body[:per_page]}")
+    if memory_hits:
+        for hit in memory_hits[:RAG_TOP_K]:
+            snippet_lines = [f"- {snippet}" for snippet in hit.get("snippets", []) if snippet]
+            headings = ", ".join(hit.get("headings", []))
+            context_parts.append(
+                "\n".join(
+                    part
+                    for part in [
+                        f"=== [[{hit['page_name']}]] ({hit['folder']}) ===",
+                        f"Current understanding: {hit.get('current_understanding', '')}".strip(),
+                        f"Relevant headings: {headings}" if headings else "",
+                        *snippet_lines,
+                    ]
+                    if part
+                )
+            )
+    else:
+        pages_content = vault_reader.read_pages_content(relevant_names[:RAG_TOP_K])
+        n_pages = len(pages_content)
+        per_page = RAG_CONTEXT_BUDGET // n_pages if n_pages else RAG_CONTEXT_BUDGET
+        for name, content in pages_content.items():
+            body = _strip_frontmatter(content)
+            context_parts.append(f"=== [[{name}]] ===\n{body[:per_page]}")
     context = "\n\n".join(context_parts) if context_parts else "No matching pages found yet."
 
     index_content = vault_reader.read_index()
@@ -1456,7 +1995,7 @@ async def chat(req: ChatRequest):
 
     answer = llm_client.complete(
         task="chat_answer",
-        model="claude-haiku-4-5-20251001",
+        model=None,
         max_tokens=1200,
         system=system_block,
         messages=history_messages,
@@ -1465,13 +2004,24 @@ async def chat(req: ChatRequest):
     # Attach structured knowledge card for self-knowledge queries
     knowledge_card = None
     if _is_knowledge_query(req.message):
-        topic = _extract_topic(req.message, relevant_names)
+        concept_candidates = [
+            hit["page_name"]
+            for hit in memory_hits
+            if hit.get("folder") in {"cs", "science", "humanities"}
+        ]
+        topic = _extract_topic(req.message, concept_candidates or relevant_names)
         if topic:
             knowledge_card = vault_reader.parse_concept_page(topic)
 
+    if memory_hits:
+        source_paths = [f"_wiki/{hit['folder']}/{hit['page_name']}.md" for hit in memory_hits]
+    else:
+        folder_by_page = {page["name"]: page["folder"] for page in vault_reader.list_concept_pages()}
+        source_paths = [f"_wiki/{folder_by_page.get(name, 'cs')}/{name}.md" for name in relevant_names]
+
     return {
         "answer": answer,
-        "sources": [f"_wiki/concepts/{n}.md" for n in relevant_names],
+        "sources": source_paths,
         "pages_read": relevant_names,
         **({"knowledge_card": knowledge_card} if knowledge_card else {}),
     }
@@ -1596,7 +2146,7 @@ async def interview(req: InterviewRequest):
 
     wiki_answer = llm_client.complete(
         task="chat_answer",
-        model="claude-haiku-4-5-20251001",
+        model=None,
         max_tokens=1500,
         system=system_block,
         messages=[{"role": "user", "content": user_content}],
@@ -1660,8 +2210,49 @@ async def health():
 
 
 @app.get("/pages")
-async def list_pages(folder: str = "concepts"):
+async def list_pages(folder: str = "cs"):
     return {"pages": vault_reader.list_pages_in_folder(folder)}
+
+
+@app.get("/memory/status")
+async def get_memory_status():
+    try:
+        return memory_store.status()
+    except Exception as e:
+        raise HTTPException(500, f"Memory status failed: {e}")
+
+
+@app.get("/aliases")
+async def get_aliases():
+    pages = [p["name"] for p in vault_reader.list_concept_pages()]
+    return {
+        "aliases": identity.alias_map(),
+        "duplicate_candidates": identity.duplicate_candidates(pages),
+    }
+
+
+@app.post("/memory/reindex")
+async def reindex_memory():
+    try:
+        result = memory_store.sync_index()
+        result.update(memory_store.status())
+        return result
+    except Exception as e:
+        raise HTTPException(500, f"Memory reindex failed: {e}")
+
+
+@app.get("/vault/recent-pages")
+async def recent_pages(days: int = 7):
+    """Return pages from all domain folders sorted by last_updated desc, filtered to last N days."""
+    from datetime import timedelta
+    cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
+    all_pages = []
+    for folder in ["cs", "science", "humanities"]:
+        for p in vault_reader.list_pages_in_folder(folder):
+            if (p.get("last_updated") or p.get("date") or "") >= cutoff:
+                all_pages.append(p)
+    all_pages.sort(key=lambda p: p.get("last_updated") or p.get("date") or "", reverse=True)
+    return {"pages": all_pages}
 
 
 # ── /tag-colors ──────────────────────────────────────────────────────────────
@@ -1676,6 +2267,7 @@ async def get_tag_colors():
 
 @app.get("/page/{page_name}")
 async def get_page(page_name: str):
+    page_name = identity.resolve_slug(page_name)
     content = vault_reader.read_page(page_name)
     if content is None:
         raise HTTPException(404, f"Page '{page_name}' not found")
@@ -1885,7 +2477,7 @@ prompt_hints must be actionable, specific, and short — they will be directly i
 
     raw = llm_client.complete(
         task="analyze_traces",
-        model="claude-sonnet-4-6",
+        model=None,
         max_tokens=2000,
         messages=[{"role": "user", "content": prompt}],
         expect_json=True,
@@ -2010,7 +2602,7 @@ async def follow_up(page_name: str, recently_read: str = ""):
       -5  candidate was recently read (don't repeat)
     """
     vault_path = Path(os.environ.get("VAULT_PATH", "/Users/sakethv7/SakethVault"))
-    concepts_dir = vault_path / "_wiki" / "concepts"
+    concepts_dir = vault_path / "_wiki" / "cs"
     if not concepts_dir.exists():
         return {"suggestions": []}
 
@@ -2141,13 +2733,16 @@ async def quick_note(req: QuickNoteRequest):
         raise HTTPException(400, "note cannot be empty")
 
     vault_path = Path(os.environ.get("VAULT_PATH", "/Users/sakethv7/SakethVault"))
-    concepts_dir = vault_path / "_wiki" / "concepts"
+    wiki_dir = vault_path / "_wiki"
 
-    # Find page (case-insensitive)
+    # Find page (case-insensitive) across all domain folders
     page_path = None
-    for f in concepts_dir.glob("*.md"):
-        if f.stem.lower() == req.page.lower():
-            page_path = f
+    for folder in ["cs", "science", "humanities", "insights", "sources", "open-threads"]:
+        for f in (wiki_dir / folder).glob("*.md"):
+            if f.stem.lower() == req.page.lower():
+                page_path = f
+                break
+        if page_path:
             break
 
     if page_path is None:
@@ -2240,6 +2835,49 @@ async def delete_open_thread(name: str):
     raise HTTPException(404, f"Thread '{name}' not found")
 
 
+@app.post("/close-open-thread/{page_name}")
+async def close_open_thread(page_name: str):
+    """Remove deep-dive tag from a concept page and delete its open-thread stub."""
+    vault_path = Path(os.environ.get("VAULT_PATH", "/Users/sakethv7/SakethVault"))
+
+    # Remove deep-dive tag from concept page (search all domain folders)
+    page_file = None
+    for folder in ["cs", "humanities", "science", "concepts", "lectures"]:
+        candidate = vault_path / "_wiki" / folder / f"{page_name}.md"
+        if candidate.exists():
+            page_file = candidate
+            break
+
+    if page_file:
+        content = page_file.read_text(encoding="utf-8")
+        if content.startswith("---"):
+            end = content.find("---", 3)
+            if end != -1:
+                fm = content[3:end]
+                body = content[end:]
+                lines = fm.splitlines()
+                new_lines = []
+                for line in lines:
+                    if line.strip().startswith("tags:"):
+                        stripped = line.strip()[5:].strip()
+                        if stripped.startswith("[") and stripped.endswith("]"):
+                            inner = [t.strip().strip('"\'') for t in stripped[1:-1].split(",")]
+                            inner = [t for t in inner if t.lower() != "deep-dive"]
+                            line = line[:line.index("tags:")] + f"tags: [{', '.join(inner)}]"
+                    new_lines.append(line)
+                new_content = "---" + "\n".join(new_lines) + body
+                _atomic_write_path(page_file, new_content)
+
+    # Delete matching open-thread stub
+    threads_dir = vault_path / "_wiki" / "open-threads"
+    for f in threads_dir.glob("*.md"):
+        if f.stem.lower() == page_name.lower():
+            f.unlink()
+            break
+
+    return {"success": True}
+
+
 # ── /save-answer ─────────────────────────────────────────────────────────────
 
 @app.post("/save-answer")
@@ -2280,6 +2918,10 @@ pages_read: {req.pages_read}
 
     _append_log(vault_path / "_wiki" / "log.md",
                 f"\n## {time_str} · insight\nQ: {req.question[:80]}\nWritten to: _wiki/insights/{filename}\n")
+    try:
+        memory_store.index_page(file_path.stem)
+    except Exception as e:
+        logger.warning("memory index update failed for insight %s: %s", file_path.stem, e)
 
     return {"success": True, "file_written": f"_wiki/insights/{filename}"}
 
@@ -2342,6 +2984,137 @@ def _save_lint_cache(report: dict, pages: list) -> None:
         pass
 
 
+def _build_link_consistency_audit(pages: list[dict]) -> dict:
+    """Deterministic wikilink audit for consistency and redundancy.
+
+    This is analysis-only: it does not mutate files.
+    """
+    page_names = [p.get("name", "") for p in pages if p.get("name")]
+    existing = set(page_names)
+
+    broken_links = []
+    redundant_links = []
+    weak_links = []
+    suggested_additions = []
+
+    total_links = 0
+    penalty = 0
+
+    for page in pages:
+        name = page.get("name", "")
+        if not name:
+            continue
+
+        content = vault_reader.read_page(name) or ""
+        body = _strip_frontmatter(content)
+        raw_links = _re.findall(r"\[\[([^\]]+)\]\]", body)
+        normalized = [_normalize_slug(l) for l in raw_links if _normalize_slug(l)]
+        total_links += len(normalized)
+
+        # Redundant links inside same page
+        counts = {}
+        for l in normalized:
+            counts[l] = counts.get(l, 0) + 1
+        for link, c in counts.items():
+            if c > 1:
+                redundant_links.append({"page": name, "link": link, "count": c})
+                penalty += min(6, c - 1)
+
+        uniq_links = sorted(set(normalized))
+
+        # Broken/self links
+        for link in uniq_links:
+            if link == name:
+                weak_links.append({"page": name, "link": link, "reason": "self-link"})
+                penalty += 2
+            elif link not in existing:
+                broken_links.append({"page": name, "link": link})
+                penalty += 5
+
+        # Weak semantic links + missing related links
+        scope_text = " ".join([name] + [str(x) for x in page.get("tags", [])] + [body[:1200]]).lower()
+        scope_tokens = set(_re.findall(r"[a-z0-9]+", scope_text))
+
+        for link in uniq_links:
+            if link not in existing or link == name:
+                continue
+            overlap = len(set(link.split("-")) & scope_tokens)
+            if overlap == 0:
+                weak_links.append({"page": name, "link": link, "reason": "low-overlap"})
+                penalty += 2
+
+        candidates = _top_matching_pages(scope_text, page_names, max_pages=8)
+        adds = []
+        linked = set(uniq_links)
+        for cand in candidates:
+            if cand == name or cand in linked:
+                continue
+            ov = len(set(cand.split("-")) & scope_tokens)
+            if ov >= 2:
+                adds.append(cand)
+            if len(adds) >= 3:
+                break
+        if adds:
+            suggested_additions.append({"page": name, "add": adds})
+
+    consistency_score = max(0, 100 - penalty)
+    return {
+        "consistency_score": consistency_score,
+        "pages_audited": len(page_names),
+        "total_links": total_links,
+        "broken_links": broken_links[:200],
+        "redundant_links": redundant_links[:200],
+        "weak_links": weak_links[:200],
+        "suggested_additions": suggested_additions[:200],
+    }
+
+def _apply_safe_link_fixes_to_content(content: str, valid_pages: set[str]) -> tuple[str, dict]:
+    """Apply deterministic, low-risk link fixes to one page content.
+
+    Safe fixes:
+    - Remove duplicate wikilinks in the same page.
+    - Remove broken wikilinks pointing to non-existent pages.
+    """
+    body = _strip_frontmatter(content)
+    fm = content[:len(content) - len(body)]
+
+    pattern = _re.compile(r"\[\[([^\]]+)\]\]")
+    seen = set()
+    duplicate_removed = 0
+    broken_removed = 0
+
+    def repl(m):
+        nonlocal duplicate_removed, broken_removed
+        raw = m.group(1)
+        slug = _normalize_slug(raw)
+        if not slug:
+            broken_removed += 1
+            return ""
+        if slug not in valid_pages:
+            broken_removed += 1
+            return ""
+        if slug in seen:
+            duplicate_removed += 1
+            return ""
+        seen.add(slug)
+        return f"[[{slug}]]"
+
+    new_body = pattern.sub(repl, body)
+    # Clean punctuation artifacts caused by link removals.
+    new_body = _re.sub(r",\s*,", ", ", new_body)
+    new_body = _re.sub(r"\(\s*\)", "", new_body)
+    new_body = _re.sub(r"\s{2,}", " ", new_body)
+    new_body = _re.sub(r"\n[ \t]+\n", "\n\n", new_body)
+
+    return fm + new_body, {
+        "duplicate_removed": duplicate_removed,
+        "broken_removed": broken_removed,
+    }
+
+
+
+
+
 @app.get("/lint")
 async def get_lint_cache():
     """
@@ -2352,6 +3125,11 @@ async def get_lint_cache():
     if cached is None:
         return Response(status_code=204)
     cached_clean = {k: v for k, v in cached.items() if not k.startswith("_")}
+    pages = vault_reader.list_concept_pages()
+    cached_clean["identity_resolution"] = {
+        "duplicate_candidates": identity.duplicate_candidates(p["name"] for p in pages),
+        "alias_count": len(identity.alias_map()),
+    }
     cached_clean["cached"] = True
     return cached_clean
 
@@ -2381,6 +3159,10 @@ async def lint_wiki(req: LintRequest):
         if _is_cache_valid(cached, pages):
             # Remove metadata fields from cached report before returning
             cached_clean = {k: v for k, v in cached.items() if not k.startswith("_")}
+            cached_clean["identity_resolution"] = {
+                "duplicate_candidates": identity.duplicate_candidates(p["name"] for p in pages),
+                "alias_count": len(identity.alias_map()),
+            }
             cached_clean["from_cache"] = True
             return cached_clean
 
@@ -2458,7 +3240,7 @@ Rules:
 
     raw = llm_client.complete(
         task="lint_scan",
-        model="claude-sonnet-4-6",
+        model=None,
         max_tokens=4000,
         messages=[{"role": "user", "content": prompt}],
         expect_json=True,
@@ -2496,7 +3278,7 @@ Rules:
         try:
             raw2 = llm_client.complete(
                 task="lint_json_fix",
-                model="claude-haiku-4-5-20251001",
+                model=None,
                 max_tokens=4000,
                 messages=[
                     {"role": "user", "content": prompt},
@@ -2517,6 +3299,13 @@ Rules:
             report = json.loads(raw2)
         except Exception:
             raise HTTPException(500, f"LLM returned unparseable JSON: {first_err}\nRaw: {raw[:300]}")
+
+    # Deterministic link consistency audit (non-LLM, non-mutating).
+    report["link_consistency"] = _build_link_consistency_audit(pages)
+    report["identity_resolution"] = {
+        "duplicate_candidates": identity.duplicate_candidates(p["name"] for p in pages),
+        "alias_count": len(identity.alias_map()),
+    }
 
     file_written = None
     if req.save:
@@ -2540,6 +3329,16 @@ Rules:
         ) or "- None found"
         orphans_md = "\n".join(f"- [[{p}]]" for p in report.get("orphaned_pages", [])) or "- None"
         wins_md = "\n".join(f"- {w}" for w in report.get("quick_wins", [])) or "- None"
+        lc = report.get("link_consistency", {}) or {}
+        broken_md = "\n".join(f"- [[{x['page']}]] -> [[{x['link']}]]" for x in lc.get("broken_links", [])[:20]) or "- None"
+        redundant_md = "\n".join(f"- [[{x['page']}]] repeats [[{x['link']}]] x{x['count']}" for x in lc.get("redundant_links", [])[:20]) or "- None"
+        weak_md = "\n".join(f"- [[{x['page']}]] -> [[{x['link']}]] ({x['reason']})" for x in lc.get("weak_links", [])[:20]) or "- None"
+        add_md = "\n".join(f"- [[{x['page']}]] add: " + ", ".join(f"[[{a}]]" for a in x.get("add", [])) for x in lc.get("suggested_additions", [])[:20]) or "- None"
+        identity_report = report.get("identity_resolution", {}) or {}
+        alias_md = "\n".join(
+            f"- [[{x['alias']}]] -> [[{x['canonical']}]]: {x['reason']}"
+            for x in identity_report.get("duplicate_candidates", [])
+        ) or "- None"
 
         content = f"""---
 title: "Wiki Lint Report"
@@ -2568,6 +3367,29 @@ pages_scanned: {len(pages)}
 
 ## Quick Wins
 {wins_md}
+
+## Link Consistency Audit
+**Consistency score:** {lc.get('consistency_score', '?')}/100
+**Pages audited:** {lc.get('pages_audited', 0)}
+**Total links scanned:** {lc.get('total_links', 0)}
+
+### Broken Links
+{broken_md}
+
+### Redundant Links
+{redundant_md}
+
+### Weak Links
+{weak_md}
+
+### Suggested Related Links
+{add_md}
+
+## Identity Resolution
+**Known aliases:** {identity_report.get('alias_count', 0)}
+
+### Duplicate / Redirect Candidates
+{alias_md}
 """
         _atomic_write_path(lint_path, content)
         file_written = f"_wiki/insights/{lint_path.name}"
@@ -2581,6 +3403,72 @@ pages_scanned: {len(pages)}
     return result
 
 
+@app.post("/lint/apply-link-fixes")
+async def apply_link_fixes(req: ApplyLinkFixesRequest):
+    """Apply safe deterministic wikilink fixes across concept pages.
+
+    Applies only:
+    - remove duplicate wikilinks in-page
+    - remove broken wikilinks to non-existent pages
+
+    Does not auto-remove weak semantic links.
+    """
+    pages = vault_reader.list_concept_pages()
+    if not pages:
+        raise HTTPException(400, "No concept pages to process")
+
+    valid_pages = {p.get("name") for p in pages if p.get("name")}
+    vault_path = Path(os.environ.get("VAULT_PATH", "/Users/sakethv7/SakethVault"))
+    concepts_dir = vault_path / "_wiki" / "concepts"
+
+    changed_pages = []
+    total_duplicate_removed = 0
+    total_broken_removed = 0
+
+    for p in pages:
+        name = p.get("name")
+        if not name:
+            continue
+        fp = concepts_dir / f"{name}.md"
+        if not fp.exists():
+            continue
+        original = fp.read_text(encoding="utf-8")
+        updated, stats = _apply_safe_link_fixes_to_content(original, valid_pages)
+
+        if stats["duplicate_removed"] or stats["broken_removed"]:
+            total_duplicate_removed += stats["duplicate_removed"]
+            total_broken_removed += stats["broken_removed"]
+            changed_pages.append({
+                "page": name,
+                "duplicate_removed": stats["duplicate_removed"],
+                "broken_removed": stats["broken_removed"],
+            })
+            if not req.dry_run:
+                _atomic_write_path(fp, updated)
+
+    if changed_pages and not req.dry_run:
+        wiki_writer._update_index()
+        time_str = datetime.now().strftime("%Y-%m-%d %H:%M")
+        _append_log(
+            vault_path / "_wiki" / "log.md",
+            f"\n## {time_str} · apply-link-fixes\n"
+            f"Pages changed: {len(changed_pages)}\n"
+            f"Duplicate links removed: {total_duplicate_removed}\n"
+            f"Broken links removed: {total_broken_removed}\n"
+        )
+
+    return {
+        "dry_run": req.dry_run,
+        "pages_scanned": len(pages),
+        "pages_changed": len(changed_pages),
+        "duplicate_links_removed": total_duplicate_removed,
+        "broken_links_removed": total_broken_removed,
+        "changed_pages": changed_pages,
+    }
+
+
+
+
 # ── DELETE /page/{page_name} ─────────────────────────────────────────────────
 
 @app.delete("/page/{page_name}")
@@ -2588,9 +3476,10 @@ async def delete_page(page_name: str):
     """Permanently delete a page from any vault folder."""
     vault_path = Path(os.environ.get("VAULT_PATH", "/Users/sakethv7/SakethVault"))
     wiki_dir = vault_path / "_wiki"
+    page_name = identity.resolve_slug(page_name)
 
     # Search all folders for the page
-    search_folders = ["concepts", "insights", "sources", "open-threads", "meta"]
+    search_folders = ["cs", "science", "humanities", "insights", "sources", "open-threads", "meta"]
     page_path = None
     for folder in search_folders:
         candidate = wiki_dir / folder / f"{page_name}.md"
@@ -2603,6 +3492,10 @@ async def delete_page(page_name: str):
         raise HTTPException(404, f"Page '{page_name}' not found")
 
     page_path.unlink()
+    try:
+        memory_store.remove_page(page_name)
+    except Exception as e:
+        logger.warning("memory index delete failed for %s: %s", page_name, e)
 
     # Rebuild index (only matters for concepts but harmless for others)
     wiki_writer._update_index()
@@ -2627,25 +3520,36 @@ async def consolidate(req: ConsolidateRequest):
     - Deletes `source` after merge
     """
     vault_path = Path(os.environ.get("VAULT_PATH", "/Users/sakethv7/SakethVault"))
-    concepts_dir = vault_path / "_wiki" / "concepts"
+    wiki_dir = vault_path / "_wiki"
 
-    source_path = concepts_dir / f"{req.source}.md"
-    target_path = concepts_dir / f"{req.target}.md"
+    def _find_page(name: str):
+        for folder in ["cs", "science", "humanities", "insights", "sources", "open-threads"]:
+            c = wiki_dir / folder / f"{name}.md"
+            if c.exists():
+                return c
+        return None
 
-    if not source_path.exists():
-        raise HTTPException(404, f"Source page '{req.source}' not found")
-    if not target_path.exists():
-        raise HTTPException(404, f"Target page '{req.target}' not found")
+    source = identity.resolve_slug(req.source)
+    target = identity.resolve_slug(req.target)
+    source_path = _find_page(source)
+    target_path = _find_page(target)
+
+    if not source_path:
+        raise HTTPException(404, f"Source page '{source}' not found")
+    if not target_path:
+        raise HTTPException(404, f"Target page '{target}' not found")
+    if source == target:
+        raise HTTPException(400, "Source and target resolve to the same canonical page")
 
     source_content = source_path.read_text(encoding="utf-8")
     target_content = target_path.read_text(encoding="utf-8")
 
     prompt = f"""You are merging two wiki pages about the same topic into one clean, canonical page.
 
-TARGET page (keep this slug/title): [[{req.target}]]
+TARGET page (keep this slug/title): [[{target}]]
 {target_content}
 
-SOURCE page (merge into target, then it will be deleted): [[{req.source}]]
+SOURCE page (merge into target, then it will be deleted): [[{source}]]
 {source_content}
 
 Rules:
@@ -2660,7 +3564,7 @@ Rules:
 
     merged = llm_client.complete(
         task="consolidate_pages",
-        model="claude-sonnet-4-6",
+        model=None,
         max_tokens=3000,
         messages=[{"role": "user", "content": prompt}],
     ).strip()
@@ -2673,17 +3577,22 @@ Rules:
 
     _atomic_write_path(target_path, merged)
     source_path.unlink()
+    try:
+        memory_store.remove_page(source)
+        memory_store.index_page(target)
+    except Exception as e:
+        logger.warning("memory index consolidate update failed for %s -> %s: %s", source, target, e)
 
     wiki_writer._update_index()
 
     time_str = datetime.now().strftime("%Y-%m-%d %H:%M")
     _append_log(vault_path / "_wiki" / "log.md",
-                f"\n## {time_str} · consolidate\nMerged: [[{req.source}]] → [[{req.target}]]\nDeleted: _wiki/concepts/{req.source}.md\n")
+                f"\n## {time_str} · consolidate\nMerged: [[{source}]] → [[{target}]]\nDeleted: _wiki/concepts/{source}.md\n")
 
     return {
         "success": True,
-        "merged_into": f"_wiki/concepts/{req.target}.md",
-        "deleted": f"_wiki/concepts/{req.source}.md",
+        "merged_into": f"_wiki/concepts/{target}.md",
+        "deleted": f"_wiki/concepts/{source}.md",
     }
 
 
@@ -2699,17 +3608,15 @@ async def fix_page(page_name: str):
     Returns counts of what was fixed.
     """
     vault_path = Path(os.environ.get("VAULT_PATH", "/Users/sakethv7/SakethVault"))
-    # fix-page only applies to concepts; search concepts first, then all folders
     wiki_dir = vault_path / "_wiki"
-    page_path = wiki_dir / "concepts" / f"{page_name}.md"
-    if not page_path.exists():
-        for folder in ["insights", "sources", "open-threads", "meta"]:
-            candidate = wiki_dir / folder / f"{page_name}.md"
-            if candidate.exists():
-                page_path = candidate
-                break
+    page_path = None
+    for folder in ["cs", "science", "humanities", "insights", "sources", "open-threads", "meta"]:
+        candidate = wiki_dir / folder / f"{page_name}.md"
+        if candidate.exists():
+            page_path = candidate
+            break
 
-    if not page_path.exists():
+    if page_path is None:
         raise HTTPException(404, f"Page '{page_name}' not found")
 
     content = page_path.read_text(encoding="utf-8")
@@ -2748,6 +3655,10 @@ async def fix_page(page_name: str):
     changes = content != original
     if changes:
         _atomic_write_path(page_path, content)
+        try:
+            memory_store.index_page(page_name)
+        except Exception as e:
+            logger.warning("memory index update failed for fixed page %s: %s", page_name, e)
 
     return {
         "success": True,
@@ -2780,15 +3691,14 @@ async def calculate_maturity(page_name: str):
     wiki_dir = vault_path / "_wiki"
 
     # Find the page
-    page_path = wiki_dir / "concepts" / f"{page_name}.md"
-    if not page_path.exists():
-        for folder in ["insights", "sources", "open-threads", "meta"]:
-            candidate = wiki_dir / folder / f"{page_name}.md"
-            if candidate.exists():
-                page_path = candidate
-                break
+    page_path = None
+    for folder in ["cs", "science", "humanities", "insights", "sources", "open-threads", "meta"]:
+        candidate = wiki_dir / folder / f"{page_name}.md"
+        if candidate.exists():
+            page_path = candidate
+            break
 
-    if not page_path.exists():
+    if page_path is None:
         raise HTTPException(404, f"Page '{page_name}' not found")
 
     content = page_path.read_text(encoding="utf-8")
@@ -2932,10 +3842,13 @@ async def calculate_all_maturity():
     Returns list of updated pages with their scores.
     """
     vault_path = Path(os.environ.get("VAULT_PATH", "/Users/sakethv7/SakethVault"))
-    concepts_dir = vault_path / "_wiki" / "concepts"
+    wiki_dir = vault_path / "_wiki"
 
     results = []
-    for page_file in sorted(concepts_dir.glob("*.md")):
+    all_files = []
+    for folder in ["cs", "science", "humanities"]:
+        all_files.extend(sorted((wiki_dir / folder).glob("*.md")))
+    for page_file in all_files:
         page_name = page_file.stem
         try:
             result = await calculate_maturity(page_name)
@@ -2974,13 +3887,20 @@ async def add_link(req: AddLinkRequest):
     """
     import re
     vault_path = Path(os.environ.get("VAULT_PATH", "/Users/sakethv7/SakethVault"))
-    concepts_dir = vault_path / "_wiki" / "concepts"
-    from_file = concepts_dir / f"{req.from_page}.md"
-    if not from_file.exists():
-        raise HTTPException(404, f"Page '{req.from_page}' not found")
+    wiki_dir = vault_path / "_wiki"
+    from_page = identity.resolve_slug(req.from_page)
+    to_page = identity.resolve_slug(req.to_page)
+    from_file = None
+    for folder in ["cs", "science", "humanities", "insights", "sources", "open-threads"]:
+        c = wiki_dir / folder / f"{from_page}.md"
+        if c.exists():
+            from_file = c
+            break
+    if from_file is None:
+        raise HTTPException(404, f"Page '{from_page}' not found")
 
     content = from_file.read_text(encoding="utf-8")
-    link = f"[[{req.to_page}]]"
+    link = f"[[{to_page}]]"
 
     if link in content:
         return {"added": False, "message": "Link already exists"}
@@ -2992,7 +3912,7 @@ async def add_link(req: AddLinkRequest):
         content = content.rstrip() + f"\n\nSee also: {link}\n"
 
     _atomic_write_path(from_file, content)
-    return {"added": True, "message": f"Added {link} to {req.from_page}"}
+    return {"added": True, "message": f"Added {link} to {from_page}"}
 
 
 # ── POST /create-stub ─────────────────────────────────────────────────────────
@@ -3008,9 +3928,9 @@ async def create_stub(req: CreateStubRequest):
     Zero LLM — pure template fill.
     """
     vault_path = Path(os.environ.get("VAULT_PATH", "/Users/sakethv7/SakethVault"))
-    concepts_dir = vault_path / "_wiki" / "concepts"
-    slug = req.slug.lower().replace(" ", "-")
-    slug = _re.sub(r"[^\w-]", "", slug)
+    concepts_dir = vault_path / "_wiki" / "cs"
+    concepts_dir.mkdir(parents=True, exist_ok=True)
+    slug = identity.resolve_slug(req.slug)
     file_path = concepts_dir / f"{slug}.md"
 
     if file_path.exists():
@@ -3333,8 +4253,13 @@ class EditPageRequest(BaseModel):
 async def edit_page(page_name: str, req: EditPageRequest):
     import subprocess
     vault_path = Path(os.environ.get("VAULT_PATH", "/Users/sakethv7/SakethVault"))
-    page_path = vault_path / "_wiki" / "concepts" / f"{page_name}.md"
-    if not page_path.exists():
+    page_path = None
+    for folder in ["cs", "science", "humanities", "insights", "open-threads", "sources"]:
+        candidate = vault_path / "_wiki" / folder / f"{page_name}.md"
+        if candidate.exists():
+            page_path = candidate
+            break
+    if page_path is None:
         raise HTTPException(404, f"Page '{page_name}' not found")
 
     current = page_path.read_text(encoding="utf-8")
@@ -3371,6 +4296,11 @@ async def edit_page(page_name: str, req: EditPageRequest):
         git_sha = sha_match.group(1) if sha_match else ""
     except Exception as e:
         logger.warning("git commit failed (write succeeded): %s", e)
+
+    try:
+        memory_store.index_page(page_name)
+    except Exception as e:
+        logger.warning("memory index update failed for edited page %s: %s", page_name, e)
 
     return {"success": True, "git_commit_sha": git_sha}
 
@@ -3489,6 +4419,278 @@ async def review_due():
     return {"due": due, "total": len(due)}
 
 
+# ── /rewrite-notes ────────────────────────────────────────────────────────────
+
+class RewriteNotesRequest(BaseModel):
+    bullets: list
+    title: str = ""
+    context: str = ""
+
+
+@app.post("/store-image")
+async def store_image(req: IngestRequest):
+    """
+    Save a pasted image directly to _wiki/assets/ without LLM extraction.
+    Returns the Obsidian-compatible embed path so the frontend can insert it.
+    Also runs a quick vision pass to suggest a filename and caption.
+    """
+    all_images = list(req.images or [])
+    if req.image_base64 and not all_images:
+        all_images = [{"data": req.image_base64, "mediaType": "image/png"}]
+    if not all_images:
+        raise HTTPException(400, "No image provided")
+
+    vault = _vault_path()
+    assets_dir = vault / "_wiki" / "assets"
+    assets_dir.mkdir(parents=True, exist_ok=True)
+
+    today = datetime.now().strftime("%Y-%m-%d")
+    saved = []
+
+    for i, img in enumerate(all_images):
+        media_type = img.get("mediaType", "image/png")
+        ext = media_type.split("/")[-1].replace("jpeg", "jpg")
+        raw_bytes = base64.b64decode(img["data"])
+
+        # Quick Haiku vision pass: get a short slug + one-line caption
+        try:
+            caption_raw = llm_client.complete(
+                task="image_caption",
+                model=None,  # vision model selected by provider routing
+                max_tokens=120,
+                messages=[{"role": "user", "content": [
+                    {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": img["data"]}},
+                    {"type": "text", "text": 'Return ONLY a JSON object: {"slug": "2-4-word-kebab-slug", "caption": "one sentence describing the diagram/image"}'},
+                ]}],
+                expect_json=True,
+            ).strip()
+            s = caption_raw.find("{"); e2 = caption_raw.rfind("}") + 1
+            meta = json.loads(caption_raw[s:e2]) if s >= 0 else {}
+        except Exception:
+            meta = {}
+
+        slug = _re.sub(r"[^a-z0-9\-]", "", (meta.get("slug") or "image").lower().replace(" ", "-"))[:40] or "image"
+        suffix = f"-{i+1}" if i > 0 else ""
+        filename = f"{today}-{slug}{suffix}.{ext}"
+        file_path = assets_dir / filename
+
+        file_path.write_bytes(raw_bytes)
+
+        saved.append({
+            "filename": filename,
+            "obsidian_embed": f"![[{filename}]]",
+            "caption": meta.get("caption", ""),
+        })
+
+    return {"saved": saved}
+
+
+class ExpandNotesRequest(BaseModel):
+    bullets: list
+    title: str = ""
+    direction: str = ""  # e.g. "add a point about gradient accumulation"
+    count: int = 2       # how many new bullets to add
+
+
+@app.post("/expand-notes")
+async def expand_notes(req: ExpandNotesRequest):
+    """
+    Add new insight bullets in a given direction, appended to the existing set.
+    """
+    if not req.direction.strip():
+        raise HTTPException(400, "direction is required")
+
+    bullets_block = "\n".join(f"{i+1}. {b}" for i, b in enumerate(req.bullets))
+    context_line = f"\nTopic: {req.title}" if req.title else ""
+
+    prompt = f"""You are adding new insight bullets to an existing set of technical notes.{context_line}
+
+Existing bullets:
+{bullets_block}
+
+Direction: {req.direction.strip()}
+
+Write {req.count} new bullets that follow this direction. Rules:
+- Each bullet is 1-2 sentences, dense with information
+- No first-person ("I learned", "I found")
+- State facts, mechanisms, and implications directly
+- Do not repeat what is already covered above
+- Match the technical depth and style of the existing bullets
+
+Return ONLY a JSON array of the NEW bullets (not the existing ones), e.g.:
+["New bullet 1.", "New bullet 2."]"""
+
+    try:
+        raw = llm_client.complete(
+            task="expand_notes",
+            model=None,
+            max_tokens=600,
+            messages=[{"role": "user", "content": prompt}],
+            expect_json=True,
+        ).strip()
+        start = raw.find("[")
+        end = raw.rfind("]") + 1
+        new_bullets = json.loads(raw[start:end]) if start >= 0 else []
+    except Exception as e:
+        raise HTTPException(500, f"Expand failed: {e}")
+
+    return {"bullets": req.bullets + new_bullets}
+
+
+@app.post("/rewrite-notes")
+async def rewrite_notes(req: RewriteNotesRequest):
+    """
+    Rewrite POV/first-person summary bullets as neutral, precise technical notes
+    in the style of Lilian Weng's blog — factual, dense, no 'I learned' openers.
+    """
+    if not req.bullets:
+        raise HTTPException(400, "bullets is required")
+
+    bullets_block = "\n".join(f"{i+1}. {b}" for i, b in enumerate(req.bullets))
+    context_line = f"\nTopic context: {req.title}" if req.title else ""
+    extra_context = f"\nAdditional context: {req.context[:500]}" if req.context else ""
+
+    prompt = f"""Rewrite the following notes as clean, neutral technical prose — the style of Lilian Weng's blog posts (lilianweng.github.io).{context_line}{extra_context}
+
+Rules:
+- No first-person ("I learned", "I found", "impressed me", "interesting that")
+- State facts, mechanisms, and implications directly
+- Keep the same number of bullets
+- Each bullet 1-2 sentences, dense with information — no filler
+- Preserve all technical details and specifics from the original
+- Do not merge bullets or split them
+
+Original notes:
+{bullets_block}
+
+Return ONLY a JSON array of strings (one per rewritten bullet), e.g.:
+["Rewritten bullet 1.", "Rewritten bullet 2."]"""
+
+    try:
+        raw = llm_client.complete(
+            task="rewrite_notes",
+            model=None,
+            max_tokens=800,
+            messages=[{"role": "user", "content": prompt}],
+            expect_json=True,
+        ).strip()
+        start = raw.find("[")
+        end = raw.rfind("]") + 1
+        bullets = json.loads(raw[start:end]) if start >= 0 else req.bullets
+    except Exception as e:
+        raise HTTPException(500, f"Rewrite failed: {e}")
+
+    return {"bullets": bullets}
+
+
+# ── /vault/rewrite-pov-notes ──────────────────────────────────────────────────
+
+_POV_RE = _re.compile(
+    r"^(- )(I learned that |I learned |I found that |I found |"
+    r"This shows that |This shows |Select AI impressed|.+ impressed me|"
+    r"I think |I believe |I noticed )",
+    _re.IGNORECASE,
+)
+
+# In-memory task store: task_id -> progress dict
+_polish_tasks: dict = {}
+
+
+def _run_vault_polish(task_id: str) -> None:
+    task = _polish_tasks[task_id]
+    vault = _vault_path()
+
+    # First pass: collect all pages that have POV bullets
+    candidates = []
+    for md_path in sorted(vault.rglob("*.md")):
+        if "_wiki" not in str(md_path):
+            continue
+        try:
+            content = md_path.read_text(encoding="utf-8")
+        except Exception:
+            continue
+        lines = content.splitlines()
+        pov_indices = [i for i, ln in enumerate(lines) if _POV_RE.match(ln.strip())]
+        if pov_indices:
+            candidates.append((md_path, lines, pov_indices))
+
+    task["pages_total"] = len(candidates)
+    task["status"] = "running" if candidates else "done"
+    if not candidates:
+        task["message"] = "No POV bullets found — vault is already clean."
+        return
+
+    pages_updated = 0
+    bullets_updated = 0
+
+    for md_path, lines, pov_indices in candidates:
+        page_name = md_path.stem
+        task["current_page"] = page_name
+        task["pages_done"] = pages_updated
+
+        pov_bullets = [lines[i].strip().lstrip("- ").strip() for i in pov_indices]
+        try:
+            raw = llm_client.complete(
+                task="rewrite_notes",
+                model=None,
+                max_tokens=600,
+                messages=[{"role": "user", "content":
+                    "Rewrite these notes as neutral technical prose (no first-person, no 'I learned'). "
+                    "Return ONLY a JSON array of strings with the same count:\n"
+                    + "\n".join(f"{i+1}. {b}" for i, b in enumerate(pov_bullets))
+                }],
+                expect_json=True,
+            ).strip()
+            start = raw.find("[")
+            end = raw.rfind("]") + 1
+            rewritten = json.loads(raw[start:end]) if start >= 0 else None
+        except Exception:
+            rewritten = None
+
+        if not rewritten or len(rewritten) != len(pov_indices):
+            continue
+
+        new_lines = list(lines)
+        for idx, new_text in zip(pov_indices, rewritten):
+            indent = len(lines[idx]) - len(lines[idx].lstrip())
+            new_lines[idx] = " " * indent + "- " + new_text.strip().lstrip("- ")
+
+        wiki_writer._atomic_write(md_path, "\n".join(new_lines) + "\n")
+        pages_updated += 1
+        bullets_updated += len(pov_indices)
+        task["bullets_done"] = bullets_updated
+
+    task["pages_done"] = pages_updated
+    task["bullets_done"] = bullets_updated
+    task["status"] = "done"
+    task["message"] = f"Polished {bullets_updated} bullet{'s' if bullets_updated != 1 else ''} across {pages_updated} page{'s' if pages_updated != 1 else ''}."
+    task["current_page"] = None
+
+
+@app.post("/vault/rewrite-pov-notes")
+async def vault_rewrite_pov_notes():
+    """Start a background vault polish task. Returns task_id for status polling."""
+    task_id = str(uuid.uuid4())
+    _polish_tasks[task_id] = {
+        "status": "scanning",
+        "pages_total": 0,
+        "pages_done": 0,
+        "bullets_done": 0,
+        "current_page": None,
+        "message": None,
+    }
+    loop = asyncio.get_running_loop()
+    loop.run_in_executor(None, _run_vault_polish, task_id)
+    return {"task_id": task_id}
+
+
+@app.get("/vault/rewrite-pov-notes/status/{task_id}")
+async def vault_rewrite_pov_notes_status(task_id: str):
+    if task_id not in _polish_tasks:
+        raise HTTPException(404, "Task not found")
+    return _polish_tasks[task_id]
+
+
 # ── /knowledge-gaps/{page_name} ───────────────────────────────────────────────
 
 @app.post("/knowledge-gaps/{page_name}")
@@ -3529,7 +4731,7 @@ Rules:
 
     text = llm_client.complete(
         task="knowledge_gaps",
-        model="claude-sonnet-4-6",
+        model=None,
         max_tokens=1200,
         messages=[{"role": "user", "content": prompt}],
         expect_json=True,
@@ -3544,6 +4746,133 @@ Rules:
         return json.loads(text)
     except json.JSONDecodeError:
         raise HTTPException(500, "Failed to parse knowledge gaps from model")
+
+
+# ── mobile upload & QR code ──────────────────────────────────────────────────
+
+def _local_ip() -> str:
+    import socket
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        return "127.0.0.1"
+
+
+@app.get("/qr-code")
+async def qr_code():
+    """Return a QR code PNG pointing to the mobile upload page on the LAN."""
+    import qrcode, io
+    port = int(os.environ.get("PORT", 8001))
+    url = f"http://{_local_ip()}:{port}/mobile"
+    img = qrcode.make(url)
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return Response(content=buf.getvalue(), media_type="image/png")
+
+
+@app.get("/mobile")
+async def mobile_upload_page():
+    """Simple HTML upload page served to phones — no React needed."""
+    port = int(os.environ.get("PORT", 8001))
+    api_base = f"http://{_local_ip()}:{port}"
+    html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+  <title>FlashCapture</title>
+  <style>
+    * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+    body {{ font-family: -apple-system, sans-serif; background: #fafaf8; color: #1c1917; padding: 24px 16px; }}
+    h1 {{ font-size: 20px; font-weight: 700; margin-bottom: 4px; }}
+    p.sub {{ font-size: 13px; color: #78716c; margin-bottom: 24px; }}
+    label {{ display: block; font-size: 13px; font-weight: 600; color: #44403c; margin-bottom: 6px; }}
+    textarea, input[type=text] {{ width: 100%; border: 1px solid #e7e5e4; border-radius: 12px;
+      padding: 12px; font-size: 15px; background: white; margin-bottom: 16px; }}
+    textarea {{ height: 80px; resize: none; }}
+    .img-picker {{ width: 100%; border: 2px dashed #d6d3d1; border-radius: 12px;
+      padding: 32px 16px; text-align: center; color: #a8a29e; font-size: 14px;
+      cursor: pointer; margin-bottom: 16px; background: white; }}
+    .img-picker input {{ display: none; }}
+    #previews {{ display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 16px; }}
+    #previews img {{ width: 80px; height: 80px; object-fit: cover; border-radius: 8px; }}
+    button {{ width: 100%; background: #f97316; color: white; border: none;
+      border-radius: 12px; padding: 14px; font-size: 16px; font-weight: 600; cursor: pointer; }}
+    button:disabled {{ opacity: 0.5; }}
+    #status {{ margin-top: 16px; font-size: 14px; text-align: center; color: #44403c; }}
+  </style>
+</head>
+<body>
+  <h1>📸 FlashCapture</h1>
+  <p class="sub">Take a photo of your lecture slides to add to SakethWiki.</p>
+
+  <label>Your understanding (optional)</label>
+  <textarea id="notes" placeholder="What do you already understand about this? Helps the AI fill gaps..."></textarea>
+
+  <label>Screenshots</label>
+  <div class="img-picker" onclick="document.getElementById('filePicker').click()">
+    Tap to take photos or choose from library
+    <input type="file" id="filePicker" accept="image/*" multiple capture="environment">
+  </div>
+  <div id="previews"></div>
+
+  <button id="submitBtn" onclick="submit()" disabled>Process</button>
+  <div id="status"></div>
+
+  <script>
+    const files = [];
+    document.getElementById('filePicker').addEventListener('change', e => {{
+      Array.from(e.target.files).forEach(f => {{
+        files.push(f);
+        const img = document.createElement('img');
+        img.src = URL.createObjectURL(f);
+        document.getElementById('previews').appendChild(img);
+      }});
+      document.getElementById('submitBtn').disabled = files.length === 0;
+    }});
+
+    async function toB64(file) {{
+      return new Promise(res => {{
+        const r = new FileReader();
+        r.onload = e => {{ const parts = e.target.result.split(','); res({{ data: parts[1], mediaType: file.type || 'image/jpeg' }}); }};
+        r.readAsDataURL(file);
+      }});
+    }}
+
+    async function submit() {{
+      const btn = document.getElementById('submitBtn');
+      const status = document.getElementById('status');
+      btn.disabled = true;
+      status.textContent = 'Processing…';
+      try {{
+        const images = await Promise.all(files.map(toB64));
+        const notes = document.getElementById('notes').value.trim();
+        const body = {{ images, source_type: 'lecture' }};
+        if (notes) body.user_notes = notes;
+        const res = await fetch('{api_base}/ingest', {{
+          method: 'POST', headers: {{ 'Content-Type': 'application/json' }},
+          body: JSON.stringify(body)
+        }});
+        if (!res.ok) throw new Error(await res.text());
+        status.innerHTML = '✓ Queued for review in SakethWiki!';
+        status.style.color = '#16a34a';
+        files.length = 0;
+        document.getElementById('previews').innerHTML = '';
+        document.getElementById('notes').value = '';
+      }} catch(e) {{
+        status.textContent = 'Error: ' + e.message;
+        status.style.color = '#dc2626';
+        btn.disabled = false;
+      }}
+    }}
+  </script>
+</body>
+</html>"""
+    return Response(content=html, media_type="text/html")
 
 
 # ── dev entrypoint ────────────────────────────────────────────────────────────

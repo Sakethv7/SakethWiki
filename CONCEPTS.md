@@ -45,14 +45,17 @@ graph TB
         T --> V[_wiki/sources/*.md]
         T --> W[_wiki/index.md]
         T --> TR[_wiki/meta/traces.jsonl\nappend trace]
+        T --> MM[_wiki/meta/memory.db\npersistent chunk index]
     end
 
     subgraph Chat["Chat (POST /chat)"]
-        X[User question] --> Y{Knowledge query?}
-        Y -- yes --> Z[find_relevant_pages\nparse_concept_page]
-        Y -- no --> AA[keyword match context]
+        X[User question] --> MX[sync memory index]
+        MX --> MY[SQLite chunk retrieval\nlexical + optional embeddings]
+        MY --> Y{Knowledge query?}
+        Y -- yes --> Z[top concept\nparse_concept_page]
+        Y -- no --> AA[top snippets + headings]
         Z --> AB[Return knowledge_card]
-        AA --> AC[routed LLM\nanswer with context]
+        AA --> AC[routed LLM\nanswer with memory context]
     end
 
     subgraph Frontend["Frontend (Vite/React :5173)"]
@@ -145,9 +148,49 @@ The understanding block is **rewritten** on each approval (not appended to), so 
 | Lint / consolidate / knowledge gaps | Anthropic by default | Integrity-critical tasks |
 | All routing/parsing | Pure Python + `llm_client` | Task-based provider routing + contract guardrails |
 
+## Memory Substrate
+
+The important shift is architectural, not cosmetic:
+
+- Markdown pages remain the editable source of truth.
+- A persistent SQLite index in `_wiki/meta/memory.db` stores page metadata plus chunked retrieval units.
+- On each chat query, the system syncs the index against the vault, so direct file edits and page deletions become visible to retrieval without a restart.
+- If `EMBED_ENABLED=true` and an embedding key is configured, each chunk also stores an embedding and retrieval blends lexical + semantic similarity. Without that explicit opt-in, the same index stays local and lexical.
+
 **Principle:** LLM only where rule-based fails. High-volume tasks can run local; integrity-critical tasks use strict output contracts with Anthropic fallback.
 
 ---
+
+## Identity Resolution
+
+Aliases are resolved before concept identity reaches storage, retrieval, graph edges, and automation endpoints.
+
+```mermaid
+graph LR
+    A[User phrase / model slug / wikilink] --> B[identity.slugify]
+    B --> C[Built-in aliases]
+    B --> D[_wiki/meta/aliases.json]
+    B --> E[Page frontmatter aliases]
+    C --> F[Canonical slug]
+    D --> F
+    E --> F
+    F --> G[Writer target page]
+    F --> H[Memory index page_slug]
+    F --> I[Backlinks + graph]
+    F --> J[Lint identity report]
+```
+
+The key implementation point is that aliases are not a UI search trick. `backend/identity.py` is the shared resolver. It is used by `wiki_writer.py` before writes, by `memory_store.py` before retrieval and indexing, by `vault_reader.py` for page reads/backlinks/graph, and by API endpoints that mutate links or pages.
+
+Built-in aliases cover high-frequency AI terms such as `retrieval augmented generation -> rag`, `key-value cache -> kv-cache`, and `agentic -> agents`. Vault-specific aliases can be added without code changes in `_wiki/meta/aliases.json`, and individual pages can declare `aliases: [...]` in frontmatter.
+
+The system is intentionally conservative:
+
+- If both `rag.md` and `retrieval-augmented-generation.md` exist, the memory index skips the alias page and returns `rag`.
+- If only the alias page exists, reads can still fall back to it instead of making old pages unreachable.
+- `/lint` and `/aliases` report duplicate/redirect candidates; they do not merge pages automatically.
+
+Mistake to avoid: treating aliases, tags, and folders as the same problem. Aliases answer "what exact concept is this?" Tags answer "what cluster does this belong to?" Folders answer "where does it live?"
 
 ---
 
