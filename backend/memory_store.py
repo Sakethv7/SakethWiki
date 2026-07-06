@@ -562,11 +562,12 @@ def _vector_hits(conn: sqlite3.Connection, query: str, limit: int = 40) -> list[
     return hits[:limit]
 
 
-def search(query: str, limit: int = 5) -> list[dict]:
+def search(query: str, limit: int = 5, *, sync: bool = True) -> list[dict]:
     if not query or not query.strip():
         return []
 
-    sync_index()
+    if sync:
+        sync_index()
     query = identity.expand_query(query)
     with _connect() as conn:
         lexical = _lexical_hits(conn, query, limit=max(20, limit * 6))

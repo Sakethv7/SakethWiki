@@ -7,7 +7,12 @@ import memory_store
 import preference_memory
 import active_review
 import consolidation
+import eval_harness
+import identity
+import llm_client
 import main
+import system_loop
+import telemetry
 import vault_reader
 
 
@@ -308,3 +313,353 @@ def test_expand_notes_parser_accepts_markdown_and_json():
         "Recovery is CPU-intensive.",
         "Parity count changes decode cost.",
     ]
+
+
+def test_telemetry_generates_inference_report(monkeypatch, tmp_path):
+    vault = tmp_path / "vault"
+    (vault / "_wiki" / "meta").mkdir(parents=True)
+    monkeypatch.setenv("VAULT_PATH", str(vault))
+
+    telemetry.log_llm_call(
+        {
+            "task": "INGEST_EXTRACT",
+            "provider": "openai_compat",
+            "requested_provider": "openai_compat",
+            "model": "gemini-2.5-flash",
+            "duration_ms": 1200,
+            "input_chars": 6000,
+            "output_chars": 900,
+            "max_tokens": 1200,
+            "expect_json": True,
+            "contract_ok": True,
+            "fallback_used": False,
+            "error": None,
+        }
+    )
+    telemetry.log_context_event(
+        "ingest_context",
+        {
+            "task": "ingest_extract",
+            "source_url": "https://example.com/long",
+            "source_chars_total": 10000,
+            "source_chars_used": 4000,
+            "source_coverage_ratio": 0.4,
+        },
+    )
+
+    report = telemetry.generate_inference_report()
+    path = Path(report["path"])
+    assert path.exists()
+    text = path.read_text(encoding="utf-8")
+    assert "Inference Engineering Report" in text
+    assert "INGEST_EXTRACT" in text
+    assert "40.0%" in text
+
+
+def test_system_loop_routes_repeated_preferences(monkeypatch, tmp_path):
+    vault = tmp_path / "vault"
+    (vault / "_wiki" / "meta").mkdir(parents=True)
+    monkeypatch.setenv("VAULT_PATH", str(vault))
+
+    trace = {
+        "approved": True,
+        "url": "https://example.com/agents",
+        "suggested_page": "agentic-ai",
+        "final_page": "agents",
+        "page_corrected": True,
+    }
+    preference_memory.record_approval_trace(trace)
+    preference_memory.record_approval_trace(trace)
+
+    result = system_loop.run_system_loop(auto_apply=True)
+    assert result["success"] is True
+    assert preference_memory.preferred_page("agentic ai") == "agents"
+    assert Path(result["report_path"]).exists()
+
+
+def test_system_loop_can_set_runtime_route_override(monkeypatch, tmp_path):
+    vault = tmp_path / "vault"
+    (vault / "_wiki" / "meta").mkdir(parents=True)
+    monkeypatch.setenv("VAULT_PATH", str(vault))
+
+    for _ in range(20):
+        telemetry.log_llm_call(
+            {
+                "task": "INGEST_EXTRACT",
+                "provider": "openai_compat",
+                "requested_provider": "openai_compat",
+                "model": "gemini-2.5-flash",
+                "duration_ms": 1000,
+                "input_chars": 5000,
+                "output_chars": 800,
+                "max_tokens": 1200,
+                "expect_json": True,
+                "contract_ok": True,
+                "fallback_used": True,
+                "error": None,
+            }
+        )
+
+    result = system_loop.run_system_loop(auto_apply=True)
+    overrides = system_loop.load_runtime_overrides()
+    assert overrides["routes"]["INGEST_EXTRACT"]["provider"] == "anthropic"
+    assert any(action["action"] == "set_runtime_route_override" for action in result["actions"])
+
+
+def test_action_candidate_approval_applies_runtime_setting(monkeypatch, tmp_path):
+    vault = tmp_path / "vault"
+    (vault / "_wiki" / "meta").mkdir(parents=True)
+    monkeypatch.setenv("VAULT_PATH", str(vault))
+    for _ in range(5):
+        telemetry.log_context_event(
+            "chat_context",
+            {
+                "query": "why did retrieval drop chunks",
+                "retrieved_chunks_total": 5,
+                "retrieved_chunks_used": 3,
+                "retrieved_chunks_dropped": 2,
+                "context_chars_used": 6000,
+                "context_chars_dropped": 1200,
+                "context_budget": 6000,
+            },
+        )
+
+    candidate = system_loop.upsert_action_candidate(
+        {
+            "risk": "medium",
+            "action": "increase_chat_context_budget",
+            "target": "chat_answer",
+            "title": "Increase chat context budget",
+            "reason": "chat dropped chunks",
+            "current_state": {"chat_context_budget": 6000},
+            "proposed_change": {"chat_context_budget": 9000},
+        }
+    )
+    approved = system_loop.approve_action_candidate(candidate["id"])
+    settings = system_loop.load_runtime_settings()
+
+    assert approved["status"] == "applied"
+    assert approved["eval_status"] == "passed"
+    assert settings["settings"]["chat_context_budget"] == 9000
+
+
+def test_budget_candidate_eval_fails_without_enough_evidence(monkeypatch, tmp_path):
+    vault = tmp_path / "vault"
+    (vault / "_wiki" / "meta").mkdir(parents=True)
+    monkeypatch.setenv("VAULT_PATH", str(vault))
+    telemetry.log_context_event(
+        "chat_context",
+        {
+            "query": "one dropped context event",
+            "retrieved_chunks_total": 5,
+            "retrieved_chunks_used": 3,
+            "retrieved_chunks_dropped": 2,
+            "context_chars_used": 6000,
+            "context_chars_dropped": 1200,
+            "context_budget": 6000,
+        },
+    )
+    candidate = system_loop.upsert_action_candidate(
+        {
+            "risk": "medium",
+            "action": "increase_chat_context_budget",
+            "target": "chat_answer",
+            "title": "Increase chat context budget",
+            "reason": "chat dropped chunks",
+            "current_state": {"chat_context_budget": 6000},
+            "proposed_change": {"chat_context_budget": 9000},
+        }
+    )
+
+    approved = system_loop.approve_action_candidate(candidate["id"])
+
+    assert approved["status"] == "eval_failed"
+    assert system_loop.load_runtime_settings()["settings"] == {}
+
+
+def test_alias_candidate_adds_alias(monkeypatch, tmp_path):
+    vault = tmp_path / "vault"
+    (vault / "_wiki" / "meta").mkdir(parents=True)
+    monkeypatch.setenv("VAULT_PATH", str(vault))
+
+    candidate = system_loop.upsert_action_candidate(
+        {
+            "risk": "medium",
+            "action": "add_alias",
+            "target": "rag",
+            "title": "Add RAG alias",
+            "reason": "retrieval missed rag",
+            "proposed_change": {"alias": "retrieval grounding", "canonical": "rag"},
+        }
+    )
+    approved = system_loop.approve_action_candidate(candidate["id"])
+
+    assert approved["status"] == "applied"
+    assert identity.resolve_slug("retrieval grounding") == "rag"
+
+
+def test_exclude_eval_case_candidate_records_exclusion(monkeypatch, tmp_path):
+    vault = tmp_path / "vault"
+    (vault / "_wiki" / "meta").mkdir(parents=True)
+    monkeypatch.setenv("VAULT_PATH", str(vault))
+
+    candidate = system_loop.upsert_action_candidate(
+        {
+            "risk": "medium",
+            "action": "exclude_eval_case",
+            "target": "trace-2",
+            "title": "Exclude noisy eval case",
+            "reason": "bad trace",
+            "proposed_change": {"case_id": "trace-2"},
+        }
+    )
+    approved = system_loop.approve_action_candidate(candidate["id"])
+
+    assert approved["status"] == "applied"
+    assert "trace-2" in eval_harness.load_eval_exclusions()["excluded_cases"]
+
+
+def test_route_eval_findings_stages_alias_and_exclusion_candidates(monkeypatch, tmp_path):
+    vault = tmp_path / "vault"
+    (vault / "_wiki" / "meta").mkdir(parents=True)
+    monkeypatch.setenv("VAULT_PATH", str(vault))
+
+    actions = system_loop.route_eval_findings(
+        {
+            "retrieval": {
+                "failures": [
+                    {
+                        "case_id": "trace-7",
+                        "expected": "rag",
+                        "got": ["agents"],
+                        "query": "retrieval grounding",
+                    }
+                ]
+            }
+        }
+    )
+    candidates = system_loop.list_action_candidates()
+
+    assert any(action["action"] == "stage_add_alias_candidate" for action in actions)
+    assert any(c["action"] == "add_alias" for c in candidates)
+    assert any(c["action"] == "exclude_eval_case" for c in candidates)
+
+
+def test_curated_eval_cases_are_loaded(monkeypatch, tmp_path):
+    vault = tmp_path / "vault"
+    (vault / "_wiki" / "meta").mkdir(parents=True)
+    monkeypatch.setenv("VAULT_PATH", str(vault))
+
+    eval_harness.eval_cases_path().write_text(
+        """{
+  "cases": [
+    {"id": "curated-rag", "query": "retrieval grounding", "expected_page": "rag", "tags": ["RAG"]}
+  ]
+}
+""",
+        encoding="utf-8",
+    )
+
+    cases = eval_harness.load_curated_eval_cases()
+    assert cases[0]["id"] == "curated-rag"
+    assert cases[0]["expected_page"] == "rag"
+
+
+def test_ingest_budget_candidate_applies_after_replay_gate(monkeypatch, tmp_path):
+    vault = tmp_path / "vault"
+    (vault / "_wiki" / "meta").mkdir(parents=True)
+    monkeypatch.setenv("VAULT_PATH", str(vault))
+    for _ in range(5):
+        telemetry.log_context_event(
+            "ingest_context",
+            {
+                "task": "ingest_extract",
+                "source_chars_total": 10000,
+                "source_chars_used": 4000,
+                "source_coverage_ratio": 0.4,
+            },
+        )
+
+    candidate = system_loop.upsert_action_candidate(
+        {
+            "risk": "medium",
+            "action": "increase_ingest_source_budget",
+            "target": "ingest_extract",
+            "title": "Increase ingest budget",
+            "reason": "low source coverage",
+            "current_state": {"ingest_source_budget": 4000},
+            "proposed_change": {"ingest_source_budget": 8000},
+        }
+    )
+    approved = system_loop.approve_action_candidate(candidate["id"])
+
+    assert approved["status"] == "applied"
+    assert system_loop.load_runtime_settings()["settings"]["ingest_source_budget"] == 8000
+
+
+def test_high_risk_review_and_consolidation_handlers(monkeypatch, tmp_path):
+    vault = tmp_path / "vault"
+    (vault / "_wiki" / "meta").mkdir(parents=True)
+    monkeypatch.setenv("VAULT_PATH", str(vault))
+
+    review = system_loop.upsert_action_candidate(
+        {
+            "risk": "high",
+            "action": "queue_page_review",
+            "target": "rag",
+            "title": "Review RAG",
+            "reason": "trace critic found repeated corrections",
+            "proposed_change": {"page": "rag"},
+            "requires_eval": False,
+            "requires_approval": True,
+        }
+    )
+    merged = system_loop.upsert_action_candidate(
+        {
+            "risk": "high",
+            "action": "create_consolidation_candidate",
+            "target": "rag-systems->rag",
+            "title": "Consider consolidation",
+            "reason": "duplicate concepts",
+            "proposed_change": {"source": "rag-systems", "target": "rag"},
+            "requires_eval": False,
+            "requires_approval": True,
+        }
+    )
+
+    assert system_loop.approve_action_candidate(review["id"])["status"] == "applied"
+    assert system_loop.approve_action_candidate(merged["id"])["status"] == "applied"
+    assert system_loop.review_requests_path().exists()
+    assert system_loop.consolidation_requests_path().exists()
+
+
+def test_trace_critic_drops_malformed_candidates(monkeypatch, tmp_path):
+    vault = tmp_path / "vault"
+    (vault / "_wiki" / "meta").mkdir(parents=True)
+    monkeypatch.setenv("VAULT_PATH", str(vault))
+    traces_path = vault / "_wiki" / "meta" / "traces.jsonl"
+    for i in range(5):
+        traces_path.write_text(
+            (traces_path.read_text(encoding="utf-8") if traces_path.exists() else "")
+            + f'{{"approved": true, "title": "Trace {i}", "suggested_page": "a", "final_page": "b"}}\n',
+            encoding="utf-8",
+        )
+
+    def fake_complete(*args, **kwargs):
+        return """{
+  "quality_summary": "malformed candidates should not enter the queue",
+  "bad_trace_cases": [],
+  "good_eval_cases": [],
+  "action_candidates": [
+    {"action": "add_alias", "risk": "medium", "proposed_change": {"canonical": "rag"}},
+    {"action": "queue_page_review", "risk": "high", "proposed_change": {}},
+    {"action": "create_consolidation_candidate", "risk": "high", "proposed_change": {"target": "rag"}}
+  ]
+}"""
+
+    monkeypatch.setattr(llm_client, "complete", fake_complete)
+    result = system_loop.run_trace_critic()
+
+    assert result["ran"] is True
+    assert result["staged"] == []
+    assert system_loop.list_action_candidates() == []

@@ -1,5 +1,4 @@
 import { useState, useEffect, useRef } from "react";
-import mermaid from "mermaid";
 import { marked } from "marked";
 import DOMPurify from "dompurify";
 
@@ -20,9 +19,13 @@ function sanitizeMermaid(chart) {
 }
 
 let _mermaidReady = false;
-function ensureMermaid() {
+let _mermaidLib = null;
+async function ensureMermaid() {
+  if (!_mermaidLib) {
+    _mermaidLib = (await import("mermaid")).default;
+  }
   if (!_mermaidReady) {
-    mermaid.initialize({
+    _mermaidLib.initialize({
       startOnLoad: false,
       securityLevel: "antiscript",
       theme: "base",
@@ -44,6 +47,7 @@ function ensureMermaid() {
     });
     _mermaidReady = true;
   }
+  return _mermaidLib;
 }
 
 function MermaidDiagram({ chart }) {
@@ -53,13 +57,13 @@ function MermaidDiagram({ chart }) {
 
   useEffect(() => {
     if (!chart) return;
-    ensureMermaid();
     setSvg(""); setRawFallback(false);
     const clean = sanitizeMermaid(chart);
     const tmp = document.createElement("div");
     tmp.style.position = "absolute"; tmp.style.visibility = "hidden";
     document.body.appendChild(tmp);
-    mermaid.render(uid.current, clean, tmp)
+    ensureMermaid()
+      .then((mermaid) => mermaid.render(uid.current, clean, tmp))
       .then(({ svg: s }) => setSvg(s))
       .catch(() => setRawFallback(true))
       .finally(() => { try { document.body.removeChild(tmp); } catch {} });
@@ -3518,6 +3522,452 @@ function DashboardTab({ onNavigateToConcept }) {
   );
 }
 
+// ── OPERATIONS TAB ───────────────────────────────────────────────────────────
+
+function RiskBadge({ risk }) {
+  const cls = risk === "high"
+    ? "bg-red-50 text-red-700 ring-red-200"
+    : risk === "medium"
+      ? "bg-amber-50 text-amber-700 ring-amber-200"
+      : "bg-emerald-50 text-emerald-700 ring-emerald-200";
+  return <span className={`px-2 py-0.5 rounded-full text-[10px] font-semibold ring-1 ${cls}`}>{risk || "low"}</span>;
+}
+
+function StatusBadge({ status }) {
+  const cls = status === "applied"
+    ? "bg-emerald-50 text-emerald-700 ring-emerald-200"
+    : status === "rejected" || status === "apply_failed"
+      ? "bg-red-50 text-red-700 ring-red-200"
+      : "bg-stone-100 text-stone-600 ring-stone-200";
+  return <span className={`px-2 py-0.5 rounded-full text-[10px] font-semibold ring-1 ${cls}`}>{status || "candidate"}</span>;
+}
+
+function StatTile({ label, value, tone = "stone" }) {
+  const cls = tone === "red"
+    ? "border-red-100 bg-red-50 text-red-900"
+    : tone === "amber"
+      ? "border-amber-100 bg-amber-50 text-amber-900"
+      : tone === "emerald"
+        ? "border-emerald-100 bg-emerald-50 text-emerald-900"
+        : "border-stone-200 bg-white text-stone-900";
+  return (
+    <div className={`rounded-lg border px-3 py-2 ${cls}`}>
+      <p className="text-[10px] uppercase tracking-wide opacity-60">{label}</p>
+      <p className="text-lg font-semibold mt-0.5">{value}</p>
+    </div>
+  );
+}
+
+function OperationsTab() {
+  const [data, setData] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [busy, setBusy] = useState("");
+  const [error, setError] = useState("");
+  const [view, setView] = useState("queue");
+  const [reportPreview, setReportPreview] = useState(null);
+
+  async function load() {
+    setLoading(true);
+    try {
+      const d = await api("/operations-overview");
+      setData(d);
+      setError("");
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  useEffect(() => { load(); }, []);
+
+  async function runLoop() {
+    setBusy("loop");
+    setError("");
+    try {
+      await api("/system-loop/run?auto_apply=true", { method: "POST" });
+      await load();
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function generateInference() {
+    setBusy("inference");
+    setError("");
+    try {
+      await api("/inference-report", { method: "POST" });
+      await load();
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function runEvals() {
+    setBusy("evals");
+    setError("");
+    try {
+      await api("/evals/run", { method: "POST" });
+      await load();
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function runTraceCritic() {
+    setBusy("critic");
+    setError("");
+    try {
+      await api("/trace-critic/run", { method: "POST" });
+      await load();
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function openReport(path) {
+    setBusy(`report-${path}`);
+    setError("");
+    try {
+      const report = await api("/reports/read", { method: "POST", body: JSON.stringify({ path }) });
+      setReportPreview(report);
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function evalCandidate(id) {
+    setBusy(`eval-${id}`);
+    setError("");
+    try {
+      await api(`/system-actions/${id}/eval`, { method: "POST" });
+      await load();
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function approve(id) {
+    setBusy(id);
+    setError("");
+    try {
+      await api(`/system-actions/${id}/approve`, { method: "POST" });
+      await load();
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function reject(id) {
+    setBusy(id);
+    setError("");
+    try {
+      await api(`/system-actions/${id}/reject`, { method: "POST", body: JSON.stringify({ reason: "Rejected from Operations tab" }) });
+      await load();
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setBusy("");
+    }
+  }
+
+  const candidates = data?.candidates || [];
+  const pending = candidates.filter(c => ["candidate", "needs_approval", "eval_ready", "eval_failed", "apply_failed"].includes(c.status || "candidate"));
+  const applied = candidates.filter(c => c.status === "applied");
+  const highRisk = pending.filter(c => c.risk === "high");
+  const mediumRisk = pending.filter(c => c.risk === "medium");
+  const lowActions = (data?.actions || []).filter(a => a.applied).slice(-10).reverse();
+  const errors = data?.errors || [];
+  const context = data?.context_summary || {};
+  const llm = data?.llm_summary || { total_calls: 0, by_task: {} };
+  const taskRows = Object.entries(llm.by_task || {}).sort((a, b) => (b[1].calls || 0) - (a[1].calls || 0));
+  const reports = data?.reports || [];
+  const historyActions = data?.actions || [];
+  const evalReports = reports.filter(r => r.name?.startsWith("eval-"));
+  const systemReports = reports.filter(r => r.name?.startsWith("system-loop-"));
+  const inferenceReports = reports.filter(r => r.name?.startsWith("inference-"));
+  const criticReports = reports.filter(r => r.name?.startsWith("trace-critic-"));
+  const VIEWS = [
+    ["queue", "Queue"],
+    ["evals", "Evals"],
+    ["telemetry", "Telemetry"],
+    ["reports", "Reports"],
+    ["history", "History"],
+  ];
+
+  return (
+    <div className="space-y-4 pb-10">
+      <div className="flex items-start justify-between gap-3">
+        <div>
+          <h2 className="text-lg font-semibold text-stone-900">Operations</h2>
+          <p className="text-xs text-stone-500 mt-1">System loop, inference telemetry, action queue, and runtime changes.</p>
+        </div>
+        <div className="flex gap-2">
+          <button onClick={runEvals} disabled={busy === "evals"}
+            className="px-3 py-1.5 rounded-lg border border-stone-200 text-xs text-stone-700 hover:bg-stone-50 disabled:opacity-50">
+            {busy === "evals" ? "Running…" : "Run evals"}
+          </button>
+          <button onClick={generateInference} disabled={busy === "inference"}
+            className="px-3 py-1.5 rounded-lg border border-stone-200 text-xs text-stone-700 hover:bg-stone-50 disabled:opacity-50">
+            {busy === "inference" ? "Writing…" : "Inference report"}
+          </button>
+          <button onClick={runTraceCritic} disabled={busy === "critic"}
+            className="px-3 py-1.5 rounded-lg border border-stone-200 text-xs text-stone-700 hover:bg-stone-50 disabled:opacity-50">
+            {busy === "critic" ? "Critiquing…" : "Trace critic"}
+          </button>
+          <button onClick={runLoop} disabled={busy === "loop"}
+            className="px-3 py-1.5 rounded-lg bg-stone-900 text-xs text-white hover:bg-stone-700 disabled:opacity-50">
+            {busy === "loop" ? "Running…" : "Run system loop"}
+          </button>
+        </div>
+      </div>
+
+      {error && <div className="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-700">{error}</div>}
+      {loading && <p className="text-sm text-stone-400 py-8 text-center">Loading operations…</p>}
+
+      {!loading && (
+        <>
+          <div className="grid grid-cols-2 md:grid-cols-4 gap-2">
+            <StatTile label="LLM calls" value={llm.total_calls || 0} />
+            <StatTile label="Pending actions" value={pending.length} tone={pending.length ? "amber" : "stone"} />
+            <StatTile label="Applied actions" value={applied.length} tone="emerald" />
+            <StatTile label="Errors" value={errors.length} tone={errors.length ? "red" : "stone"} />
+          </div>
+
+          <div className="flex gap-1 rounded-lg bg-stone-100 p-1">
+            {VIEWS.map(([id, label]) => (
+              <button key={id} onClick={() => setView(id)}
+                className={`flex-1 px-3 py-1.5 rounded-md text-xs font-medium transition-colors ${
+                  view === id ? "bg-white text-stone-900 shadow-sm" : "text-stone-500 hover:text-stone-700"
+                }`}>
+                {label}
+              </button>
+            ))}
+          </div>
+
+          {view === "queue" && <div className="rounded-xl border border-stone-200 bg-white overflow-hidden">
+            <div className="px-4 py-3 border-b border-stone-100 flex items-center justify-between">
+              <div>
+                <h3 className="text-sm font-semibold text-stone-900">Action Queue</h3>
+                <p className="text-xs text-stone-400 mt-0.5">Low risk auto-applies. Medium risk is staged for eval. High risk waits for your click.</p>
+              </div>
+              <span className="text-xs text-stone-400">{pending.length} pending</span>
+            </div>
+            <div className="divide-y divide-stone-100">
+              {pending.length === 0 && <p className="text-sm text-stone-400 text-center py-8">No pending system actions.</p>}
+              {pending.map(c => (
+                <div key={c.id} className="p-4">
+                  <div className="flex items-start justify-between gap-3">
+                    <div className="min-w-0">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <h4 className="text-sm font-semibold text-stone-900 truncate">{c.title || c.action}</h4>
+                        <RiskBadge risk={c.risk} />
+                        <StatusBadge status={c.status} />
+                      </div>
+                      <p className="text-xs text-stone-600 mt-1 leading-relaxed">{c.reason}</p>
+                      {c.proposed_change && Object.keys(c.proposed_change).length > 0 && (
+                        <pre className="mt-2 text-[11px] bg-stone-50 border border-stone-100 rounded-lg p-2 overflow-x-auto text-stone-600">{JSON.stringify(c.proposed_change, null, 2)}</pre>
+                      )}
+                      {c.requires_eval && (
+                        <p className={`text-[11px] mt-2 ${c.eval_status === "passed" ? "text-emerald-600" : c.eval_status === "failed" ? "text-red-600" : "text-amber-600"}`}>
+                          Eval gate: {c.eval_status || "not run"}
+                        </p>
+                      )}
+                    </div>
+                    <div className="flex gap-1 shrink-0">
+                      {c.requires_eval && (
+                        <button onClick={() => evalCandidate(c.id)} disabled={busy === `eval-${c.id}`}
+                          className="px-2.5 py-1.5 rounded-md border border-amber-200 text-amber-700 text-xs hover:bg-amber-50 disabled:opacity-50">
+                          Eval
+                        </button>
+                      )}
+                      {c.action !== "inspect_ingest_content_budget" && (
+                        <button onClick={() => approve(c.id)} disabled={busy === c.id}
+                          className="px-2.5 py-1.5 rounded-md bg-emerald-600 text-white text-xs hover:bg-emerald-700 disabled:opacity-50">
+                          Approve
+                        </button>
+                      )}
+                      <button onClick={() => reject(c.id)} disabled={busy === c.id}
+                        className="px-2.5 py-1.5 rounded-md border border-stone-200 text-stone-600 text-xs hover:bg-stone-50 disabled:opacity-50">
+                        Reject
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>}
+
+          {view === "evals" && <div className="grid md:grid-cols-2 gap-3">
+            <div className="rounded-xl border border-stone-200 bg-white p-4">
+              <h3 className="text-sm font-semibold text-stone-900">Risk Buckets</h3>
+              <div className="mt-3 space-y-2 text-xs">
+                <div className="flex justify-between"><span className="text-emerald-700">Low risk auto-applied</span><span className="font-medium text-stone-900">{lowActions.length}</span></div>
+                <div className="flex justify-between"><span className="text-amber-700">Medium staged/eval</span><span className="font-medium text-stone-900">{mediumRisk.length}</span></div>
+                <div className="flex justify-between"><span className="text-red-700">High needs approval</span><span className="font-medium text-stone-900">{highRisk.length}</span></div>
+              </div>
+              <div className="mt-3 space-y-1.5">
+                {lowActions.length === 0 ? (
+                  <p className="text-xs text-stone-400">No auto-applied actions yet.</p>
+                ) : lowActions.map((a, i) => (
+                  <p key={i} className="text-xs text-stone-600 truncate">Applied {a.action} · {a.reason}</p>
+                ))}
+              </div>
+            </div>
+
+            <div className="rounded-xl border border-stone-200 bg-white p-4">
+              <h3 className="text-sm font-semibold text-stone-900">Context Issues</h3>
+              <div className="mt-3 grid grid-cols-2 gap-2">
+                <StatTile label="Low coverage" value={context.low_source_coverage_events || 0} tone={context.low_source_coverage_events ? "amber" : "stone"} />
+                <StatTile label="Dropped chunks" value={context.chat_events_with_dropped_chunks || 0} tone={context.chat_events_with_dropped_chunks ? "amber" : "stone"} />
+              </div>
+            </div>
+          </div>}
+
+          {view === "evals" && <div className="rounded-xl border border-stone-200 bg-white p-4">
+            <h3 className="text-sm font-semibold text-stone-900">Eval Reports</h3>
+            <div className="mt-3 space-y-1.5">
+              {evalReports.length === 0 ? (
+                <p className="text-xs text-stone-400">No eval reports yet.</p>
+              ) : evalReports.map(r => (
+                <div key={r.path} className="flex items-center justify-between gap-2 text-xs">
+                  <button onClick={() => openReport(r.path)} className="text-stone-700 hover:text-stone-950 truncate text-left">{r.name}</button>
+                  <span className="text-stone-400 shrink-0">{(r.updated_at || "").slice(0, 10)}</span>
+                </div>
+              ))}
+            </div>
+          </div>}
+
+          {view === "telemetry" && <div className="rounded-xl border border-stone-200 bg-white overflow-hidden">
+            <div className="px-4 py-3 border-b border-stone-100">
+              <h3 className="text-sm font-semibold text-stone-900">Inference Tasks</h3>
+            </div>
+            <div className="divide-y divide-stone-100">
+              {taskRows.length === 0 && <p className="text-sm text-stone-400 text-center py-8">No LLM telemetry yet.</p>}
+              {taskRows.map(([task, row]) => (
+                <div key={task} className="px-4 py-3 grid grid-cols-[1fr_auto] gap-3 items-center">
+                  <div className="min-w-0">
+                    <p className="text-sm font-medium text-stone-800 truncate">{task}</p>
+                    <p className="text-xs text-stone-400">{row.calls} calls · median {row.median_ms}ms · fallback {(row.fallback_rate * 100).toFixed(1)}%</p>
+                  </div>
+                  <span className={`text-xs font-medium ${row.contract_failure_rate || row.error_rate ? "text-red-600" : "text-emerald-600"}`}>
+                    {((row.contract_failure_rate || 0) * 100).toFixed(1)}% contract fail
+                  </span>
+                </div>
+              ))}
+            </div>
+          </div>}
+
+          {view === "telemetry" && <div className="rounded-xl border border-stone-200 bg-white p-4">
+            <h3 className="text-sm font-semibold text-stone-900">Context Telemetry</h3>
+            <div className="mt-3 grid grid-cols-2 gap-2">
+              <StatTile label="Ingest events" value={context.ingest_events || 0} />
+              <StatTile label="Chat events" value={context.chat_events || 0} />
+              <StatTile label="Low coverage" value={context.low_source_coverage_events || 0} tone={context.low_source_coverage_events ? "amber" : "stone"} />
+              <StatTile label="Dropped chunks" value={context.chat_events_with_dropped_chunks || 0} tone={context.chat_events_with_dropped_chunks ? "amber" : "stone"} />
+            </div>
+          </div>}
+
+          {view === "telemetry" && <div className="rounded-xl border border-stone-200 bg-white p-4">
+            <h3 className="text-sm font-semibold text-stone-900">Recent Errors</h3>
+            <div className="mt-3 space-y-2">
+              {errors.length === 0 ? (
+                <p className="text-xs text-stone-400">No recent LLM errors or contract failures.</p>
+              ) : errors.slice(-8).reverse().map((e, i) => (
+                <div key={i} className="text-xs border border-red-100 bg-red-50 rounded-lg p-2">
+                  <p className="font-medium text-red-800">{e.task} · {e.model}</p>
+                  <p className="text-red-700 mt-0.5">{e.error || "contract failed"}</p>
+                </div>
+              ))}
+            </div>
+          </div>}
+
+          {view === "reports" && <div className="grid md:grid-cols-4 gap-3">
+            <div className="rounded-xl border border-stone-200 bg-white p-4">
+              <h3 className="text-sm font-semibold text-stone-900">Inference Reports</h3>
+              <div className="mt-3 space-y-1.5">
+                {inferenceReports.length === 0 ? <p className="text-xs text-stone-400">None yet.</p> : inferenceReports.map(r => (
+                  <button key={r.path} onClick={() => openReport(r.path)} className="block w-full text-left text-xs text-stone-700 hover:text-stone-950 truncate">{r.name}</button>
+                ))}
+              </div>
+            </div>
+            <div className="rounded-xl border border-stone-200 bg-white p-4">
+              <h3 className="text-sm font-semibold text-stone-900">System Reports</h3>
+              <div className="mt-3 space-y-1.5">
+                {systemReports.length === 0 ? <p className="text-xs text-stone-400">None yet.</p> : systemReports.map(r => (
+                  <button key={r.path} onClick={() => openReport(r.path)} className="block w-full text-left text-xs text-stone-700 hover:text-stone-950 truncate">{r.name}</button>
+                ))}
+              </div>
+            </div>
+            <div className="rounded-xl border border-stone-200 bg-white p-4">
+              <h3 className="text-sm font-semibold text-stone-900">Eval Reports</h3>
+              <div className="mt-3 space-y-1.5">
+                {evalReports.length === 0 ? <p className="text-xs text-stone-400">None yet.</p> : evalReports.map(r => (
+                  <button key={r.path} onClick={() => openReport(r.path)} className="block w-full text-left text-xs text-stone-700 hover:text-stone-950 truncate">{r.name}</button>
+                ))}
+              </div>
+            </div>
+            <div className="rounded-xl border border-stone-200 bg-white p-4">
+              <h3 className="text-sm font-semibold text-stone-900">Trace Critic</h3>
+              <div className="mt-3 space-y-1.5">
+                {criticReports.length === 0 ? <p className="text-xs text-stone-400">None yet.</p> : criticReports.map(r => (
+                  <button key={r.path} onClick={() => openReport(r.path)} className="block w-full text-left text-xs text-stone-700 hover:text-stone-950 truncate">{r.name}</button>
+                ))}
+              </div>
+            </div>
+          </div>}
+
+          {view === "reports" && reportPreview && <div className="rounded-xl border border-stone-200 bg-white overflow-hidden">
+            <div className="px-4 py-3 border-b border-stone-100 flex items-center justify-between gap-3">
+              <div className="min-w-0">
+                <h3 className="text-sm font-semibold text-stone-900 truncate">{reportPreview.name}</h3>
+                <p className="text-xs text-stone-400 truncate">{reportPreview.path}</p>
+              </div>
+              <button onClick={() => setReportPreview(null)} className="px-2.5 py-1.5 rounded-md border border-stone-200 text-xs text-stone-600 hover:bg-stone-50">Close</button>
+            </div>
+            <div className="p-4 max-h-[520px] overflow-auto">
+              <div className="prose prose-stone prose-sm max-w-none"
+                dangerouslySetInnerHTML={{ __html: DOMPurify.sanitize(marked.parse(reportPreview.content || "")) }} />
+            </div>
+          </div>}
+
+          {view === "history" && <div className="rounded-xl border border-stone-200 bg-white overflow-hidden">
+            <div className="px-4 py-3 border-b border-stone-100">
+              <h3 className="text-sm font-semibold text-stone-900">Action History</h3>
+            </div>
+            <div className="divide-y divide-stone-100">
+              {historyActions.length === 0 && <p className="text-sm text-stone-400 text-center py-8">No system actions yet.</p>}
+              {historyActions.slice().reverse().map((a, i) => (
+                <div key={i} className="px-4 py-3 text-xs">
+                  <div className="flex items-center justify-between gap-3">
+                    <span className="font-medium text-stone-800">{a.action}</span>
+                    <span className={a.applied ? "text-emerald-600" : "text-stone-400"}>{a.applied ? "applied" : "not applied"}</span>
+                  </div>
+                  <p className="text-stone-500 mt-1">{a.reason}</p>
+                </div>
+              ))}
+            </div>
+          </div>}
+        </>
+      )}
+    </div>
+  );
+}
+
 // ── APP SHELL ─────────────────────────────────────────────────────────────────
 
 // ── INTERVIEW TAB ─────────────────────────────────────────────────────────────
@@ -3779,6 +4229,9 @@ const TABS = [
   { id: "dashboard", label: "Dashboard", icon: (
     <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z"/></svg>
   )},
+  { id: "operations", label: "Operations", icon: (
+    <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M10.5 6h9m-9 6h9m-9 6h9M4.5 6h.01M4.5 12h.01M4.5 18h.01"/></svg>
+  )},
 ];
 
 const FOCUS_PRIMARY_TABS = [
@@ -3790,6 +4243,7 @@ const FOCUS_SECONDARY_TABS = [
   { id: "interview", label: "Practice" },
   { id: "browse", label: "Library" },
   { id: "dashboard", label: "Insights" },
+  { id: "operations", label: "Ops" },
 ];
 
 const FOCUS_ONBOARDING_KEY = "sw_focus_mode_onboarded";
@@ -3939,6 +4393,7 @@ export default function App() {
             </div>
           )}
           {tab === "dashboard" && <DashboardTab onNavigateToConcept={() => setTab("browse")} />}
+          {tab === "operations" && <OperationsTab />}
         </div>
       </main>
     </div>

@@ -47,9 +47,12 @@ import llm_client
 import memory_store
 import preference_memory
 import queue_manager
+import system_loop
 import tag_classifier
+import telemetry
 import vault_reader
 import wiki_writer
+import eval_harness
 
 # ── app setup ────────────────────────────────────────────────────────────────
 
@@ -86,6 +89,31 @@ LINT_CACHE_TTL_SECONDS  = 86400  # 24 h — lint report cache validity
 WEEKLY_ANALYSIS_INTERVAL_SECONDS = 3600  # scheduler checks every hour
 
 # ─────────────────────────────────────────────────────────────────────────────
+
+def _chat_context_budget() -> int:
+    try:
+        settings = system_loop.load_runtime_settings().get("settings", {})
+        value = int(settings.get("chat_context_budget") or 0)
+        if value >= 1000:
+            return value
+    except Exception:
+        pass
+    try:
+        return int(os.environ.get("RAG_CONTEXT_BUDGET", RAG_CONTEXT_BUDGET))
+    except ValueError:
+        return RAG_CONTEXT_BUDGET
+
+
+def _ingest_source_budget(default_budget: int) -> int:
+    try:
+        settings = system_loop.load_runtime_settings().get("settings", {})
+        value = int(settings.get("ingest_source_budget") or 0)
+        if 4000 <= value <= 80000:
+            return max(default_budget, value)
+    except Exception:
+        pass
+    return default_budget
+
 
 VALID_TAGS = [
     # AI / ML
@@ -184,6 +212,14 @@ class SaveAnswerRequest(BaseModel):
     answer: str
     sources: list = []
     pages_read: list = []
+
+
+class RejectSystemActionRequest(BaseModel):
+    reason: str = ""
+
+
+class ReportPathRequest(BaseModel):
+    path: str
 
 
 class LintRequest(BaseModel):
@@ -1079,6 +1115,26 @@ def _extract_with_sonnet(text: str, images: Optional[list], source_url: str,
         content_budget = 3000
         max_out = 800
 
+    content_budget = _ingest_source_budget(content_budget)
+    source_chars_total = len(text or "")
+    source_chars_used = min(source_chars_total, content_budget)
+    telemetry.log_context_event(
+        "ingest_context",
+        {
+            "task": "ingest_extract",
+            "source_url": source_url,
+            "depth": depth,
+            "has_images": has_images,
+            "source_chars_total": source_chars_total,
+            "source_chars_used": source_chars_used,
+            "source_chars_dropped": max(0, source_chars_total - source_chars_used),
+            "source_coverage_ratio": round(source_chars_used / source_chars_total, 4) if source_chars_total else 1.0,
+            "content_budget": content_budget,
+            "existing_pages_total": len(existing_pages),
+            "existing_pages_used": len(relevant_pages),
+        },
+    )
+
     user_notes_block = (
         f"\nStudent's own understanding (build on this, correct gaps, don't repeat what they already know):\n"
         f"\"{user_notes}\"\n"
@@ -1955,31 +2011,74 @@ async def chat(req: ChatRequest):
     if not relevant_names:
         relevant_names = vault_reader.find_relevant_pages(req.message)
 
+    context_budget = _chat_context_budget()
     context_parts = []
+    retrieved_chunks_total = 0
+    retrieved_chunks_used = 0
+    retrieved_chunks_dropped = 0
+    context_chars_dropped = 0
     if memory_hits:
         for hit in memory_hits[:RAG_TOP_K]:
             snippet_lines = [f"- {snippet}" for snippet in hit.get("snippets", []) if snippet]
+            retrieved_chunks_total += len(snippet_lines)
             headings = ", ".join(hit.get("headings", []))
-            context_parts.append(
-                "\n".join(
-                    part
-                    for part in [
-                        f"=== [[{hit['page_name']}]] ({hit['folder']}) ===",
-                        f"Current understanding: {hit.get('current_understanding', '')}".strip(),
-                        f"Relevant headings: {headings}" if headings else "",
-                        *snippet_lines,
-                    ]
-                    if part
-                )
+            section = "\n".join(
+                part
+                for part in [
+                    f"=== [[{hit['page_name']}]] ({hit['folder']}) ===",
+                    f"Current understanding: {hit.get('current_understanding', '')}".strip(),
+                    f"Relevant headings: {headings}" if headings else "",
+                    *snippet_lines,
+                ]
+                if part
+            )
+            current_len = len("\n\n".join(context_parts))
+            remaining = context_budget - current_len - (2 if context_parts else 0)
+            if remaining <= 0:
+                retrieved_chunks_dropped += len(snippet_lines)
+                context_chars_dropped += len(section)
+                continue
+            if len(section) > remaining:
+                context_parts.append(section[:remaining].rstrip())
+                retrieved_chunks_used += len(snippet_lines)
+                context_chars_dropped += len(section) - remaining
+                if snippet_lines:
+                    retrieved_chunks_dropped += 1
+                break
+            context_parts.append(section)
+            retrieved_chunks_used += len(snippet_lines)
+        if len(memory_hits) > RAG_TOP_K:
+            retrieved_chunks_dropped += sum(
+                len(hit.get("snippets", []) or []) for hit in memory_hits[RAG_TOP_K:]
             )
     else:
+        retrieved_chunks_total = len(relevant_names)
+        retrieved_chunks_dropped = max(0, len(relevant_names) - RAG_TOP_K)
         pages_content = vault_reader.read_pages_content(relevant_names[:RAG_TOP_K])
         n_pages = len(pages_content)
-        per_page = RAG_CONTEXT_BUDGET // n_pages if n_pages else RAG_CONTEXT_BUDGET
+        per_page = context_budget // n_pages if n_pages else context_budget
         for name, content in pages_content.items():
             body = _strip_frontmatter(content)
-            context_parts.append(f"=== [[{name}]] ===\n{body[:per_page]}")
+            used_body = body[:per_page]
+            context_parts.append(f"=== [[{name}]] ===\n{used_body}")
+            retrieved_chunks_used += 1
+            context_chars_dropped += max(0, len(body) - len(used_body))
     context = "\n\n".join(context_parts) if context_parts else "No matching pages found yet."
+    telemetry.log_context_event(
+        "chat_context",
+        {
+            "task": "chat_answer",
+            "query": req.message,
+            "memory_hits": len(memory_hits),
+            "pages_read": relevant_names[:RAG_TOP_K],
+            "retrieved_chunks_total": retrieved_chunks_total,
+            "retrieved_chunks_used": retrieved_chunks_used,
+            "retrieved_chunks_dropped": retrieved_chunks_dropped,
+            "context_chars_used": len(context),
+            "context_chars_dropped": context_chars_dropped,
+            "context_budget": context_budget,
+        },
+    )
 
     index_content = vault_reader.read_index()
     chat_preferences = preference_memory.chat_hints()
@@ -2600,12 +2699,14 @@ traces_analyzed: {len(traces)}
     insights_path = vault_path / "_wiki" / "meta" / "system-insights.md"
     insights_path.parent.mkdir(parents=True, exist_ok=True)
     _atomic_write_path(insights_path, content)
+    routed = system_loop.run_system_loop(auto_apply=True)
 
     return {
         "success": True,
         "traces_analyzed": len(traces),
         "insights": insights,
         "file_written": str(insights_path.relative_to(vault_path)),
+        "system_loop": routed,
     }
 
 
@@ -2644,6 +2745,126 @@ async def get_system_insights():
         "traces_count": traces_count,
         "sections": sections,
         "content": content,
+    }
+
+
+@app.post("/inference-report")
+async def generate_inference_report():
+    """Generate a Markdown inference report from runtime LLM/context telemetry."""
+    return telemetry.generate_inference_report()
+
+
+@app.post("/system-loop/run")
+async def run_system_loop(auto_apply: bool = True):
+    """
+    Generate inference + system-loop reports and route bounded system improvements.
+
+    Low-risk repeated correction preferences can be activated automatically.
+    Runtime model-routing overrides require enough critical-task telemetry.
+    """
+    return system_loop.run_system_loop(auto_apply=auto_apply)
+
+
+@app.get("/system-loop/actions")
+async def get_system_loop_actions(limit: int = 100):
+    """Return recent system-loop routed actions."""
+    return {"actions": telemetry.read_system_actions(limit=limit)}
+
+
+@app.get("/system-actions")
+async def get_system_actions(status: Optional[str] = None):
+    """Return staged/applied/rejected system action candidates."""
+    return {"candidates": system_loop.list_action_candidates(status=status)}
+
+
+@app.post("/trace-critic/run")
+async def run_trace_critic():
+    """Run the bounded LLM trace critic and stage only supported action candidates."""
+    actions: list[dict] = []
+    return system_loop.run_trace_critic(actions)
+
+
+@app.post("/system-actions/{candidate_id}/approve")
+async def approve_system_action(candidate_id: str):
+    try:
+        return {"candidate": system_loop.approve_action_candidate(candidate_id)}
+    except KeyError as e:
+        raise HTTPException(404, str(e))
+
+
+@app.post("/system-actions/{candidate_id}/reject")
+async def reject_system_action(candidate_id: str, req: RejectSystemActionRequest):
+    try:
+        return {"candidate": system_loop.reject_action_candidate(candidate_id, req.reason)}
+    except KeyError as e:
+        raise HTTPException(404, str(e))
+
+
+@app.post("/system-actions/{candidate_id}/eval")
+async def eval_system_action(candidate_id: str):
+    try:
+        return system_loop.run_candidate_eval(candidate_id)
+    except KeyError as e:
+        raise HTTPException(404, str(e))
+
+
+@app.post("/evals/run")
+async def run_evals():
+    """Run the current replay eval suite and write an eval report."""
+    report = eval_harness.run_eval()
+    actions = system_loop.route_eval_findings(report)
+    return {"eval": report, "actions": actions}
+
+
+@app.post("/reports/read")
+async def read_report(req: ReportPathRequest):
+    report_dir = telemetry.reports_dir().resolve()
+    try:
+        path = Path(req.path).resolve()
+    except OSError:
+        raise HTTPException(400, "Invalid report path")
+    if report_dir not in path.parents or path.suffix != ".md" or not path.exists():
+        raise HTTPException(404, "Report not found")
+    return {
+        "name": path.name,
+        "path": str(path),
+        "content": path.read_text(encoding="utf-8"),
+        "updated_at": datetime.fromtimestamp(path.stat().st_mtime).isoformat(),
+    }
+
+
+@app.get("/operations-overview")
+async def operations_overview():
+    llm_summary = telemetry.summarize_llm_calls()
+    context_summary = telemetry.summarize_context_events()
+    actions = telemetry.read_system_actions(limit=50)
+    candidates = system_loop.list_action_candidates()
+    errors = [
+        row for row in telemetry.read_llm_calls(limit=200)
+        if row.get("error") or row.get("contract_ok") is False
+    ][-50:]
+    settings = system_loop.load_runtime_settings()
+    overrides = system_loop.load_runtime_overrides()
+    report_dir = telemetry.reports_dir()
+    reports = []
+    if report_dir.exists():
+        for path in sorted(report_dir.glob("*.md"), key=lambda p: p.stat().st_mtime, reverse=True)[:20]:
+            reports.append({
+                "name": path.name,
+                "path": str(path),
+                "updated_at": datetime.fromtimestamp(path.stat().st_mtime).isoformat(),
+                "kind": path.name.split("-", 1)[0],
+            })
+    return {
+        "llm_summary": llm_summary,
+        "context_summary": context_summary,
+        "eval_summary": None,
+        "actions": actions,
+        "candidates": candidates,
+        "errors": errors,
+        "runtime_settings": settings,
+        "runtime_overrides": overrides,
+        "reports": reports,
     }
 
 

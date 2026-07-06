@@ -6,12 +6,16 @@ to Qwen (or other OpenAI-compatible providers) without changing app code.
 """
 import json
 import os
+import time
 from typing import Any, Optional
 
 import httpx
 
+import telemetry
+
 CRITICAL_TASKS = {
     "INGEST_EXTRACT",
+    "ANALYZE_TRACES",
     "LINT_SCAN",
     "LINT_JSON_FIX",
     "CONSOLIDATE_PAGES",
@@ -36,7 +40,20 @@ def _has_image_blocks(messages: list[dict[str, Any]]) -> bool:
 
 def _provider_for_task(task: str) -> str:
     key = _task_key(task)
-    return os.environ.get(f"LLM_PROVIDER_{key}", os.environ.get("LLM_PROVIDER", "anthropic")).strip().lower()
+    explicit = os.environ.get(f"LLM_PROVIDER_{key}", "").strip().lower()
+    if explicit:
+        return explicit
+    try:
+        import system_loop
+        overrides = system_loop.load_runtime_overrides()
+        route = (overrides.get("routes") or {}).get(key, {})
+        if overrides.get("enabled", True) and isinstance(route, dict):
+            provider = str(route.get("provider", "")).strip().lower()
+            if provider:
+                return provider
+    except Exception:
+        pass
+    return os.environ.get("LLM_PROVIDER", "anthropic").strip().lower()
 
 
 def _default_model_for_provider(provider: str, has_images: bool) -> str:
@@ -284,9 +301,11 @@ def complete(
     Execute one completion call for the given task.
     Task controls provider/model routing via env vars.
     """
+    started = time.perf_counter()
     has_images = _has_image_blocks(messages)
     key = _task_key(task)
     provider = _provider_for_task(task)
+    requested_provider = provider
 
     # Ollama can't handle images — route vision tasks directly to Anthropic
     # Cloud providers (openai_compat covers Gemini/OpenAI/DeepSeek) handle vision themselves
@@ -296,6 +315,28 @@ def complete(
     resolved_model = _model_for_task(task, provider, model, has_images)
     primary_err: Optional[Exception] = None
     primary_text = ""
+    input_chars = telemetry.estimate_chars({"system": system, "messages": messages})
+
+    def _log(*, text: str = "", fallback_used: bool = False, fallback_model: str = "", contract_ok: bool = False, error: str = "") -> None:
+        telemetry.log_llm_call(
+            {
+                "task": key,
+                "provider": provider,
+                "requested_provider": requested_provider,
+                "model": resolved_model,
+                "fallback_model": fallback_model,
+                "duration_ms": round((time.perf_counter() - started) * 1000, 1),
+                "input_chars": input_chars,
+                "output_chars": len(text or ""),
+                "max_tokens": max_tokens,
+                "expect_json": bool(expect_json),
+                "required_json_keys": required_json_keys or [],
+                "has_images": has_images,
+                "contract_ok": contract_ok,
+                "fallback_used": fallback_used,
+                "error": error,
+            }
+        )
 
     try:
         if provider == "anthropic":
@@ -319,25 +360,35 @@ def complete(
         primary_err = e
 
     if primary_text and _valid_contract(primary_text, expect_json, required_json_keys):
+        _log(text=primary_text, contract_ok=True)
         return primary_text
 
     if provider == "anthropic" or not _fallback_enabled(task):
         if primary_err:
+            _log(text=primary_text, contract_ok=False, error=f"{type(primary_err).__name__}: {primary_err}")
             raise primary_err
+        _log(text=primary_text, contract_ok=False, error="LLM contract failed")
         raise RuntimeError(f"LLM contract failed for task={key} provider={provider} model={resolved_model}")
 
     fallback_model = os.environ.get(f"LLM_FALLBACK_MODEL_{key}", "").strip() or _model_for_task(
         task, "anthropic", model, has_images
     )
-    fallback_text = _anthropic_complete(
-        model=fallback_model,
-        max_tokens=max_tokens,
-        messages=messages,
-        system=system,
-        api_key=api_key,
-    )
+    try:
+        fallback_text = _anthropic_complete(
+            model=fallback_model,
+            max_tokens=max_tokens,
+            messages=messages,
+            system=system,
+            api_key=api_key,
+        )
+    except Exception as fallback_err:
+        err = f"{type(fallback_err).__name__}: {fallback_err}"
+        _log(text=primary_text, fallback_used=True, fallback_model=fallback_model, contract_ok=False, error=err)
+        raise
     if _valid_contract(fallback_text, expect_json, required_json_keys):
+        _log(text=fallback_text, fallback_used=True, fallback_model=fallback_model, contract_ok=True)
         return fallback_text
+    _log(text=fallback_text, fallback_used=True, fallback_model=fallback_model, contract_ok=False, error="LLM fallback contract failed")
     raise RuntimeError(
         f"LLM fallback contract failed for task={key} provider={provider}→anthropic model={resolved_model}→{fallback_model}"
     )

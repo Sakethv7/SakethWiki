@@ -102,6 +102,7 @@ LLM_PROVIDER_LINT_JSON_FIX=anthropic
 LLM_PROVIDER_CONSOLIDATE_PAGES=anthropic
 LLM_PROVIDER_KNOWLEDGE_GAPS=anthropic
 LLM_PROVIDER_EVOLUTION_CLASSIFY=anthropic
+LLM_PROVIDER_ANALYZE_TRACES=anthropic
 
 # Keep embeddings explicit. The Markdown vault and SQLite lexical index work
 # without vectors; semantic embeddings are an opt-in derived index.
