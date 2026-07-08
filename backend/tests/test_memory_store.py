@@ -396,6 +396,37 @@ def test_telemetry_summarizes_llm_cost(monkeypatch, tmp_path):
     assert summary["recent_expensive_calls"][0]["task"] == "INGEST_EXTRACT"
 
 
+def test_telemetry_backfills_legacy_char_usage(monkeypatch, tmp_path):
+    vault = tmp_path / "vault"
+    (vault / "_wiki" / "meta").mkdir(parents=True)
+    monkeypatch.setenv("VAULT_PATH", str(vault))
+
+    telemetry.log_llm_call(
+        {
+            "task": "IMAGE_CAPTION",
+            "provider": "openai_compat",
+            "requested_provider": "openai_compat",
+            "model": "gemini-2.5-flash",
+            "duration_ms": 3200,
+            "input_chars": 4000,
+            "output_chars": 800,
+            "expect_json": True,
+            "contract_ok": False,
+            "fallback_used": False,
+            "error": "LLM contract failed",
+        }
+    )
+
+    summary = telemetry.summarize_llm_calls()
+    task = summary["by_task"]["IMAGE_CAPTION"]
+
+    assert summary["total_tokens"] == 1200
+    assert summary["total_cost_usd"] > 0
+    assert task["estimated_cost_rate"] == 1.0
+    assert task["contract_failure_rate"] == 1.0
+    assert summary["recent_expensive_calls"][0]["cost_estimated"] is True
+
+
 def test_image_caption_response_parser_handles_json_and_prose():
     parsed = main._parse_image_caption_response(
         '```json\n{"slug": "Latency Dashboard", "caption": "A dashboard showing ingest latency."}\n```',

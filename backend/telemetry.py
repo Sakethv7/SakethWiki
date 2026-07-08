@@ -138,6 +138,61 @@ def _percentile(values: list[float], pct: float) -> float:
     return values[max(0, min(idx, len(values) - 1))]
 
 
+def _estimate_tokens_from_chars(chars: int) -> int:
+    return max(1, int(round(max(chars, 0) / 4)))
+
+
+def _default_price_per_1m(provider: str, model: str, direction: str) -> float:
+    m = model.lower()
+    p = provider.lower()
+    if p == "ollama":
+        return 0.0
+    if "haiku" in m:
+        return 1.0 if direction == "input" else 5.0
+    if "sonnet" in m:
+        return 3.0 if direction == "input" else 15.0
+    if "gpt-4o-mini" in m:
+        return 0.15 if direction == "input" else 0.60
+    if "gemini-2.5-flash" in m or "gemini-1.5-flash" in m:
+        return 0.30 if direction == "input" else 2.50
+    if "qwen-vl-plus" in m or "qwen-plus" in m:
+        return 0.40 if direction == "input" else 1.20
+    return 0.0
+
+
+def _effective_usage(row: dict[str, Any]) -> dict[str, Any]:
+    input_tokens = int(row.get("input_tokens", 0) or 0)
+    output_tokens = int(row.get("output_tokens", 0) or 0)
+    cache_creation_tokens = int(row.get("cache_creation_input_tokens", 0) or 0)
+    cache_read_tokens = int(row.get("cache_read_input_tokens", 0) or 0)
+    total_tokens = int(row.get("total_tokens", 0) or 0)
+    cost = float(row.get("cost_usd", 0) or 0)
+    estimated = bool(row.get("cost_estimated"))
+
+    if total_tokens <= 0:
+        input_tokens = input_tokens or _estimate_tokens_from_chars(int(row.get("input_chars", 0) or 0))
+        output_tokens = output_tokens or _estimate_tokens_from_chars(int(row.get("output_chars", 0) or 0))
+        total_tokens = input_tokens + output_tokens + cache_creation_tokens + cache_read_tokens
+        estimated = True
+
+    if cost <= 0 and total_tokens > 0:
+        provider = str(row.get("effective_provider") or row.get("provider") or "unknown")
+        model = str(row.get("effective_model") or row.get("model") or "unknown")
+        input_price = _default_price_per_1m(provider, model, "input")
+        output_price = _default_price_per_1m(provider, model, "output")
+        billable_input = input_tokens + cache_creation_tokens + (cache_read_tokens * 0.10)
+        cost = ((billable_input / 1_000_000) * input_price) + ((output_tokens / 1_000_000) * output_price)
+        estimated = True
+
+    return {
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "total_tokens": total_tokens,
+        "cost_usd": cost,
+        "cost_estimated": estimated,
+    }
+
+
 def summarize_llm_calls(calls: Iterable[dict[str, Any]] | None = None) -> dict[str, Any]:
     rows = list(calls) if calls is not None else read_llm_calls()
     by_task: dict[str, list[dict[str, Any]]] = defaultdict(list)
@@ -155,9 +210,10 @@ def summarize_llm_calls(calls: Iterable[dict[str, Any]] | None = None) -> dict[s
         contract_failures = sum(1 for r in task_rows if r.get("contract_ok") is False)
         errors = sum(1 for r in task_rows if r.get("error"))
         fallbacks = sum(1 for r in task_rows if r.get("fallback_used"))
-        total_cost = sum(float(r.get("cost_usd", 0) or 0) for r in task_rows)
-        total_tokens = sum(int(r.get("total_tokens", 0) or 0) for r in task_rows)
-        estimated_costs = sum(1 for r in task_rows if r.get("cost_estimated"))
+        usage_rows = [_effective_usage(r) for r in task_rows]
+        total_cost = sum(float(r.get("cost_usd", 0) or 0) for r in usage_rows)
+        total_tokens = sum(int(r.get("total_tokens", 0) or 0) for r in usage_rows)
+        estimated_costs = sum(1 for r in usage_rows if r.get("cost_estimated"))
         task_summary[task] = {
             "calls": len(task_rows),
             "median_ms": round(statistics.median(durations), 1) if durations else 0,
@@ -180,9 +236,10 @@ def summarize_llm_calls(calls: Iterable[dict[str, Any]] | None = None) -> dict[s
         contract_failures = sum(1 for r in route_rows if r.get("contract_ok") is False)
         errors = sum(1 for r in route_rows if r.get("error"))
         fallbacks = sum(1 for r in route_rows if r.get("fallback_used"))
-        total_cost = sum(float(r.get("cost_usd", 0) or 0) for r in route_rows)
-        total_tokens = sum(int(r.get("total_tokens", 0) or 0) for r in route_rows)
-        estimated_costs = sum(1 for r in route_rows if r.get("cost_estimated"))
+        usage_rows = [_effective_usage(r) for r in route_rows]
+        total_cost = sum(float(r.get("cost_usd", 0) or 0) for r in usage_rows)
+        total_tokens = sum(int(r.get("total_tokens", 0) or 0) for r in usage_rows)
+        estimated_costs = sum(1 for r in usage_rows if r.get("cost_estimated"))
         key = f"{task}::{provider}::{model}"
         route_summary[key] = {
             "task": task,
@@ -201,9 +258,14 @@ def summarize_llm_calls(calls: Iterable[dict[str, Any]] | None = None) -> dict[s
             "estimated_cost_rate": round(estimated_costs / len(route_rows), 4) if route_rows else 0,
         }
 
-    total_cost = sum(float(r.get("cost_usd", 0) or 0) for r in rows)
-    total_tokens = sum(int(r.get("total_tokens", 0) or 0) for r in rows)
-    recent_expensive = sorted(rows[-200:], key=lambda r: float(r.get("cost_usd", 0) or 0), reverse=True)[:20]
+    usage_by_id = {id(r): _effective_usage(r) for r in rows}
+    total_cost = sum(float(r.get("cost_usd", 0) or 0) for r in usage_by_id.values())
+    total_tokens = sum(int(r.get("total_tokens", 0) or 0) for r in usage_by_id.values())
+    recent_expensive = sorted(
+        [{**r, **usage_by_id[id(r)]} for r in rows[-200:]],
+        key=lambda r: float(r.get("cost_usd", 0) or 0),
+        reverse=True,
+    )[:20]
 
     return {
         "total_calls": len(rows),
