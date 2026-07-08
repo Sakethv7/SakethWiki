@@ -237,6 +237,7 @@ def summarize_llm_calls(calls: Iterable[dict[str, Any]] | None = None) -> dict[s
         estimated_costs = sum(1 for r in usage_rows if r.get("cost_estimated"))
         task_summary[task] = {
             "calls": len(task_rows),
+            "time_range": _time_range(task_rows),
             "median_ms": round(statistics.median(durations), 1) if durations else 0,
             "p95_ms": round(_percentile(durations, 95), 1),
             "contract_failure_rate": round(contract_failures / len(task_rows), 4) if task_rows else 0,
@@ -266,6 +267,7 @@ def summarize_llm_calls(calls: Iterable[dict[str, Any]] | None = None) -> dict[s
             "task": task,
             "provider": provider,
             "model": model,
+            "time_range": _time_range(route_rows),
             "calls": len(route_rows),
             "median_ms": round(statistics.median(durations), 1) if durations else 0,
             "p95_ms": round(_percentile(durations, 95), 1),

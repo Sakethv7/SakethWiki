@@ -3581,8 +3581,12 @@ function DashboardTab({ onNavigateToConcept }) {
     ? `${opsRange.first_ts.slice(0, 10)} to ${opsRange.last_ts.slice(0, 10)}`
     : "no log rows";
   const contractFailureLabel = worstContractTask
-    ? `${worstContractTask[0]} ${Math.round((worstContractTask[1].contract_failure_rate || 0) * 100)}%`
+    ? `${worstContractTask[0]} ${Math.round((worstContractTask[1].contract_failure_rate || 0) * 100)}% · ${worstContractTask[1].calls || 0} calls`
     : "none";
+  const contractFailureRange = worstContractTask?.[1]?.time_range;
+  const contractFailureDetail = contractFailureRange?.first_ts && contractFailureRange?.last_ts
+    ? `${contractFailureRange.first_ts.slice(0, 10)} to ${contractFailureRange.last_ts.slice(0, 10)}`
+    : "";
 
   return (
     <div className="space-y-5 pb-8">
@@ -3617,6 +3621,9 @@ function DashboardTab({ onNavigateToConcept }) {
           <p className="text-sm font-semibold text-stone-800 mt-0.5">{stats.total_rejected || 0} rejected / skipped in {periodDays}d</p>
         </div>
       </div>
+      <p className="text-[11px] text-stone-400 px-1">
+        Approval rate = approved ingest decisions divided by approved plus rejected decisions in the last {periodDays} days.
+      </p>
 
       {/* Recently Read */}
       <RecentlyRead />
@@ -3638,6 +3645,7 @@ function DashboardTab({ onNavigateToConcept }) {
             <div className="rounded-lg border border-stone-200 bg-stone-50 px-3 py-2 min-w-0">
               <p className="text-[10px] uppercase tracking-wide text-stone-400">Contract risk</p>
               <p className={`text-sm font-semibold mt-0.5 truncate ${worstContractTask ? "text-red-700" : "text-emerald-700"}`}>{contractFailureLabel}</p>
+              {contractFailureDetail && <p className="text-[10px] text-stone-400 mt-0.5">{contractFailureDetail}</p>}
             </div>
             <div className="rounded-lg border border-stone-200 bg-stone-50 px-3 py-2 min-w-0">
               <p className="text-[10px] uppercase tracking-wide text-stone-400">Slowest ingest stage</p>

@@ -421,7 +421,7 @@ def complete(
     primary_usage: dict[str, Any] = {}
     input_chars = telemetry.estimate_chars({"system": system, "messages": messages})
 
-    def _log(*, text: str = "", usage: dict[str, Any] | None = None, fallback_used: bool = False, fallback_model: str = "", contract_ok: bool = False, error: str = "") -> None:
+    def _log(*, text: str = "", usage: Optional[dict[str, Any]] = None, fallback_used: bool = False, fallback_model: str = "", contract_ok: bool = False, error: str = "") -> None:
         effective_provider = "anthropic" if fallback_model else provider
         effective_model = fallback_model or resolved_model
         cost = _usage_with_estimates(effective_provider, effective_model, usage or {}, input_chars, len(text or ""))

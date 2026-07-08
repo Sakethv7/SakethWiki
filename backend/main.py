@@ -5028,6 +5028,7 @@ async def store_image(req: IngestRequest):
 
     today = datetime.now().strftime("%Y-%m-%d")
     saved = []
+    max_caption_image_chars = int(os.environ.get("IMAGE_CAPTION_MAX_BASE64_CHARS", "300000"))
 
     for i, img in enumerate(all_images):
         media_type = img.get("mediaType", "image/png")
@@ -5039,21 +5040,27 @@ async def store_image(req: IngestRequest):
         # Best-effort vision caption. This is optional asset metadata, so avoid
         # strict JSON contracts that create noisy reliability failures.
         started = time.perf_counter()
-        try:
-            caption_raw = llm_client.complete(
-                task="image_caption",
-                model=None,  # vision model selected by provider routing
-                max_tokens=120,
-                messages=[{"role": "user", "content": [
-                    {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": img["data"]}},
-                    {"type": "text", "text": 'Describe this image for a personal knowledge vault. Prefer JSON like {"slug":"2-4-word-kebab-slug","caption":"one sentence"}, but a short one-line caption is acceptable.'},
-                ]}],
-                expect_json=False,
-            ).strip()
-            meta = _parse_image_caption_response(caption_raw, index=i)
-        except Exception:
+        if len(img.get("data", "")) > max_caption_image_chars:
             meta = {"slug": _fallback_image_slug(i), "caption": ""}
+        else:
+            try:
+                caption_raw = llm_client.complete(
+                    task="image_caption",
+                    model=None,  # vision model selected by provider routing
+                    max_tokens=120,
+                    messages=[{"role": "user", "content": [
+                        {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": img["data"]}},
+                        {"type": "text", "text": 'Describe this image for a personal knowledge vault. Prefer JSON like {"slug":"2-4-word-kebab-slug","caption":"one sentence"}, but a short one-line caption is acceptable.'},
+                    ]}],
+                    expect_json=False,
+                ).strip()
+                meta = _parse_image_caption_response(caption_raw, index=i)
+            except Exception:
+                meta = {"slug": _fallback_image_slug(i), "caption": ""}
         _mark_stage(f"caption_image_{i + 1}", started)
+
+        if len(img.get("data", "")) > max_caption_image_chars:
+            stage_ms[f"caption_skipped_image_{i + 1}"] = 1.0
 
         slug = _re.sub(r"[^a-z0-9\-]", "", (meta.get("slug") or _fallback_image_slug(i)).lower().replace(" ", "-"))[:40] or _fallback_image_slug(i)
         suffix = f"-{i+1}" if i > 0 else ""
@@ -5076,6 +5083,7 @@ async def store_image(req: IngestRequest):
         "stage_ms": stage_ms,
         "source_type": "store_image",
         "image_count": len(all_images),
+        "caption_skipped_count": sum(1 for img in all_images if len(img.get("data", "")) > max_caption_image_chars),
     }
     telemetry.log_context_event("store_image_latency", latency)
     return {"saved": saved, "latency": latency}

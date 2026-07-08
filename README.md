@@ -399,6 +399,7 @@ No request body needed. Displays in the **Dashboard** tab:
 - **Approved activity heatmap:** 16-week grid of approved ingestions only
 - **Learning velocity:** Approved entries per week and unique approved concepts per week
 - **Approval quality:** Approved, rejected/skipped, and approval rate for the last 30 days
+- **Approval rate definition:** `approved / (approved + rejected)` ingest decisions in the dashboard period; this measures curation selectivity, not model correctness
 - **Top tags:** 10 most-referenced tags with frequency counts
 - **Top sources:** Source type breakdown (tweets, articles, etc.)
 - **Weekly badges:** True new concepts this week and concepts touched this week
@@ -510,6 +511,8 @@ The `/ingest` endpoint detects iOS clients (`CFNetwork`/`Darwin`/`Shortcuts` in 
 Paste images anywhere on the page (Cmd+V) — no textarea focus required. Or drag-and-drop onto the Capture card (orange highlight on hover). Images are base64-encoded and sent with `/ingest`. If text is present with images, the frontend still sends the images to the vision extraction path so visual structure can become Mermaid diagrams; the images are also saved as vault assets. Tap a thumbnail to view full-size; tap `+` to add more.
 
 Capture responses include latency metadata. `/ingest` logs stage timings for fetch, slicing, image uncertainty extraction, web gap search, vision/text extraction, and queue staging. `/store-image` logs image decode, caption, and write timings. The preview card shows client/server timing for the current run, and Operations → Telemetry keeps recent ingest/image-save latency plus slow-stage summaries.
+
+Image asset captioning is optional metadata. Large pasted images skip the separate caption LLM call and fall back to deterministic filenames so full-resolution screenshots do not create expensive or noisy `IMAGE_CAPTION` contract failures. The main `/ingest` vision path still receives the images for knowledge extraction and diagram recovery.
 
 Operations → Usage summarizes LLM token and cost telemetry by task, route, and recent expensive call. Provider-reported token usage is used when available; otherwise SakethWiki estimates tokens from character counts. Costs use built-in per-million-token defaults for common configured models and can be overridden with environment variables such as `LLM_PRICE_ANTHROPIC_CLAUDE_SONNET_4_6_INPUT_PER_1M` and `LLM_PRICE_ANTHROPIC_CLAUDE_SONNET_4_6_OUTPUT_PER_1M`.
 

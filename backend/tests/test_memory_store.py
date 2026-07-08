@@ -1,6 +1,7 @@
 from pathlib import Path
 from datetime import datetime, timedelta
 import asyncio
+import base64
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -444,6 +445,48 @@ def test_image_caption_response_parser_handles_json_and_prose():
 
     empty = main._parse_image_caption_response("", index=2)
     assert empty == {"slug": "image-3", "caption": ""}
+
+
+def test_store_image_skips_large_optional_caption(monkeypatch, tmp_path):
+    vault = tmp_path / "vault"
+    (vault / "_wiki" / "meta").mkdir(parents=True)
+    monkeypatch.setenv("VAULT_PATH", str(vault))
+    monkeypatch.setenv("IMAGE_CAPTION_MAX_BASE64_CHARS", "10")
+
+    def fail_if_called(**kwargs):
+        raise AssertionError("large optional image caption should not call LLM")
+
+    monkeypatch.setattr(llm_client, "complete", fail_if_called)
+    image_data = base64.b64encode(b"large-enough-image-bytes").decode("ascii")
+
+    result = asyncio.run(main.store_image(main.IngestRequest(images=[{"data": image_data, "mediaType": "image/png"}])))
+    context = telemetry.summarize_context_events()
+
+    assert result["saved"][0]["filename"].endswith("image-1.png")
+    assert context["store_image_latency_events"] == 1
+    assert context["recent_store_image_latency"][0]["caption_skipped_count"] == 1
+
+
+def test_llm_client_complete_runs_on_python39(monkeypatch, tmp_path):
+    vault = tmp_path / "vault"
+    (vault / "_wiki" / "meta").mkdir(parents=True)
+    monkeypatch.setenv("VAULT_PATH", str(vault))
+    monkeypatch.setenv("LLM_PROVIDER", "anthropic")
+
+    def fake_complete(**kwargs):
+        return llm_client.CompletionResult("ok", {"input_tokens": 2, "output_tokens": 1, "source": "provider"})
+
+    monkeypatch.setattr(llm_client, "_anthropic_complete", fake_complete)
+
+    result = llm_client.complete(
+        task="chat_answer",
+        model=None,
+        max_tokens=10,
+        messages=[{"role": "user", "content": "ping"}],
+    )
+
+    assert result == "ok"
+    assert telemetry.summarize_llm_calls()["total_calls"] == 1
 
 
 def test_dashboard_stats_distinguish_new_touched_and_rejected():
