@@ -1,5 +1,6 @@
 from pathlib import Path
 from datetime import datetime, timedelta
+import asyncio
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -499,6 +500,34 @@ def test_dashboard_stats_distinguish_new_touched_and_rejected():
         "text": 1,
     }
     assert stats["top_tags"][0] == {"tag": "Agents", "count": 2}
+
+
+def test_review_due_handles_string_maturity(monkeypatch, tmp_path):
+    vault = tmp_path / "vault"
+    (vault / "_wiki" / "cs").mkdir(parents=True)
+    (vault / "_wiki" / "meta").mkdir(parents=True)
+    monkeypatch.setenv("VAULT_PATH", str(vault))
+
+    _write_page(
+        vault / "_wiki" / "cs" / "quoted-maturity.md",
+        "Quoted Maturity",
+        "Learning",
+        "A page with string maturity.",
+        extra_frontmatter='understanding_maturity: "85"',
+    )
+    _write_page(
+        vault / "_wiki" / "cs" / "weak-string-maturity.md",
+        "Weak String Maturity",
+        "Learning",
+        "A page with low string maturity.",
+        extra_frontmatter='understanding_maturity: "25"',
+    )
+
+    result = asyncio.run(main.review_due())
+
+    names = {row["name"] for row in result["due"]}
+    assert "quoted-maturity" not in names
+    assert "weak-string-maturity" in names
 
 
 def test_telemetry_summarizes_ingest_latency(monkeypatch, tmp_path):

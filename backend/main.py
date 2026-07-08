@@ -4972,7 +4972,11 @@ async def review_due():
         name = p["name"]
         content = vault_reader.read_page(name) or ""
         fm = vault_reader._parse_frontmatter(content)
-        maturity = fm.get("understanding_maturity")
+        raw_maturity = fm.get("understanding_maturity")
+        try:
+            maturity = int(raw_maturity) if raw_maturity not in {None, ""} else None
+        except (TypeError, ValueError):
+            maturity = None
         if maturity is not None and maturity >= 70:
             continue  # solid, skip
         last = last_read.get(name)

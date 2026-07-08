@@ -138,6 +138,27 @@ def _percentile(values: list[float], pct: float) -> float:
     return values[max(0, min(idx, len(values) - 1))]
 
 
+def _parse_ts(value: Any) -> datetime | None:
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+
+
+def _time_range(rows: Iterable[dict[str, Any]]) -> dict[str, Any]:
+    timestamps = [ts for ts in (_parse_ts(row.get("ts")) for row in rows) if ts is not None]
+    if not timestamps:
+        return {"first_ts": None, "last_ts": None, "span_days": 0}
+    first = min(timestamps)
+    last = max(timestamps)
+    span_seconds = max(0.0, (last - first).total_seconds())
+    return {
+        "first_ts": first.isoformat(),
+        "last_ts": last.isoformat(),
+        "span_days": round(span_seconds / 86400, 2),
+    }
+
+
 def _estimate_tokens_from_chars(chars: int) -> int:
     return max(1, int(round(max(chars, 0) / 4)))
 
@@ -261,6 +282,7 @@ def summarize_llm_calls(calls: Iterable[dict[str, Any]] | None = None) -> dict[s
     usage_by_id = {id(r): _effective_usage(r) for r in rows}
     total_cost = sum(float(r.get("cost_usd", 0) or 0) for r in usage_by_id.values())
     total_tokens = sum(int(r.get("total_tokens", 0) or 0) for r in usage_by_id.values())
+    estimated_costs = sum(1 for r in usage_by_id.values() if r.get("cost_estimated"))
     recent_expensive = sorted(
         [{**r, **usage_by_id[id(r)]} for r in rows[-200:]],
         key=lambda r: float(r.get("cost_usd", 0) or 0),
@@ -272,6 +294,8 @@ def summarize_llm_calls(calls: Iterable[dict[str, Any]] | None = None) -> dict[s
         "total_tokens": total_tokens,
         "total_cost_usd": round(total_cost, 6),
         "cost_per_token_usd": round(total_cost / total_tokens, 10) if total_tokens else 0,
+        "estimated_cost_rate": round(estimated_costs / len(rows), 4) if rows else 0,
+        "time_range": _time_range(rows),
         "by_task": task_summary,
         "by_route": route_summary,
         "recent_expensive_calls": recent_expensive,
@@ -333,6 +357,7 @@ def summarize_context_events(events: Iterable[dict[str, Any]] | None = None) -> 
 
     return {
         "total_events": len(rows),
+        "time_range": _time_range(rows),
         "ingest_events": len(extraction_rows),
         "ingest_curation_events": len(curation_rows),
         "ingest_latency_events": len(latency_rows),

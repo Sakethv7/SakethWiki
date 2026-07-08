@@ -406,7 +406,7 @@ No request body needed. Displays in the **Dashboard** tab:
 
 **Frontend visualization:**
 - Dashboard tab with learning-health cards, compact Operations health, recent reads, review-due items, activity heatmap, tag breakdown, and source list
-- Learning data is derived from `_wiki/meta/traces.jsonl`; Operations health is derived from runtime telemetry logs and uses the full runtime log window unless filtered in Operations
+- Learning data is derived from `_wiki/meta/traces.jsonl`; Operations health is derived from runtime telemetry logs and displays the log date range. Historical usage rows without provider token data are estimated from character counts and labeled as estimated.
 
 ---
 
@@ -512,6 +512,8 @@ Paste images anywhere on the page (Cmd+V) — no textarea focus required. Or dra
 Capture responses include latency metadata. `/ingest` logs stage timings for fetch, slicing, image uncertainty extraction, web gap search, vision/text extraction, and queue staging. `/store-image` logs image decode, caption, and write timings. The preview card shows client/server timing for the current run, and Operations → Telemetry keeps recent ingest/image-save latency plus slow-stage summaries.
 
 Operations → Usage summarizes LLM token and cost telemetry by task, route, and recent expensive call. Provider-reported token usage is used when available; otherwise SakethWiki estimates tokens from character counts. Costs use built-in per-million-token defaults for common configured models and can be overridden with environment variables such as `LLM_PRICE_ANTHROPIC_CLAUDE_SONNET_4_6_INPUT_PER_1M` and `LLM_PRICE_ANTHROPIC_CLAUDE_SONNET_4_6_OUTPUT_PER_1M`.
+
+Operations → Queue renders staged actions as approval cards: proposed change, reason, evidence, eval gate explanation, and the concrete mutation behind Approve. Raw JSON remains available behind a disclosure for debugging, but approval should not require reading raw machine payloads.
 
 ---
 

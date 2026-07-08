@@ -3574,7 +3574,12 @@ function DashboardTab({ onNavigateToConcept }) {
   const slowStage = (context.ingest_slow_stages || [])[0];
   const opsCost = Number(llm.total_cost_usd || 0);
   const opsTokens = Number(llm.total_tokens || 0);
+  const opsEstimatedRate = Number(llm.estimated_cost_rate || 0);
   const ingestP95 = Number(context.ingest_latency_p95_ms || 0);
+  const opsRange = llm.time_range || context.time_range || {};
+  const opsRangeLabel = opsRange.first_ts && opsRange.last_ts
+    ? `${opsRange.first_ts.slice(0, 10)} to ${opsRange.last_ts.slice(0, 10)}`
+    : "no log rows";
   const contractFailureLabel = worstContractTask
     ? `${worstContractTask[0]} ${Math.round((worstContractTask[1].contract_failure_rate || 0) * 100)}%`
     : "none";
@@ -3621,10 +3626,10 @@ function DashboardTab({ onNavigateToConcept }) {
         <div className="bg-white border border-stone-200 rounded-xl p-4">
           <div className="flex items-center justify-between gap-3 mb-3">
             <h3 className="text-sm font-semibold text-stone-900">System health</h3>
-            <span className="text-[10px] text-stone-400">runtime log</span>
+            <span className="text-[10px] text-stone-400">runtime log · {opsRangeLabel}</span>
           </div>
           <div className="grid grid-cols-2 md:grid-cols-4 gap-2">
-            <StatTile label="LLM spend" value={`$${opsCost.toFixed(4)}`} tone={opsCost > 1 ? "amber" : "stone"} />
+            <StatTile label={opsEstimatedRate > 0 ? "Est. LLM spend" : "LLM spend"} value={`$${opsCost.toFixed(4)}`} tone={opsCost > 1 ? "amber" : "stone"} />
             <StatTile label="Tokens" value={opsTokens.toLocaleString()} />
             <StatTile label="Ingest p95" value={`${ingestP95 || 0}ms`} tone={ingestP95 > 45000 ? "red" : ingestP95 > 20000 ? "amber" : "stone"} />
             <StatTile label="Ops errors" value={opErrors.length} tone={opErrors.length ? "red" : "stone"} />
@@ -3771,6 +3776,88 @@ function StatTile({ label, value, tone = "stone" }) {
       <p className="text-lg font-semibold mt-0.5">{value}</p>
     </div>
   );
+}
+
+function summarizeActionCandidate(c) {
+  const proposed = c.proposed_change || {};
+  const evidence = c.evidence || {};
+  const current = c.current_state || {};
+  const result = c.eval_result || {};
+  const evalReasons = Array.isArray(result.reasons) ? result.reasons : [];
+
+  if (c.action === "add_alias") {
+    return {
+      change: `Add alias "${proposed.alias || ""}" -> ${proposed.canonical || c.target || ""}`,
+      why: evidence.query
+        ? `Search for "${evidence.query}" missed ${evidence.expected || proposed.canonical || c.target || ""}.`
+        : c.reason,
+      evidence: evidence.got?.length ? `Current top results: ${evidence.got.slice(0, 3).join(", ")}` : "",
+      approval: `Approve writes this alias into aliases.json so future retrieval maps the query to ${proposed.canonical || c.target || ""}.`,
+      eval: evalReasons.length
+        ? evalReasons.join(" ")
+        : "Eval checks that the alias and canonical page resolve safely before writing the alias.",
+    };
+  }
+
+  if (c.action === "exclude_eval_case") {
+    return {
+      change: `Exclude eval case ${proposed.case_id || c.target || ""}`,
+      why: evidence.query
+        ? `The eval query "${evidence.query}" may be ambiguous or mislabeled.`
+        : c.reason,
+      evidence: evidence.expected ? `Expected ${evidence.expected}; got ${(evidence.got || []).slice(0, 3).join(", ") || "no match"}.` : "",
+      approval: "Approve removes this case from replay scoring; it does not change wiki content.",
+      eval: evalReasons.length ? evalReasons.join(" ") : "Eval checks that the case id is present before exclusion.",
+    };
+  }
+
+  if (c.action === "increase_chat_context_budget") {
+    return {
+      change: `Increase chat context budget ${current.chat_context_budget || "?"} -> ${proposed.chat_context_budget || "?"}`,
+      why: c.reason,
+      evidence: "",
+      approval: "Approve updates runtime settings for future chat retrieval context.",
+      eval: evalReasons.length ? evalReasons.join(" ") : "Eval replays recent dropped-context events and checks the larger budget would reduce drops.",
+    };
+  }
+
+  if (c.action === "increase_ingest_source_budget") {
+    return {
+      change: `Increase ingest source budget ${current.ingest_source_budget || "?"} -> ${proposed.ingest_source_budget || "?"}`,
+      why: c.reason,
+      evidence: "",
+      approval: "Approve updates runtime settings for future source extraction.",
+      eval: evalReasons.length ? evalReasons.join(" ") : "Eval replays recent low-coverage ingest events and checks the larger budget would reduce truncation.",
+    };
+  }
+
+  if (c.action === "queue_page_review") {
+    return {
+      change: `Queue review for ${proposed.page || (proposed.pages || []).join(" vs ") || c.target || ""}`,
+      why: c.reason,
+      evidence: evidence.quality_summary || "",
+      approval: "Approve creates a review request; it does not edit the page automatically.",
+      eval: evalReasons.length ? evalReasons.join(" ") : "High-risk review requests wait for human approval instead of auto-applying.",
+    };
+  }
+
+  if (c.action === "create_consolidation_candidate") {
+    return {
+      change: `Stage possible merge ${proposed.source || "source"} -> ${proposed.target || "target"}`,
+      why: c.reason,
+      evidence: evidence.quality_summary || proposed.rationale || "",
+      approval: "Approve creates a consolidation request for review; it does not merge pages automatically.",
+      eval: evalReasons.length ? evalReasons.join(" ") : "High-risk consolidation candidates wait for human approval instead of auto-applying.",
+    };
+  }
+
+  return {
+    change: c.title || c.action || "System action",
+    why: c.reason || "No reason recorded.",
+    evidence: evidence.quality_summary || "",
+    approval: "Approve applies the proposed runtime/system change.",
+    eval: evalReasons.length ? evalReasons.join(" ") : "No detailed eval explanation recorded.",
+  };
 }
 
 function OperationsTab() {
@@ -3991,7 +4078,9 @@ function OperationsTab() {
             </div>
             <div className="divide-y divide-stone-100">
               {pending.length === 0 && <p className="text-sm text-stone-400 text-center py-8">No pending system actions.</p>}
-              {pending.map(c => (
+              {pending.map(c => {
+                const summary = summarizeActionCandidate(c);
+                return (
                 <div key={c.id} className="p-4">
                   <div className="flex items-start justify-between gap-3">
                     <div className="min-w-0">
@@ -4000,14 +4089,36 @@ function OperationsTab() {
                         <RiskBadge risk={c.risk} />
                         <StatusBadge status={c.status} />
                       </div>
-                      <p className="text-xs text-stone-600 mt-1 leading-relaxed">{c.reason}</p>
-                      {c.proposed_change && Object.keys(c.proposed_change).length > 0 && (
-                        <pre className="mt-2 text-[11px] bg-stone-50 border border-stone-100 rounded-lg p-2 overflow-x-auto text-stone-600">{JSON.stringify(c.proposed_change, null, 2)}</pre>
-                      )}
+                      <div className="mt-3 grid md:grid-cols-2 gap-2">
+                        <div className="rounded-lg border border-stone-100 bg-stone-50 px-3 py-2">
+                          <p className="text-[10px] uppercase tracking-wide text-stone-400">Change</p>
+                          <p className="text-xs font-medium text-stone-800 mt-0.5 leading-relaxed">{summary.change}</p>
+                        </div>
+                        <div className="rounded-lg border border-stone-100 bg-stone-50 px-3 py-2">
+                          <p className="text-[10px] uppercase tracking-wide text-stone-400">Approve does</p>
+                          <p className="text-xs font-medium text-stone-800 mt-0.5 leading-relaxed">{summary.approval}</p>
+                        </div>
+                      </div>
+                      <div className="mt-2 rounded-lg border border-stone-100 bg-white px-3 py-2">
+                        <p className="text-[10px] uppercase tracking-wide text-stone-400">Why this appeared</p>
+                        <p className="text-xs text-stone-700 mt-0.5 leading-relaxed">{summary.why}</p>
+                        {summary.evidence && <p className="text-[11px] text-stone-500 mt-1 leading-relaxed">{summary.evidence}</p>}
+                      </div>
                       {c.requires_eval && (
-                        <p className={`text-[11px] mt-2 ${c.eval_status === "passed" ? "text-emerald-600" : c.eval_status === "failed" ? "text-red-600" : "text-amber-600"}`}>
-                          Eval gate: {c.eval_status || "not run"}
-                        </p>
+                        <div className={`mt-2 rounded-lg border px-3 py-2 ${
+                          c.eval_status === "passed" ? "border-emerald-100 bg-emerald-50" : c.eval_status === "failed" ? "border-red-100 bg-red-50" : "border-amber-100 bg-amber-50"
+                        }`}>
+                          <p className={`text-[10px] uppercase tracking-wide ${
+                            c.eval_status === "passed" ? "text-emerald-600" : c.eval_status === "failed" ? "text-red-600" : "text-amber-600"
+                          }`}>Eval gate: {c.eval_status || "not run"}</p>
+                          <p className="text-xs text-stone-700 mt-0.5 leading-relaxed">{summary.eval}</p>
+                        </div>
+                      )}
+                      {c.proposed_change && Object.keys(c.proposed_change).length > 0 && (
+                        <details className="mt-2">
+                          <summary className="cursor-pointer text-[11px] text-stone-400 hover:text-stone-600">Raw proposed change</summary>
+                          <pre className="mt-1 text-[11px] bg-stone-50 border border-stone-100 rounded-lg p-2 overflow-x-auto text-stone-600">{JSON.stringify(c.proposed_change, null, 2)}</pre>
+                        </details>
                       )}
                     </div>
                     <div className="flex gap-1 shrink-0">
@@ -4030,7 +4141,7 @@ function OperationsTab() {
                     </div>
                   </div>
                 </div>
-              ))}
+              );})}
             </div>
           </div>}
 
