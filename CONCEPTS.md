@@ -566,7 +566,41 @@ Raw markdown clipping is now treated as transport. The value layer is refinement
     └── index.md            ← Auto-rebuilt on every vault write
 ```
 
-## Concept Page Structure
+## Telemetry Pipeline & Operations Dashboard
+
+The Operations tab (`frontend/src/App.jsx` `OperationsTab`) is fed by a single endpoint, `GET /operations-overview` (`backend/main.py:2836`), which stitches together **two structurally independent log files** plus a few derived reads. There is no shared request/trace id between them.
+
+```mermaid
+graph TD
+    subgraph Writers
+        LC[llm_client.complete\nsole writer] -->|_log()| LOG1[_wiki/meta/llm_call_logs.jsonl]
+        CTX1[main.py _extract_with_sonnet\nlog_context_event ingest_context] --> LOG2[_wiki/meta/context_budget_logs.jsonl]
+        CTX2[main.py chat\nlog_context_event chat_context] --> LOG2
+    end
+    subgraph Aggregation
+        LOG1 --> SUM[telemetry.summarize_llm_calls\nunbounded read_llm_calls]
+        LOG1 --> ERR[main.py operations_overview\nread_llm_calls limit=200, filter, slice -50]
+        LOG2 --> CTXSUM[telemetry.summarize_context_events]
+    end
+    subgraph API
+        SUM --> OV[GET /operations-overview]
+        ERR --> OV
+        CTXSUM --> OV
+    end
+    OV --> UI[OperationsTab\nfetched once per mount, no polling]
+```
+
+Key structural facts, verified by reading the code (no live vault/API keys were available in this audit environment, so no production log data was inspected — findings below are grounded in code paths and reproduced with constructed data, not captured production payloads):
+
+- **`llm_client.complete()`** (`backend/llm_client.py:289`) is the *only* writer of `llm_call_logs.jsonl`. Every call — success, contract failure, fallback, fallback failure — logs exactly one row via the inner `_log()` closure (`llm_client.py:320`), and the `task` field is always normalized through `_task_key()` (`llm_client.py:27`, uppercases and collapses non-alnum to `_`) *before* being written. This means `contract_ok` and `error` are always set together (never one without the other) and the `task` grouping key is consistent everywhere it's read. Confirmed by direct execution: `telemetry.summarize_llm_calls()`'s per-task `contract_failure_rate` and the `/operations-overview` `errors` list are mathematically tied to the same rows for the same task and cannot disagree within one response.
+- **`context_budget_logs.jsonl`** is written from exactly two call sites, both named-event helpers around `telemetry.log_context_event()`: `ingest_context` from inside `_extract_with_sonnet` (`main.py:1121`, fires *before* the LLM call at `main.py:1180`) and `chat_context` from `chat()` (`main.py:2067`). **No timing field is ever recorded on an `ingest_context` row** — its schema is `task, source_url, depth, has_images, source_chars_total/used/dropped, source_coverage_ratio, content_budget, existing_pages_total/used` only (`main.py:1121-1136`). Ingest "latency" therefore doesn't exist as a metric anywhere: the closest proxy is `llm_summary.by_task.INGEST_EXTRACT.median_ms`, computed from the *other* log file, with no join key back to a specific ingest event.
+- **Routing** (`llm_client._provider_for_task`, `llm_client.py:41`) resolves per-task provider from `LLM_PROVIDER_<TASK>` env override → runtime routing overrides (`system_loop.load_runtime_overrides()`) → global `LLM_PROVIDER` default. `.env.example` pins `LINT_SCAN/LINT_JSON_FIX/CONSOLIDATE_PAGES/KNOWLEDGE_GAPS/EVOLUTION_CLASSIFY/ANALYZE_TRACES` to `anthropic` explicitly (`.env.example:13-19`) but **not** `INGEST_EXTRACT` — that line is commented out (`.env.example:22`) — so INGEST_EXTRACT actually inherits the global default (`LLM_PROVIDER=openai_compat`, i.e. Gemini 2.5 Flash), contradicting this file's own "Model Assignment" table above, which claims INGEST_EXTRACT routes to Anthropic. Treat that table as aspirational, not current-config-verified.
+- **Fallback behavior differs by provider**, not just by "is this a critical task": `complete()` (`llm_client.py:366`) skips the Anthropic-fallback retry entirely whenever the *primary* provider is already `anthropic` — it raises immediately on contract failure. `ANALYZE_TRACES` (provider=anthropic per config) hits this path, and its only caller, `POST /analyze-traces` (`main.py:2559`), has no try/except around the `llm_client.complete()` call (contrast `main.py:1179-1198`, which wraps the equivalent `INGEST_EXTRACT` call and converts failures to a clean `HTTPException`). A contract-failing `ANALYZE_TRACES` call therefore surfaces as an unhandled 500 to whatever triggered it, while still leaving a `contract_ok=False` row in the log — the failure is invisible to the trigger path but visible in telemetry.
+- **`expect_json` is a client-side-only contract check.** `_valid_contract()` (`llm_client.py:123`) parses and validates required keys after the fact; it is never translated into an API-level JSON-mode/`response_format` request (`_openai_compat_complete`'s payload, `llm_client.py:262-266`, has no such field). Combined with `INGEST_EXTRACT` requiring 8 JSON keys — the largest contract in the codebase, vs. 3-4 for every other task (`main.py:1186-1195` vs. `main.py:2193,2218,2644,5082`, `system_loop.py:794`) — the least-constrained provider (fast/cheap default, unenforced JSON mode) is paired with the most fragile contract, which is the most defensible explanation for INGEST_EXTRACT's outsized fallback rate.
+- **The Operations tab fetches once per mount** (`useEffect(() => { load(); }, [])`, `frontend/src/App.jsx:3582`) and is conditionally unmounted/remounted when the top-level tab changes (`frontend/src/App.jsx:4396`). There is no polling and no cross-tab cache invalidation, so any on-screen snapshot is only as fresh as the last time that tab was opened — background `/system-loop/run` or scheduled `/analyze-traces` activity will not appear until the tab is revisited.
+- **UI severity signaling is inconsistent**: the top stat row (`frontend/src/App.jsx:3744-3749`) surfaces call/action counts but no fallback-rate or contract-failure signal; the per-task list (`frontend/src/App.jsx:3861-3872`) sorts by call volume (`taskRows` sort, `App.jsx:3697`) not by risk, colors `contract_failure_rate` red/emerald but renders `fallback_rate` in flat gray with no threshold coloring at all (`App.jsx:3865` vs `3867`); and the top-level "Errors" tile is a bare, silently-capped count (`read_llm_calls(limit=200)` → filter → `[-50:]`, `main.py:2842-2845`) with no drill-down affordance.
+
+
 
 ```markdown
 ---
