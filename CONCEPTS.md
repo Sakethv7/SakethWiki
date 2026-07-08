@@ -146,6 +146,8 @@ Dashboard can surface a compact Operations health layer, but only as summary sig
 
 Action queues are approval surfaces, not debug dumps. A useful action card must explain the proposed change, why it appeared, what evidence triggered it, what the eval gate checked, and what approval will actually mutate. A green eval state means "the safety predicate passed"; it is not enough by itself to justify approval.
 
+Operations commands must expose side effects in the label area. Safety evals and inference reports are read-only report writers. The trace critic proposes action cards. The system loop is the only header command allowed to auto-apply low-risk runtime changes, so it needs the strongest visual treatment and side-effect copy.
+
 Ingestion is now a curation contract before it is a summary contract. The extractor must decide `source_verdict`, `educational_core`, `discarded_context`, `knowledge_shape`, and `diagram_plan` before producing bullets. `ingest` means the source has durable educational signal. `source_only` means the source is mostly event, social, or provenance context, so only the transferable core should enter the page. `reject` means the source has no durable value for this wiki and should return a 400 instead of polluting the queue.
 
 ```mermaid

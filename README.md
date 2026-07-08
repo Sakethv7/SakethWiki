@@ -518,6 +518,12 @@ Operations → Usage summarizes LLM token and cost telemetry by task, route, and
 
 Operations → Queue renders staged actions as approval cards: proposed change, reason, evidence, eval gate explanation, and the concrete mutation behind Approve. Raw JSON remains available behind a disclosure for debugging, but approval should not require reading raw machine payloads.
 
+Operations header commands are separated by side effect:
+- **Run safety evals:** replay checks and write an eval report; no settings changes.
+- **Write inference report:** summarize LLM/context telemetry, tokens, cost, and failures; no settings changes.
+- **Find improvement candidates:** run the trace critic and stage action cards; does not apply them.
+- **Run system loop:** route telemetry into bounded actions; may auto-apply low-risk fixes and stage medium/high-risk changes.
+
 ---
 
 ## Tag Normalization Script

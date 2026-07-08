@@ -3868,6 +3868,25 @@ function summarizeActionCandidate(c) {
   };
 }
 
+function OperationCommand({ title, detail, output, danger, busy, onClick, disabled }) {
+  const cls = danger
+    ? "border-stone-900 bg-stone-900 text-white hover:bg-stone-800"
+    : "border-stone-200 bg-white text-stone-800 hover:bg-stone-50";
+  const subCls = danger ? "text-stone-300" : "text-stone-500";
+  return (
+    <button
+      onClick={onClick}
+      disabled={disabled}
+      title={`${detail} ${output}`}
+      className={`text-left rounded-xl border px-3 py-2.5 transition-colors disabled:opacity-50 ${cls}`}
+    >
+      <p className="text-sm font-semibold leading-tight">{busy || title}</p>
+      <p className={`text-[11px] mt-1 leading-snug ${subCls}`}>{detail}</p>
+      <p className={`text-[10px] mt-1 leading-snug ${subCls}`}>{output}</p>
+    </button>
+  );
+}
+
 function OperationsTab() {
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(true);
@@ -4025,32 +4044,64 @@ function OperationsTab() {
     ["reports", "Reports"],
     ["history", "History"],
   ];
+  const operationCommands = [
+    {
+      id: "evals",
+      title: "Run safety evals",
+      busy: "Running evals...",
+      detail: "Replays retrieval, preference, and curation checks.",
+      output: "Writes an eval report. Does not change settings.",
+      onClick: runEvals,
+    },
+    {
+      id: "inference",
+      title: "Write inference report",
+      busy: "Writing report...",
+      detail: "Summarizes LLM latency, failures, context, tokens, and cost.",
+      output: "Writes a report only. Does not change settings.",
+      onClick: generateInference,
+    },
+    {
+      id: "critic",
+      title: "Find improvement candidates",
+      busy: "Critiquing traces...",
+      detail: "Reviews traces for repeated misses or noisy eval cases.",
+      output: "Stages action cards for review. Does not apply them.",
+      onClick: runTraceCritic,
+    },
+    {
+      id: "loop",
+      title: "Run system loop",
+      busy: "Running loop...",
+      detail: "Routes telemetry into bounded runtime actions.",
+      output: "May auto-apply low-risk fixes and stage the rest.",
+      onClick: runLoop,
+      danger: true,
+    },
+  ];
 
   return (
     <div className="space-y-4 pb-10">
       <div className="flex items-start justify-between gap-3">
         <div>
           <h2 className="text-lg font-semibold text-stone-900">Operations</h2>
-          <p className="text-xs text-stone-500 mt-1">System loop, inference telemetry, action queue, and runtime changes.</p>
+          <p className="text-xs text-stone-500 mt-1">Observe failures, write reports, and review bounded runtime changes.</p>
         </div>
-        <div className="flex gap-2">
-          <button onClick={runEvals} disabled={busy === "evals"}
-            className="px-3 py-1.5 rounded-lg border border-stone-200 text-xs text-stone-700 hover:bg-stone-50 disabled:opacity-50">
-            {busy === "evals" ? "Running…" : "Run evals"}
-          </button>
-          <button onClick={generateInference} disabled={busy === "inference"}
-            className="px-3 py-1.5 rounded-lg border border-stone-200 text-xs text-stone-700 hover:bg-stone-50 disabled:opacity-50">
-            {busy === "inference" ? "Writing…" : "Inference report"}
-          </button>
-          <button onClick={runTraceCritic} disabled={busy === "critic"}
-            className="px-3 py-1.5 rounded-lg border border-stone-200 text-xs text-stone-700 hover:bg-stone-50 disabled:opacity-50">
-            {busy === "critic" ? "Critiquing…" : "Trace critic"}
-          </button>
-          <button onClick={runLoop} disabled={busy === "loop"}
-            className="px-3 py-1.5 rounded-lg bg-stone-900 text-xs text-white hover:bg-stone-700 disabled:opacity-50">
-            {busy === "loop" ? "Running…" : "Run system loop"}
-          </button>
-        </div>
+      </div>
+
+      <div className="grid md:grid-cols-4 gap-2">
+        {operationCommands.map(cmd => (
+          <OperationCommand
+            key={cmd.id}
+            title={cmd.title}
+            detail={cmd.detail}
+            output={cmd.output}
+            danger={cmd.danger}
+            busy={busy === cmd.id ? cmd.busy : ""}
+            disabled={Boolean(busy)}
+            onClick={cmd.onClick}
+          />
+        ))}
       </div>
 
       {error && <div className="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-700">{error}</div>}
