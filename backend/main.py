@@ -2675,6 +2675,121 @@ async def get_page_history(page_name: str):
 
 # ── /dashboard-stats ──────────────────────────────────────────────────────────
 
+def _parse_iso_datetime(value) -> Optional[datetime]:
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is not None:
+        return parsed.astimezone().replace(tzinfo=None)
+    return parsed
+
+
+def _normalize_dashboard_source(value: str) -> str:
+    source = str(value or "unknown").strip().lower().replace("-", "_")
+    labels = {
+        "clip_markdown": "clip",
+        "quick_note": "quick note",
+        "quick-note": "quick note",
+        "url": "link",
+        "text": "text",
+        "lecture": "lecture",
+        "tweet": "tweet",
+        "gap_fill": "gap fill",
+        "unknown": "unknown",
+    }
+    return labels.get(source, source.replace("_", " "))
+
+
+def _dashboard_stats_from_traces(
+    traces: list[dict],
+    now: Optional[datetime] = None,
+    period_days: int = 30,
+    heatmap_days: int = 112,
+) -> dict:
+    now = now or datetime.now()
+    period_cutoff = now - timedelta(days=period_days)
+    heatmap_cutoff = now - timedelta(days=heatmap_days)
+    week_cutoff = now - timedelta(days=7)
+
+    parsed_rows = []
+    for trace in traces:
+        ts = _parse_iso_datetime(trace.get("ts"))
+        if not ts:
+            continue
+        parsed_rows.append((trace, ts))
+
+    period_rows = [(t, ts) for t, ts in parsed_rows if ts > period_cutoff]
+    period_approved = [(t, ts) for t, ts in period_rows if t.get("approved")]
+    period_rejected = [(t, ts) for t, ts in period_rows if t.get("approved") is False]
+    heatmap_approved = [(t, ts) for t, ts in parsed_rows if t.get("approved") and ts > heatmap_cutoff]
+
+    activity_by_date: dict[str, int] = {}
+    for _, ts in heatmap_approved:
+        date = ts.date().isoformat()
+        activity_by_date[date] = activity_by_date.get(date, 0) + 1
+
+    pages_30d = {
+        str(t.get("final_page") or "").strip()
+        for t, _ in period_approved
+        if str(t.get("final_page") or "").strip()
+    }
+    week_pages_touched = {
+        str(t.get("final_page") or "").strip()
+        for t, ts in period_approved
+        if ts > week_cutoff and str(t.get("final_page") or "").strip()
+    }
+
+    first_seen: dict[str, datetime] = {}
+    for trace, ts in parsed_rows:
+        if not trace.get("approved"):
+            continue
+        page = str(trace.get("final_page") or "").strip()
+        if not page:
+            continue
+        if page not in first_seen or ts < first_seen[page]:
+            first_seen[page] = ts
+    new_pages_week = {page for page, ts in first_seen.items() if ts > week_cutoff}
+
+    tag_counts: dict[str, int] = {}
+    for trace, _ in period_approved:
+        tags = trace.get("tags_final")
+        if not isinstance(tags, list):
+            tags = trace.get("tags") if isinstance(trace.get("tags"), list) else []
+        for tag in tags:
+            tag_name = str(tag).strip()
+            if tag_name:
+                tag_counts[tag_name] = tag_counts.get(tag_name, 0) + 1
+    top_tags = sorted(tag_counts.items(), key=lambda x: (-x[1], x[0].lower()))[:10]
+
+    source_counts: dict[str, int] = {}
+    for trace, _ in period_approved:
+        source = _normalize_dashboard_source(trace.get("source_type", "unknown"))
+        source_counts[source] = source_counts.get(source, 0) + 1
+    top_sources = sorted(source_counts.items(), key=lambda x: (-x[1], x[0]))
+
+    denominator = max(1, period_days / 7)
+    total_period_events = len(period_approved) + len(period_rejected)
+    return {
+        "period_days": period_days,
+        "heatmap_days": heatmap_days,
+        "total_events": total_period_events,
+        "total_approved": len(period_approved),
+        "total_rejected": len(period_rejected),
+        "approval_rate": round(len(period_approved) / total_period_events, 4) if total_period_events else None,
+        "unique_concepts": len(pages_30d),
+        "activity_by_date": activity_by_date,
+        "learning_velocity": {
+            "entries_per_week": round(len(period_approved) / denominator, 2),
+            "concepts_per_week": round(len(pages_30d) / denominator, 2),
+        },
+        "top_tags": [{"tag": tag, "count": count} for tag, count in top_tags],
+        "top_sources": [{"source": src, "count": count} for src, count in top_sources],
+        "new_concepts_this_week": len(new_pages_week),
+        "concepts_touched_this_week": len(week_pages_touched),
+    }
+
+
 @app.get("/dashboard-stats")
 async def get_dashboard_stats():
     """
@@ -2698,62 +2813,7 @@ async def get_dashboard_stats():
                 except Exception:
                     continue
 
-    # Filter to last 30 days and only approved items
-    cutoff = datetime.now() - timedelta(days=30)
-    recent_traces = []
-    for t in traces:
-        if not t.get("approved"):
-            continue
-        try:
-            ts = datetime.fromisoformat(t.get("ts", ""))
-        except (ValueError, TypeError):
-            continue  # skip traces with missing or malformed timestamps
-        if ts > cutoff:
-            recent_traces.append(t)
-
-    # Activity timeline: group by date
-    activity_by_date = {}
-    for trace in recent_traces:
-        date = trace.get("ts", "").split("T")[0]
-        activity_by_date[date] = activity_by_date.get(date, 0) + 1
-
-    # Learning velocity: entries per week, unique concepts per week
-    entries_per_week = len(recent_traces) / max(1, (datetime.now() - cutoff).days / 7)
-    unique_concepts = len(set(t.get("final_page") for t in recent_traces if t.get("final_page")))
-    concepts_per_week = unique_concepts / max(1, (datetime.now() - cutoff).days / 7)
-
-    # Tags frequency
-    tag_counts = {}
-    for trace in recent_traces:
-        for tag in trace.get("tags_final", []):
-            tag_counts[tag] = tag_counts.get(tag, 0) + 1
-    top_tags = sorted(tag_counts.items(), key=lambda x: x[1], reverse=True)[:10]
-
-    # Source type frequency
-    source_counts = {}
-    for trace in recent_traces:
-        source = trace.get("source_type", "unknown")
-        source_counts[source] = source_counts.get(source, 0) + 1
-    top_sources = sorted(source_counts.items(), key=lambda x: x[1], reverse=True)
-
-    # New concepts this week
-    week_cutoff = datetime.now() - timedelta(days=7)
-    week_traces = [t for t in recent_traces if datetime.fromisoformat(t.get("ts", "")) > week_cutoff]
-    new_concepts_week = len(set(t.get("final_page") for t in week_traces if t.get("final_page")))
-
-    return {
-        "period_days": 30,
-        "total_approved": len(recent_traces),
-        "unique_concepts": unique_concepts,
-        "activity_by_date": activity_by_date,
-        "learning_velocity": {
-            "entries_per_week": round(entries_per_week, 2),
-            "concepts_per_week": round(concepts_per_week, 2),
-        },
-        "top_tags": [{"tag": tag, "count": count} for tag, count in top_tags],
-        "top_sources": [{"source": src, "count": count} for src, count in top_sources],
-        "new_concepts_this_week": new_concepts_week,
-    }
+    return _dashboard_stats_from_traces(traces)
 
 
 # ── /analyze-traces ──────────────────────────────────────────────────────────
@@ -4729,12 +4789,13 @@ async def log_read(req: LogReadRequest):
 
 
 @app.get("/recent-reads")
-async def recent_reads(limit: int = 10):
+async def recent_reads(limit: int = 10, max_age_days: int = 30):
     vault_path = Path(os.environ.get("VAULT_PATH", "/Users/sakethv7/SakethVault"))
     reads_path = vault_path / "_wiki" / "meta" / "reads.jsonl"
     if not reads_path.exists():
         return {"reads": []}
     lines = reads_path.read_text(encoding="utf-8").splitlines()
+    cutoff = datetime.utcnow() - timedelta(days=max(1, min(max_age_days, 365)))
     # Parse last 200 lines, deduplicate keeping most recent occurrence
     seen = {}
     for line in reversed(lines[-200:]):
@@ -4743,6 +4804,9 @@ async def recent_reads(limit: int = 10):
         try:
             entry = json.loads(line)
             concept = entry.get("concept", "")
+            ts = _parse_iso_datetime(entry.get("ts"))
+            if not ts or ts < cutoff:
+                continue
             if concept and concept not in seen:
                 seen[concept] = entry
         except Exception:

@@ -190,7 +190,7 @@ cd frontend && npm run build
 | DELETE | `/page/{name}` | Delete a page |
 | POST | `/fix-page/{name}` | Normalise wikilinks and update entry count |
 | **GET** | **`/lint`** | **Scan vault for structural issues (health check) and return report** |
-| **GET** | **`/dashboard-stats`** | **Get learning metrics for the last 30 days (activity, velocity, tags, sources)** |
+| **GET** | **`/dashboard-stats`** | **Get 30-day learning health plus 112-day approved activity heatmap** |
 | **POST** | **`/add-link`** | **Auto-insert wikilink from one page to another** |
 | **POST** | **`/create-stub`** | **Create minimal stub page for missing concept** |
 | **POST** | **`/calculate-maturity/{page}`** | **Calculate and update understanding maturity score for a page** |
@@ -362,14 +362,18 @@ Supports intelligent caching to save time and costs:
 
 ### GET /dashboard-stats
 
-**Learning Metrics — Returns learning statistics for the last 30 days.** 
+**Learning Metrics — Returns learning statistics for the last 30 days plus a 112-day approved-activity heatmap.**
 
 No request body needed. Displays in the **Dashboard** tab:
 
 ```json
 {
   "period_days": 30,
+  "heatmap_days": 112,
+  "total_events": 16,
   "total_approved": 9,
+  "total_rejected": 7,
+  "approval_rate": 0.5625,
   "unique_concepts": 7,
   "activity_by_date": {
     "2026-04-15": 1,
@@ -384,22 +388,24 @@ No request body needed. Displays in the **Dashboard** tab:
     { "tag": "LLM", "count": 5 }
   ],
   "top_sources": [
-    { "source": "text", "count": 9 }
+    { "source": "text", "count": 4 }
   ],
-  "new_concepts_this_week": 7
+  "new_concepts_this_week": 6,
+  "concepts_touched_this_week": 7
 }
 ```
 
 **Metrics included:**
-- **Activity timeline:** Bar chart of entries added by date (last 14 days)
-- **Learning velocity:** Entries per week and unique concepts per week
+- **Approved activity heatmap:** 16-week grid of approved ingestions only
+- **Learning velocity:** Approved entries per week and unique approved concepts per week
+- **Approval quality:** Approved, rejected/skipped, and approval rate for the last 30 days
 - **Top tags:** 10 most-referenced tags with frequency counts
 - **Top sources:** Source type breakdown (tweets, articles, etc.)
-- **Weekly badge:** Count of new concepts added this week
-- **Summary metrics:** 30-day aggregates (total approved, unique concepts)
+- **Weekly badges:** True new concepts this week and concepts touched this week
+- **Summary metrics:** 30-day approved/rejected aggregates and unique concepts
 
 **Frontend visualization:**
-- Dashboard tab with activity timeline chart, velocity cards, tag breakdown, and source list
+- Dashboard tab with learning-health cards, recent reads, review-due items, activity heatmap, tag breakdown, and source list
 - All data derived from `_wiki/meta/traces.jsonl` (no LLM cost)
 
 ---

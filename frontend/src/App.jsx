@@ -3420,10 +3420,17 @@ function RecentlyRead() {
   const [reads, setReads] = useState([]);
 
   useEffect(() => {
-    api("/recent-reads?limit=5").then(d => setReads(d.reads || [])).catch(() => {});
+    api("/recent-reads?limit=5&max_age_days=30").then(d => setReads(d.reads || [])).catch(() => {});
   }, []);
 
-  if (reads.length === 0) return null;
+  if (reads.length === 0) {
+    return (
+      <div className="bg-white border border-stone-200 rounded-lg p-4">
+        <h3 className="text-sm font-semibold text-stone-900">Recently Read</h3>
+        <p className="text-xs text-stone-400 mt-2">No pages read in the last 30 days.</p>
+      </div>
+    );
+  }
 
   function fmtAge(ts) {
     const diffMs = Date.now() - new Date(ts + "Z").getTime();
@@ -3547,22 +3554,41 @@ function DashboardTab({ onNavigateToConcept }) {
   }
 
   const maxTagCount = stats.top_tags.length > 0 ? stats.top_tags[0].count : 1;
+  const approvalRate = stats.approval_rate == null ? null : Math.round(stats.approval_rate * 100);
+  const periodDays = stats.period_days || 30;
+  const heatmapLabel = `${stats.heatmap_days || heatmapWeeks * 7} days`;
 
   return (
     <div className="space-y-5 pb-8">
       {/* Stats row */}
-      <div className="grid grid-cols-3 gap-3">
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
         <div className="bg-white border border-stone-200 rounded-xl p-3 text-center">
-          <div className="text-2xl font-bold text-orange-500">{stats.new_concepts_this_week}</div>
-          <div className="text-[10px] text-stone-500 mt-0.5 leading-tight">concepts<br/>this week</div>
+          <div className="text-2xl font-bold text-orange-500">{stats.total_approved}</div>
+          <div className="text-[10px] text-stone-500 mt-0.5 leading-tight">approved<br/>{periodDays}d</div>
         </div>
         <div className="bg-white border border-stone-200 rounded-xl p-3 text-center">
-          <div className="text-2xl font-bold text-blue-500">{stats.learning_velocity.entries_per_week}</div>
-          <div className="text-[10px] text-stone-500 mt-0.5 leading-tight">entries<br/>/ week</div>
+          <div className="text-2xl font-bold text-blue-500">{stats.unique_concepts}</div>
+          <div className="text-[10px] text-stone-500 mt-0.5 leading-tight">concepts touched<br/>{periodDays}d</div>
         </div>
         <div className="bg-white border border-stone-200 rounded-xl p-3 text-center">
-          <div className="text-2xl font-bold text-purple-500">{stats.unique_concepts}</div>
-          <div className="text-[10px] text-stone-500 mt-0.5 leading-tight">concepts<br/>touched</div>
+          <div className="text-2xl font-bold text-purple-500">{stats.new_concepts_this_week}</div>
+          <div className="text-[10px] text-stone-500 mt-0.5 leading-tight">new concepts<br/>7d</div>
+        </div>
+        <div className="bg-white border border-stone-200 rounded-xl p-3 text-center">
+          <div className={`text-2xl font-bold ${approvalRate != null && approvalRate < 60 ? "text-amber-500" : "text-emerald-500"}`}>
+            {approvalRate == null ? "n/a" : `${approvalRate}%`}
+          </div>
+          <div className="text-[10px] text-stone-500 mt-0.5 leading-tight">approval rate<br/>{periodDays}d</div>
+        </div>
+      </div>
+      <div className="grid grid-cols-2 gap-3">
+        <div className="bg-stone-50 border border-stone-200 rounded-xl px-3 py-2">
+          <p className="text-[10px] uppercase tracking-wide text-stone-400">Velocity</p>
+          <p className="text-sm font-semibold text-stone-800 mt-0.5">{stats.learning_velocity.entries_per_week} approved entries/week</p>
+        </div>
+        <div className="bg-stone-50 border border-stone-200 rounded-xl px-3 py-2">
+          <p className="text-[10px] uppercase tracking-wide text-stone-400">Rejected</p>
+          <p className="text-sm font-semibold text-stone-800 mt-0.5">{stats.total_rejected || 0} rejected / skipped in {periodDays}d</p>
         </div>
       </div>
 
@@ -3574,7 +3600,10 @@ function DashboardTab({ onNavigateToConcept }) {
 
       {/* Contribution heatmap */}
       <div className="bg-white border border-stone-200 rounded-xl p-4">
-        <h3 className="text-sm font-semibold text-stone-900 mb-3">Ingestion activity</h3>
+        <div className="flex items-center justify-between gap-3 mb-3">
+          <h3 className="text-sm font-semibold text-stone-900">Approved ingestion activity</h3>
+          <span className="text-[10px] text-stone-400">{heatmapLabel}</span>
+        </div>
         <div className="flex gap-1">
           {/* Day-of-week labels */}
           <div className="flex flex-col gap-0.5 mr-0.5">
@@ -3609,7 +3638,10 @@ function DashboardTab({ onNavigateToConcept }) {
       {/* Top Tags */}
       {stats.top_tags.length > 0 && (
         <div className="bg-white border border-stone-200 rounded-xl p-4">
-          <h3 className="text-sm font-semibold text-stone-900 mb-3">Top tags</h3>
+          <div className="flex items-center justify-between gap-3 mb-3">
+            <h3 className="text-sm font-semibold text-stone-900">Top tags</h3>
+            <span className="text-[10px] text-stone-400">approved {periodDays}d</span>
+          </div>
           <div className="space-y-2">
             {stats.top_tags.slice(0, 8).map((item) => (
               <div key={item.tag} className="flex items-center gap-2">
@@ -3630,10 +3662,13 @@ function DashboardTab({ onNavigateToConcept }) {
       {/* Sources */}
       {stats.top_sources.length > 0 && (
         <div className="bg-white border border-stone-200 rounded-xl p-4">
-          <h3 className="text-sm font-semibold text-stone-900 mb-3">Sources</h3>
+          <div className="flex items-center justify-between gap-3 mb-3">
+            <h3 className="text-sm font-semibold text-stone-900">Sources</h3>
+            <span className="text-[10px] text-stone-400">approved {periodDays}d</span>
+          </div>
           <div className="flex flex-wrap gap-2">
             {stats.top_sources.map((item) => {
-              const sourceEmoji = { tweet: "𝕏", article: "📄", video: "📺", blog: "✍️", paper: "📜", unknown: "❓" };
+              const sourceEmoji = { tweet: "𝕏", article: "📄", video: "📺", blog: "✍️", paper: "📜", clip: "🔗", link: "🔗", lecture: "▣", text: "T", unknown: "❓" };
               return (
                 <div key={item.source} className="flex items-center gap-1.5 bg-stone-50 border border-stone-200 rounded-lg px-3 py-1.5">
                   <span className="text-sm">{sourceEmoji[item.source] || "🔗"}</span>

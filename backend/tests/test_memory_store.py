@@ -1,4 +1,5 @@
 from pathlib import Path
+from datetime import datetime, timedelta
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -411,6 +412,62 @@ def test_image_caption_response_parser_handles_json_and_prose():
 
     empty = main._parse_image_caption_response("", index=2)
     assert empty == {"slug": "image-3", "caption": ""}
+
+
+def test_dashboard_stats_distinguish_new_touched_and_rejected():
+    now = datetime(2026, 7, 8, 12, 0, 0)
+    traces = [
+        {
+            "ts": (now - timedelta(days=2)).isoformat(),
+            "approved": True,
+            "final_page": "new-page",
+            "tags_final": ["Systems"],
+            "source_type": "clip_markdown",
+        },
+        {
+            "ts": (now - timedelta(days=1)).isoformat(),
+            "approved": True,
+            "final_page": "old-page",
+            "tags_final": ["Systems", "Agents"],
+            "source_type": "text",
+        },
+        {
+            "ts": (now - timedelta(days=20)).isoformat(),
+            "approved": True,
+            "final_page": "old-page",
+            "tags_final": ["Agents"],
+            "source_type": "lecture",
+        },
+        {
+            "ts": (now - timedelta(days=3)).isoformat(),
+            "approved": False,
+            "suggested_page": "rejected-page",
+            "source_type": "text",
+        },
+        {
+            "ts": (now - timedelta(days=80)).isoformat(),
+            "approved": True,
+            "final_page": "heatmap-only",
+            "tags_final": ["Archive"],
+            "source_type": "url",
+        },
+    ]
+
+    stats = main._dashboard_stats_from_traces(traces, now=now, period_days=30, heatmap_days=112)
+
+    assert stats["total_approved"] == 3
+    assert stats["total_rejected"] == 1
+    assert stats["approval_rate"] == 0.75
+    assert stats["unique_concepts"] == 2
+    assert stats["concepts_touched_this_week"] == 2
+    assert stats["new_concepts_this_week"] == 1
+    assert stats["activity_by_date"][(now - timedelta(days=80)).date().isoformat()] == 1
+    assert {row["source"]: row["count"] for row in stats["top_sources"]} == {
+        "clip": 1,
+        "lecture": 1,
+        "text": 1,
+    }
+    assert stats["top_tags"][0] == {"tag": "Agents", "count": 2}
 
 
 def test_telemetry_summarizes_ingest_latency(monkeypatch, tmp_path):

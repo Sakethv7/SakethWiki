@@ -138,6 +138,8 @@ Latency is part of the capture contract. Ingest records stage timings for URL fe
 
 Usage cost is part of the same operations contract. Each LLM call logs provider/model route, effective fallback route, input/output tokens, cache tokens when exposed, estimated dollar cost, and cost per token. Provider token counts are preferred; missing usage is estimated from character counts and marked as estimated. Pricing is configurable because model pricing drifts faster than architecture.
 
+The Dashboard is a learning-health surface, not a raw activity vanity chart. It separates approved events, rejected/skipped events, approval rate, concepts touched, and genuinely new concepts. The 30-day cards answer "what passed curation recently?" while the 112-day heatmap answers "when did approved learning happen?" Recent reads are age-limited so stale page opens do not masquerade as current study behavior.
+
 Ingestion is now a curation contract before it is a summary contract. The extractor must decide `source_verdict`, `educational_core`, `discarded_context`, `knowledge_shape`, and `diagram_plan` before producing bullets. `ingest` means the source has durable educational signal. `source_only` means the source is mostly event, social, or provenance context, so only the transferable core should enter the page. `reject` means the source has no durable value for this wiki and should return a 400 instead of polluting the queue.
 
 ```mermaid
