@@ -405,8 +405,8 @@ No request body needed. Displays in the **Dashboard** tab:
 - **Summary metrics:** 30-day approved/rejected aggregates and unique concepts
 
 **Frontend visualization:**
-- Dashboard tab with learning-health cards, recent reads, review-due items, activity heatmap, tag breakdown, and source list
-- All data derived from `_wiki/meta/traces.jsonl` (no LLM cost)
+- Dashboard tab with learning-health cards, compact Operations health, recent reads, review-due items, activity heatmap, tag breakdown, and source list
+- Learning data is derived from `_wiki/meta/traces.jsonl`; Operations health is derived from runtime telemetry logs and uses the full runtime log window unless filtered in Operations
 
 ---
 
