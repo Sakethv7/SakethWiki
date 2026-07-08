@@ -514,7 +514,7 @@ Capture responses include latency metadata. `/ingest` logs stage timings for fet
 
 Image asset captioning is optional metadata. Large pasted images skip the separate caption LLM call and fall back to deterministic filenames so full-resolution screenshots do not create expensive or noisy `IMAGE_CAPTION` contract failures. The main `/ingest` vision path still receives the images for knowledge extraction and diagram recovery.
 
-Operations → Usage summarizes LLM token and cost telemetry by task, route, and recent expensive call. Provider-reported token usage is used when available; otherwise SakethWiki estimates tokens from character counts. Costs use built-in per-million-token defaults for common configured models and can be overridden with environment variables such as `LLM_PRICE_ANTHROPIC_CLAUDE_SONNET_4_6_INPUT_PER_1M` and `LLM_PRICE_ANTHROPIC_CLAUDE_SONNET_4_6_OUTPUT_PER_1M`.
+Operations → Usage summarizes LLM token and cost telemetry by task, route, and recent expensive call. Provider-reported token usage is used when available; otherwise SakethWiki estimates tokens from character counts. Costs use built-in per-million-token defaults for common configured models and can be overridden with environment variables such as `LLM_PRICE_ANTHROPIC_CLAUDE_SONNET_4_6_INPUT_PER_1M` and `LLM_PRICE_ANTHROPIC_CLAUDE_SONNET_4_6_OUTPUT_PER_1M`. The UI displays cost per 1M tokens instead of raw dollars per token because raw per-token values are too small to read safely.
 
 Operations → Queue renders staged actions as approval cards: proposed change, reason, evidence, eval gate explanation, and the concrete mutation behind Approve. Raw JSON remains available behind a disclosure for debugging, but approval should not require reading raw machine payloads.
 
@@ -525,6 +525,8 @@ Operations header commands are separated by side effect:
 - **Run system loop:** route telemetry into bounded actions; may auto-apply low-risk fixes and stage medium/high-risk changes.
 
 After a command finishes, Operations shows a Last operation banner with what ran, what changed, and what to inspect next. Read-only report commands route to Evals or Reports. Trace critic and system-loop runs route to Queue only when there are action candidates to review.
+
+For high-stakes planning, use a brain/executor split: an expensive planning model proposes the plan, invariants, and acceptance checks; Codex executes the patch, runs tests, and commits. The handoff artifact should be plain Markdown with goal, constraints, files likely involved, acceptance checks, and explicit non-goals.
 
 ---
 

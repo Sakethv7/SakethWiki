@@ -158,8 +158,14 @@ def _default_price_per_1m(provider: str, model: str, direction: str) -> float:
     p = provider.lower()
     if p == "ollama":
         return 0.0
+    if "fable-5" in m or "fable 5" in m:
+        return 10.0 if direction == "input" else 50.0
+    if "gpt-5.5" in m or "gpt-5_5" in m:
+        return 5.0 if direction == "input" else 30.0
     if "haiku" in m:
         return 1.0 if direction == "input" else 5.0
+    if "sonnet-5" in m or "sonnet 5" in m:
+        return 2.0 if direction == "input" else 10.0
     if "sonnet" in m:
         return 3.0 if direction == "input" else 15.0
     if "gpt-4o-mini" in m:

@@ -150,6 +150,10 @@ Operations commands must expose side effects in the label area. Safety evals and
 
 Operations command results need a visible cause-and-effect trail. A finished command should leave a Last operation summary and route the user to the evidence surface it produced: evals to Evals, telemetry reports to Reports, and action-producing critic/system-loop runs to Queue.
 
+Usage observability should prefer human billing units over raw math notation. Dollars per token is mathematically precise but easy to misread; dollars per million tokens is the product unit. Estimated cost must be visible because historical rows often infer tokens from character counts.
+
+Brain/executor agent architecture separates judgment from mutation. A high-reasoning brain model should produce plans, invariants, and acceptance checks. The executor should own repository inspection, edits, tests, commits, and rollback discipline. The boundary is a handoff document, not free-form chat, so the executor can be audited against the plan without inheriting every exploratory thought.
+
 Ingestion is now a curation contract before it is a summary contract. The extractor must decide `source_verdict`, `educational_core`, `discarded_context`, `knowledge_shape`, and `diagram_plan` before producing bullets. `ingest` means the source has durable educational signal. `source_only` means the source is mostly event, social, or provenance context, so only the transferable core should enter the page. `reject` means the source has no durable value for this wiki and should return a 400 instead of polluting the queue.
 
 ```mermaid

@@ -3786,6 +3786,19 @@ function StatTile({ label, value, tone = "stone" }) {
   );
 }
 
+function formatUsd(value, digits = 4) {
+  return `$${Number(value || 0).toFixed(digits)}`;
+}
+
+function formatCostPerMillionTokens(costPerToken) {
+  return `$${(Number(costPerToken || 0) * 1_000_000).toFixed(2)}`;
+}
+
+function estimatedCostSuffix(rate) {
+  const pct = Math.round(Number(rate || 0) * 100);
+  return pct > 0 ? ` · ${pct}% estimated` : "";
+}
+
 function summarizeActionCandidate(c) {
   const proposed = c.proposed_change || {};
   const evidence = c.evidence || {};
@@ -4325,10 +4338,12 @@ function OperationsTab() {
                 <div key={task} className="px-4 py-3 grid grid-cols-[1fr_auto] gap-3 items-center">
                   <div className="min-w-0">
                     <p className="text-sm font-medium text-stone-800 truncate">{task}</p>
-                    <p className="text-xs text-stone-400">{row.calls} calls · median {row.median_ms}ms · fallback {(row.fallback_rate * 100).toFixed(1)}%</p>
+                    <p className="text-xs text-stone-400">
+                      {row.calls} calls · median {row.median_ms}ms · p95 {row.p95_ms}ms · fallback {(row.fallback_rate * 100).toFixed(1)}%
+                    </p>
                   </div>
                   <span className={`text-xs font-medium ${row.contract_failure_rate || row.error_rate ? "text-red-600" : "text-emerald-600"}`}>
-                    {((row.contract_failure_rate || 0) * 100).toFixed(1)}% contract fail
+                    {row.contract_failures || 0}/{row.calls || 0} contract failed
                   </span>
                 </div>
               ))}
@@ -4431,8 +4446,8 @@ function OperationsTab() {
           {view === "usage" && <div className="grid grid-cols-2 md:grid-cols-4 gap-2">
             <StatTile label="LLM calls" value={llm.total_calls || 0} />
             <StatTile label="Tokens" value={(llm.total_tokens || 0).toLocaleString()} />
-            <StatTile label="Cost" value={`$${(llm.total_cost_usd || 0).toFixed(4)}`} tone={(llm.total_cost_usd || 0) > 1 ? "amber" : "stone"} />
-            <StatTile label="$/token" value={`$${(llm.cost_per_token_usd || 0).toExponential(2)}`} />
+            <StatTile label={`Cost${estimatedCostSuffix(llm.estimated_cost_rate)}`} value={formatUsd(llm.total_cost_usd)} tone={(llm.total_cost_usd || 0) > 1 ? "amber" : "stone"} />
+            <StatTile label="Cost / 1M tokens" value={formatCostPerMillionTokens(llm.cost_per_token_usd)} />
           </div>}
 
           {view === "usage" && <div className="rounded-xl border border-stone-200 bg-white overflow-hidden">
@@ -4451,8 +4466,8 @@ function OperationsTab() {
                     </p>
                   </div>
                   <div className="text-right">
-                    <p className="text-sm font-semibold text-stone-900">${Number(row.total_cost_usd || 0).toFixed(5)}</p>
-                    <p className="text-[11px] text-stone-400">${Number(row.cost_per_token_usd || 0).toExponential(2)}/token</p>
+                    <p className="text-sm font-semibold text-stone-900">{formatUsd(row.total_cost_usd, 5)}</p>
+                    <p className="text-[11px] text-stone-400">{formatCostPerMillionTokens(row.cost_per_token_usd)} / 1M tokens</p>
                   </div>
                 </div>
               ))}
@@ -4474,10 +4489,11 @@ function OperationsTab() {
                         <p className="text-xs font-medium text-stone-800 truncate">{row.task}</p>
                         <p className="text-[11px] text-stone-400 truncate">{row.provider} · {row.model}</p>
                       </div>
-                      <p className="text-xs font-semibold text-stone-900">${Number(row.total_cost_usd || 0).toFixed(5)}</p>
+                      <p className="text-xs font-semibold text-stone-900">{formatUsd(row.total_cost_usd, 5)}</p>
                     </div>
                     <p className="text-[11px] text-stone-400 mt-1">
-                      {(row.total_tokens || 0).toLocaleString()} tokens · {row.calls} calls · p95 {row.p95_ms}ms
+                      {(row.total_tokens || 0).toLocaleString()} tokens · {row.calls} calls · p95 {row.p95_ms}ms · {formatCostPerMillionTokens(row.cost_per_token_usd)} / 1M
+                      {estimatedCostSuffix(row.estimated_cost_rate)}
                     </p>
                   </div>
                 ))}
@@ -4498,7 +4514,7 @@ function OperationsTab() {
                         <p className="text-xs font-medium text-stone-800 truncate">{row.task}</p>
                         <p className="text-[11px] text-stone-400 truncate">{row.effective_provider || row.provider} · {row.effective_model || row.model}</p>
                       </div>
-                      <p className="text-xs font-semibold text-stone-900">${Number(row.cost_usd || 0).toFixed(5)}</p>
+                      <p className="text-xs font-semibold text-stone-900">{formatUsd(row.cost_usd, 5)}</p>
                     </div>
                     <p className="text-[11px] text-stone-400 mt-1">
                       {(row.total_tokens || 0).toLocaleString()} tokens · in {row.input_tokens || 0} / out {row.output_tokens || 0}
