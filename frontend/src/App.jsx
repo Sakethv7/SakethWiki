@@ -3883,9 +3883,9 @@ function summarizeActionCandidate(c) {
 
 function OperationCommand({ title, detail, output, danger, busy, onClick, disabled }) {
   const cls = danger
-    ? "border-stone-900 bg-stone-900 text-white hover:bg-stone-800"
+    ? "border-red-200 bg-red-50 text-red-900 hover:bg-red-100"
     : "border-stone-200 bg-white text-stone-800 hover:bg-stone-50";
-  const subCls = danger ? "text-stone-300" : "text-stone-500";
+  const subCls = danger ? "text-red-700" : "text-stone-500";
   return (
     <button
       onClick={onClick}
