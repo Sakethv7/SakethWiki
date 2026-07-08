@@ -736,6 +736,43 @@ def route_eval_findings(report: dict[str, Any], actions: list[dict[str, Any]] | 
             }
             actions.append(noisy_action)
             telemetry.log_system_action(noisy_action)
+    curation_judge = report.get("ingest_curation_judge") or {}
+    for failure in curation_judge.get("failures", [])[:10]:
+        page = identity.resolve_slug(failure.get("final_page", ""))
+        hint = str(failure.get("suggested_prompt_hint") or "").strip()
+        title = str(failure.get("title") or failure.get("case_id") or "curation case").strip()
+        if page:
+            candidate = upsert_action_candidate(
+                {
+                    "risk": "medium",
+                    "action": "queue_page_review",
+                    "target": page,
+                    "status": "candidate",
+                    "title": f"Review curation quality for {page}",
+                    "reason": f"Curation judge flagged `{title}`: {failure.get('got', '')}",
+                    "proposed_change": {"page": page, "reason": failure.get("got", "")},
+                    "evidence": failure,
+                    "requires_eval": False,
+                    "requires_approval": False,
+                }
+            )
+            action = {
+                "action": "stage_curation_page_review",
+                "candidate_id": candidate["id"],
+                "reason": candidate["reason"],
+                "applied": False,
+            }
+            actions.append(action)
+            telemetry.log_system_action(action)
+        if hint:
+            action = {
+                "action": "flag_ingest_curation_prompt_hint",
+                "reason": hint,
+                "evidence": failure,
+                "applied": False,
+            }
+            actions.append(action)
+            telemetry.log_system_action(action)
     return actions
 
 

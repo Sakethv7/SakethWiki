@@ -132,13 +132,37 @@ flowchart TD
 
 ### Capture Path
 
-The Capture tab sends URL, text, or images to `POST /ingest`. URL ingestion uses deterministic fetching and HTML parsing before any model call. The extractor then receives four kinds of context: source content, existing page hints, learned prompt hints from `system-insights.md`, and durable correction patterns from `preferences.json`.
+The Capture tab sends URL, text, or images to `POST /ingest`. URL ingestion uses deterministic fetching and HTML parsing before any model call. Image ingestion keeps the base64 images in the extraction request even when companion text exists, because the vision path can read slide structure and turn data-flow diagrams into Mermaid with fewer source tokens than OCR-heavy text reconstruction. The extractor then receives four kinds of context: source content, existing page hints, learned prompt hints from `system-insights.md`, and durable correction patterns from `preferences.json`.
 
-The extractor does not write the vault directly. It stages a queue item in `hitl_queue.json`. The frontend shows the diff card so the human can approve, reject, or edit page slug, tags, summary, wikilinks, and diagram.
+Latency is part of the capture contract. Ingest records stage timings for URL fetch, vault-page lookup, slicing, image uncertainty extraction, web gap search, vision extraction, text extraction, and queue staging. Image asset saving records its own caption/write timings. These events flow into Operations telemetry so a slow `Processing...` state can be diagnosed as model latency, image captioning, search, storage, or queue overhead.
+
+Usage cost is part of the same operations contract. Each LLM call logs provider/model route, effective fallback route, input/output tokens, cache tokens when exposed, estimated dollar cost, and cost per token. Provider token counts are preferred; missing usage is estimated from character counts and marked as estimated. Pricing is configurable because model pricing drifts faster than architecture.
+
+Ingestion is now a curation contract before it is a summary contract. The extractor must decide `source_verdict`, `educational_core`, `discarded_context`, `knowledge_shape`, and `diagram_plan` before producing bullets. `ingest` means the source has durable educational signal. `source_only` means the source is mostly event, social, or provenance context, so only the transferable core should enter the page. `reject` means the source has no durable value for this wiki and should return a 400 instead of polluting the queue.
+
+```mermaid
+flowchart TD
+    A[Raw URL text image clip] --> B[Source triage]
+    B --> C{Durable educational value}
+    C -->|reject| R[No queue item]
+    C -->|source only| S[Keep provenance and core]
+    C -->|ingest| K[Extract durable knowledge]
+    S --> P[Plan knowledge shape]
+    K --> P
+    P --> D{Diagram useful}
+    D -->|yes| V[Create structure aware Mermaid]
+    D -->|no| N[No diagram]
+    V --> Q[HITL queue]
+    N --> Q
+```
+
+The extractor does not write the vault directly. It stages a queue item in `hitl_queue.json`. The frontend shows the diff card so the human can approve, reject, or edit page slug, tags, summary, wikilinks, diagram, and curation metadata.
 
 Approval writes through `wiki_writer.py`. Before writing, identity resolution canonicalizes the target page and wikilinks. If the page exists, evolution classification decides whether the new source extends, refines, supersedes, contradicts, or duplicates current understanding. If the page is new, the writer creates frontmatter and a current-understanding block. The source record is also written under `_wiki/sources/`.
 
-After approval or rejection, a trace goes to `_wiki/meta/traces.jsonl`. That same trace updates `_wiki/meta/preferences.json`, so repeated corrections shape future extraction without contaminating concept pages.
+After approval or rejection, a trace goes to `_wiki/meta/traces.jsonl`. That trace includes curation metadata, so the system loop can learn whether the agent kept educational signal, dropped event context, and chose a useful diagram plan. The same trace updates `_wiki/meta/preferences.json`, so repeated corrections shape future extraction without contaminating concept pages.
+
+Manual eval runs can add a bounded curation judge on top of deterministic replay. The deterministic layer checks whether traces carry the curation contract. The judge layer samples recent curation traces and scores whether the kept core is actually transferable knowledge, whether discarded context is correctly excluded, and whether the diagram plan is justified. Judge failures can stage page-review actions and prompt-hint evidence for the system loop; they do not rewrite notes directly.
 
 ### Query Path
 
@@ -544,7 +568,7 @@ Human review before any vault write prevents junk accumulating. `hitl_queue.json
 When a knowledge system becomes feature-rich, interaction friction becomes the bottleneck before model quality does. Focus Mode makes `Capture → Ask` the default loop and demotes `Browse/Dashboard` to secondary actions, without removing them. This preserves compounding behavior while reducing cognitive load and startup latency for daily use.
 
 ### Clipping Is Transport, Refinement Is Value
-Raw markdown clipping is now treated as transport. The value layer is refinement: dedupe, page routing, synthesis update, and trace-backed evolution. This lets Obsidian Web Clipper own ingestion speed while SakethWiki owns knowledge compounding quality.
+Raw markdown clipping is now treated as transport. The value layer is refinement: dedupe, source triage, page routing, synthesis update, diagram planning, and trace-backed evolution. This lets Obsidian Web Clipper own ingestion speed while SakethWiki owns knowledge compounding quality.
 
 ---
 

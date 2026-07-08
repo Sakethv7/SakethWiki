@@ -178,6 +178,8 @@ The next serious layer is higher-quality curated eval cases and deeper A/B repla
 
 ## FactoryMind Transfer
 
+Living handoff: [FACTORYMIND_TRANSFER.md](FACTORYMIND_TRANSFER.md)
+
 FactoryMind needs the same loop pattern, but the stakes are higher.
 
 SakethWiki can tolerate a bad tag. FactoryMind cannot tolerate an unsafe diagnosis or control suggestion. The eval harness there should be incident-based and replayable.

@@ -356,6 +356,113 @@ def test_telemetry_generates_inference_report(monkeypatch, tmp_path):
     assert "40.0%" in text
 
 
+def test_telemetry_summarizes_llm_cost(monkeypatch, tmp_path):
+    vault = tmp_path / "vault"
+    (vault / "_wiki" / "meta").mkdir(parents=True)
+    monkeypatch.setenv("VAULT_PATH", str(vault))
+
+    telemetry.log_llm_call(
+        {
+            "task": "INGEST_EXTRACT",
+            "provider": "anthropic",
+            "requested_provider": "anthropic",
+            "model": "claude-sonnet-4-6",
+            "effective_provider": "anthropic",
+            "effective_model": "claude-sonnet-4-6",
+            "duration_ms": 25000,
+            "input_chars": 12000,
+            "output_chars": 2000,
+            "input_tokens": 3000,
+            "output_tokens": 500,
+            "total_tokens": 3500,
+            "cost_usd": 0.0165,
+            "cost_per_token_usd": 0.0000047143,
+            "cost_estimated": False,
+            "max_tokens": 1500,
+            "expect_json": True,
+            "contract_ok": True,
+            "fallback_used": False,
+            "error": None,
+        }
+    )
+
+    summary = telemetry.summarize_llm_calls()
+
+    assert summary["total_tokens"] == 3500
+    assert summary["total_cost_usd"] == 0.0165
+    assert summary["by_task"]["INGEST_EXTRACT"]["total_cost_usd"] == 0.0165
+    assert summary["by_task"]["INGEST_EXTRACT"]["cost_per_token_usd"] == 0.0000047143
+    assert summary["recent_expensive_calls"][0]["task"] == "INGEST_EXTRACT"
+
+
+def test_image_caption_response_parser_handles_json_and_prose():
+    parsed = main._parse_image_caption_response(
+        '```json\n{"slug": "Latency Dashboard", "caption": "A dashboard showing ingest latency."}\n```',
+        index=0,
+    )
+    assert parsed == {
+        "slug": "latency-dashboard",
+        "caption": "A dashboard showing ingest latency.",
+    }
+
+    prose = main._parse_image_caption_response("Screenshot of operation telemetry panels.", index=1)
+    assert prose["slug"] == "screenshot-of-operation-telemetry-panels"
+    assert prose["caption"] == "Screenshot of operation telemetry panels."
+
+    empty = main._parse_image_caption_response("", index=2)
+    assert empty == {"slug": "image-3", "caption": ""}
+
+
+def test_telemetry_summarizes_ingest_latency(monkeypatch, tmp_path):
+    vault = tmp_path / "vault"
+    (vault / "_wiki" / "meta").mkdir(parents=True)
+    monkeypatch.setenv("VAULT_PATH", str(vault))
+
+    telemetry.log_context_event(
+        "ingest_latency",
+        {
+            "source_type": "lecture",
+            "image_count": 3,
+            "total_ms": 42000,
+            "stage_ms": {
+                "image_uncertainty_extract": 9000,
+                "image_gap_search": 5000,
+                "vision_extract": 26000,
+                "queue_stage": 20,
+            },
+        },
+    )
+    telemetry.log_context_event(
+        "ingest_latency",
+        {
+            "source_type": "text",
+            "image_count": 0,
+            "total_ms": 10000,
+            "stage_ms": {"text_extract_slices": 9000, "queue_stage": 15},
+        },
+    )
+    telemetry.log_context_event(
+        "store_image_latency",
+        {
+            "source_type": "store_image",
+            "image_count": 3,
+            "total_ms": 12000,
+            "stage_ms": {"caption_image_1": 5000, "caption_image_2": 5000},
+        },
+    )
+
+    summary = telemetry.summarize_context_events()
+
+    assert summary["ingest_latency_events"] == 2
+    assert summary["store_image_latency_events"] == 1
+    assert summary["ingest_latency_median_ms"] == 26000
+    assert summary["ingest_latency_p95_ms"] == 42000
+    assert summary["store_image_latency_median_ms"] == 12000
+    assert summary["recent_ingest_latency"][-1]["source_type"] == "text"
+    assert summary["recent_store_image_latency"][-1]["image_count"] == 3
+    assert summary["ingest_slow_stages"][0]["stage"] == "vision_extract"
+
+
 def test_system_loop_routes_repeated_preferences(monkeypatch, tmp_path):
     vault = tmp_path / "vault"
     (vault / "_wiki" / "meta").mkdir(parents=True)

@@ -179,8 +179,8 @@ cd frontend && npm run build
 
 | Method | Path | Description |
 |--------|------|-------------|
-| POST | `/ingest` | Fetch URL or accept text/image, extract metadata, stage to queue |
-| POST | `/ingest-markdown` | Stage pasted markdown clip directly to intelligence queue |
+| POST | `/ingest` | Fetch URL or accept text/image, triage source value, extract metadata, stage to queue |
+| POST | `/ingest-markdown` | Stage pasted markdown clip directly to curation-aware intelligence queue |
 | POST | `/inbox/process` | Scan `_wiki/inbox/*.md` and stage clips to queue |
 | GET | `/queue` | List all pending review items |
 | POST | `/approve/{id}` | Approve or reject a queued item |
@@ -501,7 +501,11 @@ The `/ingest` endpoint detects iOS clients (`CFNetwork`/`Darwin`/`Shortcuts` in 
 
 ## Image Capture
 
-Paste images anywhere on the page (Cmd+V) — no textarea focus required. Or drag-and-drop onto the Capture card (orange highlight on hover). Images are base64-encoded and sent with `/ingest`. Tap a thumbnail to view full-size; tap `+` to add more.
+Paste images anywhere on the page (Cmd+V) — no textarea focus required. Or drag-and-drop onto the Capture card (orange highlight on hover). Images are base64-encoded and sent with `/ingest`. If text is present with images, the frontend still sends the images to the vision extraction path so visual structure can become Mermaid diagrams; the images are also saved as vault assets. Tap a thumbnail to view full-size; tap `+` to add more.
+
+Capture responses include latency metadata. `/ingest` logs stage timings for fetch, slicing, image uncertainty extraction, web gap search, vision/text extraction, and queue staging. `/store-image` logs image decode, caption, and write timings. The preview card shows client/server timing for the current run, and Operations → Telemetry keeps recent ingest/image-save latency plus slow-stage summaries.
+
+Operations → Usage summarizes LLM token and cost telemetry by task, route, and recent expensive call. Provider-reported token usage is used when available; otherwise SakethWiki estimates tokens from character counts. Costs use built-in per-million-token defaults for common configured models and can be overridden with environment variables such as `LLM_PRICE_ANTHROPIC_CLAUDE_SONNET_4_6_INPUT_PER_1M` and `LLM_PRICE_ANTHROPIC_CLAUDE_SONNET_4_6_OUTPUT_PER_1M`.
 
 ---
 
@@ -556,8 +560,9 @@ If you re-export the AppleScript app, assign `resources/AppIcon.icns` as the app
 Capture is now split into transport vs intelligence:
 
 - **Transport:** Obsidian Web Clipper writes markdown into vault (`_wiki/inbox`) or you paste markdown in the Capture box.
-- **Intelligence:** SakethWiki parses clip content, proposes `suggested_page` / tags / links, and stages it to HITL queue.
+- **Intelligence:** SakethWiki parses clip content, separates durable educational signal from discarded event/social context, proposes `suggested_page` / tags / links / diagram plan, and stages it to HITL queue.
 - **Decision:** You approve merge/create/discard in the same queue UI.
+- **Eval:** Manual eval runs include a bounded curation judge that samples recent traces and flags weak kept cores, missing discarded context, and unjustified diagram plans.
 
 ### Option A — paste markdown directly
 

@@ -7,6 +7,7 @@ to Qwen (or other OpenAI-compatible providers) without changing app code.
 import json
 import os
 import time
+from dataclasses import dataclass, field
 from typing import Any, Optional
 
 import httpx
@@ -22,6 +23,12 @@ CRITICAL_TASKS = {
     "KNOWLEDGE_GAPS",
     "EVOLUTION_CLASSIFY",
 }
+
+
+@dataclass
+class CompletionResult:
+    text: str
+    usage: dict[str, Any] = field(default_factory=dict)
 
 
 def _task_key(task: str) -> str:
@@ -136,6 +143,87 @@ def _valid_contract(text: str, expect_json: bool, required_keys: Optional[list[s
     return all(k in parsed for k in required_keys)
 
 
+def _estimate_tokens_from_chars(chars: int) -> int:
+    return max(1, int(round(max(chars, 0) / 4)))
+
+
+def _price_env_key(provider: str, model: str, direction: str) -> str:
+    safe_model = "".join(c if c.isalnum() else "_" for c in model).upper()
+    safe_provider = "".join(c if c.isalnum() else "_" for c in provider).upper()
+    return f"LLM_PRICE_{safe_provider}_{safe_model}_{direction.upper()}_PER_1M"
+
+
+def _default_price_per_1m(provider: str, model: str, direction: str) -> float:
+    m = model.lower()
+    p = provider.lower()
+    if p == "ollama":
+        return 0.0
+    if "haiku" in m:
+        return 1.0 if direction == "input" else 5.0
+    if "sonnet" in m:
+        return 3.0 if direction == "input" else 15.0
+    if "gpt-4o-mini" in m:
+        return 0.15 if direction == "input" else 0.60
+    if "gemini-2.5-flash" in m or "gemini-1.5-flash" in m:
+        return 0.30 if direction == "input" else 2.50
+    if "qwen-vl-plus" in m or "qwen-plus" in m:
+        return 0.40 if direction == "input" else 1.20
+    return 0.0
+
+
+def _price_per_1m(provider: str, model: str, direction: str) -> float:
+    specific = os.environ.get(_price_env_key(provider, model, direction), "").strip()
+    generic = os.environ.get(f"LLM_PRICE_{direction.upper()}_PER_1M", "").strip()
+    for raw in (specific, generic):
+        if not raw:
+            continue
+        try:
+            return max(0.0, float(raw))
+        except ValueError:
+            continue
+    return _default_price_per_1m(provider, model, direction)
+
+
+def _usage_with_estimates(provider: str, model: str, usage: dict[str, Any], input_chars: int, output_chars: int) -> dict[str, Any]:
+    input_tokens = int(usage.get("input_tokens", 0) or 0)
+    output_tokens = int(usage.get("output_tokens", 0) or 0)
+    cache_creation_tokens = int(usage.get("cache_creation_input_tokens", 0) or 0)
+    cache_read_tokens = int(usage.get("cache_read_input_tokens", 0) or 0)
+    estimated = False
+    if input_tokens <= 0:
+        input_tokens = _estimate_tokens_from_chars(input_chars)
+        estimated = True
+    if output_tokens <= 0:
+        output_tokens = _estimate_tokens_from_chars(output_chars)
+        estimated = True
+
+    input_price = _price_per_1m(provider, model, "input")
+    output_price = _price_per_1m(provider, model, "output")
+    # Treat cache read as 10% input cost when providers expose it. This matches
+    # Anthropic prompt-cache economics closely enough for local observability.
+    billable_input_tokens = input_tokens + cache_creation_tokens + (cache_read_tokens * 0.10)
+    input_usd = (billable_input_tokens / 1_000_000) * input_price
+    output_usd = (output_tokens / 1_000_000) * output_price
+    total_usd = input_usd + output_usd
+    total_tokens = input_tokens + output_tokens + cache_creation_tokens + cache_read_tokens
+    return {
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "cache_creation_input_tokens": cache_creation_tokens,
+        "cache_read_input_tokens": cache_read_tokens,
+        "total_tokens": total_tokens,
+        "billable_input_tokens": round(billable_input_tokens, 1),
+        "input_usd": round(input_usd, 8),
+        "output_usd": round(output_usd, 8),
+        "cost_usd": round(total_usd, 8),
+        "input_price_per_1m": input_price,
+        "output_price_per_1m": output_price,
+        "cost_per_token_usd": round(total_usd / total_tokens, 10) if total_tokens else 0,
+        "usage_source": usage.get("source", "provider") if not estimated else "estimated",
+        "cost_estimated": estimated or ((input_price == 0.0 and output_price == 0.0) and provider.lower() != "ollama"),
+    }
+
+
 def _normalize_openai_content(content: Any) -> Any:
     if isinstance(content, str):
         return content
@@ -198,7 +286,7 @@ def _anthropic_complete(
     messages: list[dict[str, Any]],
     system: Optional[Any],
     api_key: Optional[str],
-) -> str:
+) -> CompletionResult:
     import anthropic
 
     client = anthropic.Anthropic(api_key=api_key or os.environ.get("ANTHROPIC_API_KEY"))
@@ -229,7 +317,15 @@ def _anthropic_complete(
     for block in getattr(resp, "content", []):
         if getattr(block, "type", "") == "text":
             text_parts.append(getattr(block, "text", ""))
-    return "".join(text_parts).strip()
+    usage_obj = getattr(resp, "usage", None)
+    usage = {
+        "input_tokens": int(getattr(usage_obj, "input_tokens", 0) or 0),
+        "output_tokens": int(getattr(usage_obj, "output_tokens", 0) or 0),
+        "cache_creation_input_tokens": int(getattr(usage_obj, "cache_creation_input_tokens", 0) or 0),
+        "cache_read_input_tokens": int(getattr(usage_obj, "cache_read_input_tokens", 0) or 0),
+        "source": "provider",
+    }
+    return CompletionResult("".join(text_parts).strip(), usage)
 
 
 def _openai_compat_complete(
@@ -240,7 +336,7 @@ def _openai_compat_complete(
     messages: list[dict[str, Any]],
     system: Optional[Any],
     api_key: Optional[str],
-) -> str:
+) -> CompletionResult:
     if provider == "qwen":
         base_url = os.environ.get("QWEN_BASE_URL", "https://dashscope-intl.aliyuncs.com/compatible-mode/v1")
         key = api_key or os.environ.get("QWEN_API_KEY")
@@ -275,15 +371,22 @@ def _openai_compat_complete(
 
     msg = (((data.get("choices") or [{}])[0]).get("message") or {})
     content = msg.get("content", "")
+    usage_obj = data.get("usage") or {}
+    usage = {
+        "input_tokens": int(usage_obj.get("prompt_tokens", 0) or usage_obj.get("input_tokens", 0) or 0),
+        "output_tokens": int(usage_obj.get("completion_tokens", 0) or usage_obj.get("output_tokens", 0) or 0),
+        "total_tokens": int(usage_obj.get("total_tokens", 0) or 0),
+        "source": "provider" if usage_obj else "missing",
+    }
     if isinstance(content, str):
-        return content.strip()
+        return CompletionResult(content.strip(), usage)
     if isinstance(content, list):
         parts = []
         for block in content:
             if isinstance(block, dict) and block.get("type") == "text":
                 parts.append(block.get("text", ""))
-        return "".join(parts).strip()
-    return str(content).strip()
+        return CompletionResult("".join(parts).strip(), usage)
+    return CompletionResult(str(content).strip(), usage)
 
 
 def complete(
@@ -315,9 +418,13 @@ def complete(
     resolved_model = _model_for_task(task, provider, model, has_images)
     primary_err: Optional[Exception] = None
     primary_text = ""
+    primary_usage: dict[str, Any] = {}
     input_chars = telemetry.estimate_chars({"system": system, "messages": messages})
 
-    def _log(*, text: str = "", fallback_used: bool = False, fallback_model: str = "", contract_ok: bool = False, error: str = "") -> None:
+    def _log(*, text: str = "", usage: dict[str, Any] | None = None, fallback_used: bool = False, fallback_model: str = "", contract_ok: bool = False, error: str = "") -> None:
+        effective_provider = "anthropic" if fallback_model else provider
+        effective_model = fallback_model or resolved_model
+        cost = _usage_with_estimates(effective_provider, effective_model, usage or {}, input_chars, len(text or ""))
         telemetry.log_llm_call(
             {
                 "task": key,
@@ -325,9 +432,12 @@ def complete(
                 "requested_provider": requested_provider,
                 "model": resolved_model,
                 "fallback_model": fallback_model,
+                "effective_provider": effective_provider,
+                "effective_model": effective_model,
                 "duration_ms": round((time.perf_counter() - started) * 1000, 1),
                 "input_chars": input_chars,
                 "output_chars": len(text or ""),
+                **cost,
                 "max_tokens": max_tokens,
                 "expect_json": bool(expect_json),
                 "required_json_keys": required_json_keys or [],
@@ -340,7 +450,7 @@ def complete(
 
     try:
         if provider == "anthropic":
-            primary_text = _anthropic_complete(
+            primary_result = _anthropic_complete(
                 model=resolved_model,
                 max_tokens=max_tokens,
                 messages=messages,
@@ -348,7 +458,7 @@ def complete(
                 api_key=api_key,
             )
         else:
-            primary_text = _openai_compat_complete(
+            primary_result = _openai_compat_complete(
                 provider=provider,
                 model=resolved_model,
                 max_tokens=max_tokens,
@@ -356,39 +466,43 @@ def complete(
                 system=system,
                 api_key=api_key,
             )
+        primary_text = primary_result.text
+        primary_usage = primary_result.usage
     except Exception as e:
         primary_err = e
 
     if primary_text and _valid_contract(primary_text, expect_json, required_json_keys):
-        _log(text=primary_text, contract_ok=True)
+        _log(text=primary_text, usage=primary_usage, contract_ok=True)
         return primary_text
 
     if provider == "anthropic" or not _fallback_enabled(task):
         if primary_err:
-            _log(text=primary_text, contract_ok=False, error=f"{type(primary_err).__name__}: {primary_err}")
+            _log(text=primary_text, usage=primary_usage, contract_ok=False, error=f"{type(primary_err).__name__}: {primary_err}")
             raise primary_err
-        _log(text=primary_text, contract_ok=False, error="LLM contract failed")
+        _log(text=primary_text, usage=primary_usage, contract_ok=False, error="LLM contract failed")
         raise RuntimeError(f"LLM contract failed for task={key} provider={provider} model={resolved_model}")
 
     fallback_model = os.environ.get(f"LLM_FALLBACK_MODEL_{key}", "").strip() or _model_for_task(
         task, "anthropic", model, has_images
     )
     try:
-        fallback_text = _anthropic_complete(
+        fallback_result = _anthropic_complete(
             model=fallback_model,
             max_tokens=max_tokens,
             messages=messages,
             system=system,
             api_key=api_key,
         )
+        fallback_text = fallback_result.text
+        fallback_usage = fallback_result.usage
     except Exception as fallback_err:
         err = f"{type(fallback_err).__name__}: {fallback_err}"
-        _log(text=primary_text, fallback_used=True, fallback_model=fallback_model, contract_ok=False, error=err)
+        _log(text=primary_text, usage=primary_usage, fallback_used=True, fallback_model=fallback_model, contract_ok=False, error=err)
         raise
     if _valid_contract(fallback_text, expect_json, required_json_keys):
-        _log(text=fallback_text, fallback_used=True, fallback_model=fallback_model, contract_ok=True)
+        _log(text=fallback_text, usage=fallback_usage, fallback_used=True, fallback_model=fallback_model, contract_ok=True)
         return fallback_text
-    _log(text=fallback_text, fallback_used=True, fallback_model=fallback_model, contract_ok=False, error="LLM fallback contract failed")
+    _log(text=fallback_text, usage=fallback_usage, fallback_used=True, fallback_model=fallback_model, contract_ok=False, error="LLM fallback contract failed")
     raise RuntimeError(
         f"LLM fallback contract failed for task={key} provider={provider}→anthropic model={resolved_model}→{fallback_model}"
     )

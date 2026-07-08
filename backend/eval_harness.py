@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 import identity
+import llm_client
 import memory_store
 import preference_memory
 import telemetry
@@ -269,9 +270,205 @@ def run_retrieval_eval(limit: int = 30) -> dict[str, Any]:
     }
 
 
-def run_eval(candidate: dict[str, Any] | None = None) -> dict[str, Any]:
+def run_ingest_curation_eval(limit: int = 100) -> dict[str, Any]:
+    traces = _read_jsonl(_traces_path())[-limit:]
+    total = len(traces)
+    with_contract = 0
+    source_only = 0
+    rejected_with_reason = 0
+    diagram_mismatches = 0
+    shape_counts: dict[str, int] = {}
+    failures: list[dict[str, Any]] = []
+
+    for i, trace in enumerate(traces, start=1):
+        verdict = str(trace.get("source_verdict") or "").strip()
+        shape = str(trace.get("knowledge_shape") or "").strip()
+        plan = trace.get("diagram_plan") if isinstance(trace.get("diagram_plan"), dict) else {}
+        discarded = trace.get("discarded_context") if isinstance(trace.get("discarded_context"), list) else []
+        has_contract = bool(verdict and shape and isinstance(plan, dict))
+        with_contract += 1 if has_contract else 0
+        if not has_contract:
+            failures.append({
+                "suite": "ingest_curation",
+                "case_id": f"trace-{i}",
+                "expected": "curation contract",
+                "got": "missing",
+                "title": trace.get("title", ""),
+            })
+        if verdict == "source_only":
+            source_only += 1
+            if not discarded:
+                failures.append({
+                    "suite": "ingest_curation",
+                    "case_id": f"trace-{i}",
+                    "expected": "discarded_context for source_only",
+                    "got": "empty",
+                    "title": trace.get("title", ""),
+                })
+        if trace.get("approved") is False and discarded:
+            rejected_with_reason += 1
+        if shape:
+            shape_counts[shape] = shape_counts.get(shape, 0) + 1
+        if plan.get("needed") is False and trace.get("diagram"):
+            diagram_mismatches += 1
+            failures.append({
+                "suite": "ingest_curation",
+                "case_id": f"trace-{i}",
+                "expected": "no diagram",
+                "got": "diagram present",
+                "title": trace.get("title", ""),
+            })
+
+    return {
+        "suite": "ingest_curation",
+        "cases": total,
+        "contract_coverage": round(with_contract / total, 4) if total else None,
+        "source_only": source_only,
+        "rejected_with_reason": rejected_with_reason,
+        "diagram_mismatches": diagram_mismatches,
+        "shape_counts": shape_counts,
+        "failures": failures[:20],
+    }
+
+
+def run_ingest_curation_judge(limit: int = 8) -> dict[str, Any]:
+    """Bounded LLM judge for whether curation kept transferable knowledge and dropped noise."""
+    traces = [
+        trace for trace in _read_jsonl(_traces_path())
+        if trace.get("source_verdict") and trace.get("knowledge_shape")
+    ][-limit:]
+    if not traces:
+        return {
+            "suite": "ingest_curation_judge",
+            "ran": False,
+            "reason": "no curation traces with contract fields",
+            "cases": 0,
+            "pass_rate": None,
+            "failures": [],
+        }
+
+    cases: list[dict[str, Any]] = []
+    start = max(1, len(_read_jsonl(_traces_path())) - len(traces) + 1)
+    for offset, trace in enumerate(traces):
+        cases.append({
+            "case_id": f"trace-{start + offset}",
+            "approved": bool(trace.get("approved")),
+            "title": trace.get("title", ""),
+            "source_type": trace.get("source_type", ""),
+            "source_verdict": trace.get("source_verdict", ""),
+            "knowledge_shape": trace.get("knowledge_shape", ""),
+            "summary": trace.get("summary", []),
+            "key_concepts": trace.get("key_concepts", []),
+            "educational_core": trace.get("educational_core", []),
+            "discarded_context": trace.get("discarded_context", []),
+            "diagram_plan": trace.get("diagram_plan", {}),
+            "diagram_present": bool(trace.get("diagram")),
+            "final_page": trace.get("final_page", ""),
+        })
+
+    prompt = f"""You are judging SakethWiki ingestion curation quality.
+
+SakethWiki should keep durable, transferable knowledge and discard event chronology, social proof, hype context, sponsor copy, or biographical namedropping unless it defines the concept.
+
+For each case, decide if curation passed.
+
+Pass criteria:
+- educational_core and summary contain reusable concepts, mechanisms, distinctions, failure modes, or implementation lessons.
+- discarded_context names details that should not become durable notes when such details exist.
+- source_verdict is appropriate: ingest for durable educational sources, source_only for sources mostly useful as provenance/context, reject for no durable value.
+- knowledge_shape matches the dominant structure.
+- diagram_plan is justified. Prefer no diagram over a generic or fake graph.
+
+Return ONLY JSON:
+{{
+  "cases": [
+    {{
+      "case_id": "trace-1",
+      "passed": true,
+      "score": 0.0,
+      "issues": ["short issue"],
+      "suggested_prompt_hint": "one concrete prompt hint or empty string"
+    }}
+  ],
+  "summary": "2 sentence summary"
+}}
+
+Cases:
+{json.dumps(cases, ensure_ascii=False, indent=2)[:12000]}
+"""
+    try:
+        raw = llm_client.complete(
+            task="ingest_curation_judge",
+            model=None,
+            max_tokens=1800,
+            messages=[{"role": "user", "content": prompt}],
+            expect_json=True,
+            required_json_keys=["cases", "summary"],
+        )
+        raw = raw.strip()
+        if raw.startswith("```"):
+            raw = raw.split("```", 1)[1]
+            if raw.startswith("json"):
+                raw = raw[4:]
+            raw = raw.strip()
+        data = json.loads(raw)
+    except Exception as exc:
+        return {
+            "suite": "ingest_curation_judge",
+            "ran": False,
+            "reason": str(exc),
+            "cases": len(cases),
+            "pass_rate": None,
+            "failures": [],
+        }
+
+    judged = data.get("cases", []) if isinstance(data, dict) else []
+    failures: list[dict[str, Any]] = []
+    passed = 0
+    total = 0
+    for row in judged:
+        if not isinstance(row, dict):
+            continue
+        total += 1
+        ok = bool(row.get("passed"))
+        passed += 1 if ok else 0
+        if not ok:
+            case_id = str(row.get("case_id") or "").strip()
+            case = next((c for c in cases if c["case_id"] == case_id), {})
+            failures.append({
+                "suite": "ingest_curation_judge",
+                "case_id": case_id,
+                "expected": "high quality curation",
+                "got": "; ".join(str(x) for x in row.get("issues", []) if str(x).strip())[:500] or "judge failed case",
+                "title": case.get("title", ""),
+                "final_page": case.get("final_page", ""),
+                "suggested_prompt_hint": str(row.get("suggested_prompt_hint") or "").strip(),
+                "score": row.get("score"),
+            })
+
+    return {
+        "suite": "ingest_curation_judge",
+        "ran": True,
+        "reason": "",
+        "cases": total,
+        "pass_rate": round(passed / total, 4) if total else None,
+        "summary": str(data.get("summary") or ""),
+        "failures": failures[:20],
+    }
+
+
+def run_eval(candidate: dict[str, Any] | None = None, include_judge: bool = False) -> dict[str, Any]:
     preference = run_preference_replay_eval()
     retrieval = run_retrieval_eval()
+    curation = run_ingest_curation_eval()
+    curation_judge = run_ingest_curation_judge() if include_judge else {
+        "suite": "ingest_curation_judge",
+        "ran": False,
+        "reason": "not requested",
+        "cases": 0,
+        "pass_rate": None,
+        "failures": [],
+    }
     context = telemetry.summarize_context_events()
 
     candidate_result = None
@@ -354,6 +551,8 @@ def run_eval(candidate: dict[str, Any] | None = None) -> dict[str, Any]:
         "candidate": candidate_result,
         "preference_replay": preference,
         "retrieval": retrieval,
+        "ingest_curation": curation,
+        "ingest_curation_judge": curation_judge,
         "context": context,
     }
     write_eval_report(report)
@@ -411,8 +610,15 @@ def write_eval_report(report: dict[str, Any]) -> Path:
     path = telemetry.reports_dir() / f"eval-{today}.md"
     pref = report["preference_replay"]
     retrieval = report["retrieval"]
+    curation = report.get("ingest_curation", {})
+    curation_judge = report.get("ingest_curation_judge", {})
     candidate = report.get("candidate") or {}
-    failures = [*pref.get("failures", []), *retrieval.get("failures", [])][:12]
+    failures = [
+        *pref.get("failures", []),
+        *retrieval.get("failures", []),
+        *curation.get("failures", []),
+        *curation_judge.get("failures", []),
+    ][:12]
     failure_lines = [
         f"- `{f.get('suite')}` expected `{f.get('expected')}`, got `{f.get('got')}` for {f.get('title') or f.get('query') or f.get('case_id')}"
         for f in failures
@@ -447,6 +653,23 @@ passed: {str(report["passed"]).lower()}
 - Cases: {retrieval["cases"]}
 - Top 1: {retrieval["top1_rate"]}
 - Top 3: {retrieval["top3_rate"]}
+
+## Ingest Curation
+
+- Cases: {curation.get("cases")}
+- Contract coverage: {curation.get("contract_coverage")}
+- Source-only traces: {curation.get("source_only")}
+- Rejected with explicit reason: {curation.get("rejected_with_reason")}
+- Diagram plan mismatches: {curation.get("diagram_mismatches")}
+- Knowledge shapes: {json.dumps(curation.get("shape_counts", {}), sort_keys=True)}
+
+## Ingest Curation Judge
+
+- Ran: {curation_judge.get("ran")}
+- Cases: {curation_judge.get("cases")}
+- Pass rate: {curation_judge.get("pass_rate")}
+- Reason: {curation_judge.get("reason", "")}
+- Summary: {curation_judge.get("summary", "")}
 
 ## Failures
 

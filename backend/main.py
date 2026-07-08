@@ -16,6 +16,7 @@ import os
 import random
 import re as _re
 import shutil
+import time
 import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -87,6 +88,8 @@ RAG_CONTEXT_BUDGET      = 6000   # total chars of vault context injected into ch
 SELF_LEARN_TRACE_WINDOW = 100    # last N traces sent to Sonnet for weekly analysis
 LINT_CACHE_TTL_SECONDS  = 86400  # 24 h — lint report cache validity
 WEEKLY_ANALYSIS_INTERVAL_SECONDS = 3600  # scheduler checks every hour
+SOURCE_VERDICTS = {"ingest", "source_only", "reject"}
+KNOWLEDGE_SHAPES = {"taxonomy", "mechanism", "architecture", "argument", "case_study", "none"}
 
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -409,6 +412,7 @@ def _stage_markdown_clip(markdown: str, source_url: str = "", clip_title: str = 
         "tags": extraction.get("tags", []),
         "references": extraction.get("references", []),
         "diagram": extraction.get("diagram", ""),
+        **_curation_fields(extraction),
         "source_type": "clip_markdown",
         "clip_signature": sig,
         "raw_markdown": text,
@@ -431,6 +435,11 @@ def _regen_item(item: dict, mode: str = "full") -> dict:
             summary=updated.get("summary", []),
             key_concepts=updated.get("key_concepts", []),
         )
+        updated["diagram_plan"] = {
+            "needed": bool(updated.get("diagram")),
+            "type": "regenerated",
+            "reason": "Diagram was explicitly regenerated from the review queue.",
+        }
         updated["regenerated_at"] = datetime.now().isoformat()
         updated["regenerated_mode"] = "diagram"
         return updated
@@ -452,7 +461,11 @@ def _regen_item(item: dict, mode: str = "full") -> dict:
     else:
         raise HTTPException(400, "Cannot regenerate: item has neither raw_markdown nor url")
 
-    for k in ["title", "key_concepts", "summary", "suggested_page", "suggested_wikilinks", "tags", "references", "diagram"]:
+    for k in [
+        "title", "key_concepts", "summary", "suggested_page", "suggested_wikilinks",
+        "tags", "references", "diagram", "source_verdict", "educational_core",
+        "discarded_context", "knowledge_shape", "diagram_plan",
+    ]:
         updated[k] = extraction.get(k, updated.get(k))
     updated["regenerated_at"] = datetime.now().isoformat()
     updated["regenerated_mode"] = "full"
@@ -466,8 +479,14 @@ def _is_ios_shortcut(request: Request) -> bool:
 
 @app.post("/ingest")
 async def ingest(req: IngestRequest, request: Request):
-    if not req.url and not req.text and not req.image_base64:
-        raise HTTPException(400, "Provide url, text, or image_base64")
+    request_started = time.perf_counter()
+    stage_ms: dict[str, float] = {}
+
+    def _mark_stage(name: str, started: float) -> None:
+        stage_ms[name] = round((time.perf_counter() - started) * 1000, 1)
+
+    if not req.url and not req.text and not req.image_base64 and not req.images:
+        raise HTTPException(400, "Provide url, text, image_base64, or images")
 
     source_url = req.url or ""
 
@@ -507,7 +526,9 @@ async def ingest(req: IngestRequest, request: Request):
 
     # Step 1: fetch URL with httpx + parse with BeautifulSoup (zero LLM)
     if req.url:
+        started = time.perf_counter()
         raw_text = await loop.run_in_executor(None, _fetch_url, req.url)
+        _mark_stage("fetch_url", started)
 
     if req.text:
         raw_text = (raw_text + "\n\n" + req.text).strip()
@@ -518,22 +539,49 @@ async def ingest(req: IngestRequest, request: Request):
         all_images = [{"data": req.image_base64, "mediaType": "image/png"}]
 
     # Step 2: extract — image payloads skip slicing (already atomic)
+    started = time.perf_counter()
     existing_pages = [p["name"] for p in vault_reader.list_concept_pages()]
+    _mark_stage("list_existing_pages", started)
     source_type = req.source_type or ("lecture" if all_images else ("url" if req.url else "text"))
 
     if all_images:
         def _image_pipeline():
+            pipeline_stage_ms: dict[str, float] = {}
+
+            def _pipeline_mark(name: str, started: float) -> None:
+                pipeline_stage_ms[name] = round((time.perf_counter() - started) * 1000, 1)
+
+            started = time.perf_counter()
             uncertainties = _extract_image_uncertainties(all_images, req.user_notes or "")
+            _pipeline_mark("image_uncertainty_extract", started)
+            started = time.perf_counter()
             search_context = _tavily_search(uncertainties) if uncertainties else ""
+            _pipeline_mark("image_gap_search", started)
             enriched_text = (raw_text + "\n\n" + search_context).strip() if search_context else raw_text
-            return _extract_with_sonnet(
+            started = time.perf_counter()
+            extraction = _extract_with_sonnet(
                 enriched_text, all_images, source_url, existing_pages, user_notes=req.user_notes
             )
+            _pipeline_mark("vision_extract", started)
+            return {
+                "extraction": extraction,
+                "stage_ms": pipeline_stage_ms,
+                "uncertainty_count": len(uncertainties or []),
+                "search_context_chars": len(search_context or ""),
+            }
         slices = [{"title": "", "text": raw_text, "concept_hint": ""}]
-        extractions = [await loop.run_in_executor(None, _image_pipeline)]
+        started = time.perf_counter()
+        image_result = await loop.run_in_executor(None, _image_pipeline)
+        _mark_stage("image_pipeline_total", started)
+        stage_ms.update(image_result.get("stage_ms", {}))
+        extractions = [image_result["extraction"]]
+        image_uncertainty_count = image_result.get("uncertainty_count", 0)
+        image_search_context_chars = image_result.get("search_context_chars", 0)
     else:
         # Slice step: decide if content splits into multiple conceptual notes
+        started = time.perf_counter()
         slices = await loop.run_in_executor(None, _slice_content, raw_text, source_url, existing_pages)
+        _mark_stage("slice_content", started)
 
         # Extract each slice in parallel
         from concurrent.futures import ThreadPoolExecutor
@@ -546,10 +594,15 @@ async def ingest(req: IngestRequest, request: Request):
             if sl.get("concept_hint") and not ex.get("suggested_page"):
                 ex["suggested_page"] = sl["concept_hint"]
             return ex
+        started = time.perf_counter()
         with ThreadPoolExecutor(max_workers=min(len(slices), 4)) as pool:
             extractions = list(pool.map(_extract_slice, slices))
+        _mark_stage("text_extract_slices", started)
+        image_uncertainty_count = 0
+        image_search_context_chars = 0
 
     # Step 3: stage all slices to queue
+    started = time.perf_counter()
     items = []
     for extraction in extractions:
         item_id = str(uuid.uuid4())
@@ -566,18 +619,33 @@ async def ingest(req: IngestRequest, request: Request):
             "tags": extraction["tags"],
             "references": extraction.get("references", []),
             "diagram": extraction.get("diagram", ""),
+            **_curation_fields(extraction),
             "staged_at": datetime.now().isoformat(),
             "status": "pending",
         }
         queue_manager.enqueue(item)
         items.append(item)
+    _mark_stage("queue_stage", started)
 
     first = items[0]
+    total_ms = round((time.perf_counter() - request_started) * 1000, 1)
+    latency = {
+        "total_ms": total_ms,
+        "stage_ms": stage_ms,
+        "source_type": source_type,
+        "image_count": len(all_images),
+        "slice_count": len(items),
+        "source_chars": len(raw_text or ""),
+        "image_uncertainty_count": image_uncertainty_count,
+        "image_search_context_chars": image_search_context_chars,
+    }
+    telemetry.log_context_event("ingest_latency", latency)
     return {
         "id": first["id"],
         "sliced": len(items) > 1,
         "slice_count": len(items),
         "slice_titles": [it["title"] for it in items[1:]],
+        "latency": latency,
         "diff_preview": {
             "title": first["title"],
             "summary": first["summary"],
@@ -587,6 +655,7 @@ async def ingest(req: IngestRequest, request: Request):
             "key_concepts": first["key_concepts"],
             "references": first["references"],
             "diagram": first["diagram"],
+            **_curation_fields(first),
             "lenses": first.get("lenses", {}),
             "synthesis": first.get("synthesis", ""),
             "open_questions": first.get("open_questions", []),
@@ -617,6 +686,7 @@ async def ingest_markdown(req: MarkdownIngestRequest):
             "key_concepts": item["key_concepts"],
             "references": item["references"],
             "diagram": item["diagram"],
+            **_curation_fields(item),
         },
     }
 
@@ -1008,7 +1078,7 @@ def _extract_image_uncertainties(images: list, user_notes: str) -> list[str]:
         "Return [] if everything is self-contained."})
     try:
         raw = llm_client.complete(
-            task="ingest_extract",
+            task="ingest_image_uncertainties",
             model=None,  # vision model selected by provider routing
             max_tokens=200,
             messages=[{"role": "user", "content": content}],
@@ -1017,6 +1087,75 @@ def _extract_image_uncertainties(images: list, user_notes: str) -> list[str]:
         return json.loads(raw) if raw else []
     except Exception:
         return []
+
+
+def _string_list(value, limit: int = 8) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    out: list[str] = []
+    for item in value:
+        s = str(item).strip()
+        if s:
+            out.append(s[:280])
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _normalize_diagram_plan(value) -> dict:
+    if not isinstance(value, dict):
+        return {"needed": False, "type": "none", "reason": "No diagram plan returned."}
+    needed = bool(value.get("needed"))
+    plan_type = str(value.get("type") or "none").strip().lower().replace(" ", "-")[:60] or "none"
+    reason = str(value.get("reason") or "").strip()[:280]
+    return {
+        "needed": needed,
+        "type": plan_type,
+        "reason": reason or ("Source has explicit structure." if needed else "No durable visual structure."),
+    }
+
+
+def _normalize_extraction_contract(data: dict, depth: str) -> dict:
+    """Backfill and constrain the curation contract before queueing or writing."""
+    verdict = str(data.get("source_verdict") or "ingest").strip().lower()
+    if verdict not in SOURCE_VERDICTS:
+        verdict = "ingest"
+    shape = str(data.get("knowledge_shape") or "none").strip().lower()
+    if shape not in KNOWLEDGE_SHAPES:
+        shape = "none"
+    data["source_verdict"] = verdict
+    data["educational_core"] = _string_list(data.get("educational_core"), limit=8)
+    data["discarded_context"] = _string_list(data.get("discarded_context"), limit=8)
+    data["knowledge_shape"] = shape
+    data["diagram_plan"] = _normalize_diagram_plan(data.get("diagram_plan"))
+
+    if verdict == "reject":
+        data["diagram"] = ""
+        data["summary"] = data.get("summary") or data["discarded_context"][:3]
+        return data
+
+    if not data["educational_core"]:
+        data["educational_core"] = _string_list(data.get("summary"), limit=5)
+
+    # Short content can still be a useful note, but should not invent diagrams.
+    if depth == "short" and not data["diagram_plan"].get("needed"):
+        data["knowledge_shape"] = "none"
+    return data
+
+
+def _diagram_plan_wants_diagram(data: dict) -> bool:
+    plan = data.get("diagram_plan") if isinstance(data, dict) else {}
+    return bool(isinstance(plan, dict) and plan.get("needed"))
+
+
+def _curation_fields(data: dict) -> dict:
+    return {
+        "source_verdict": data.get("source_verdict", "ingest"),
+        "educational_core": data.get("educational_core", []),
+        "discarded_context": data.get("discarded_context", []),
+        "knowledge_shape": data.get("knowledge_shape", "none"),
+        "diagram_plan": data.get("diagram_plan", {}),
+    }
 
 
 def _extract_with_sonnet(text: str, images: Optional[list], source_url: str,
@@ -1157,22 +1296,35 @@ Content:
 Respond with a JSON object (no markdown fences) with exactly these fields:
 {{
   "title": "concise title of the source",
+  "source_verdict": "ingest | source_only | reject",
+  "educational_core": ["durable idea worth saving", "..."],
+  "discarded_context": ["event/social/context detail intentionally not saved", "..."],
+  "knowledge_shape": "taxonomy | mechanism | architecture | argument | case_study | none",
   "key_concepts": ["concept1", "concept2"],
   "summary": ["bullet 1", "bullet 2", ...],
   "suggested_page": "slug-for-concept-page (e.g. rag, kv-cache, compound-interest)",
   "suggested_wikilinks": ["related-concept-1", "related-concept-2"],
   "tags": ["Tag1", "Tag2"],
   "references": ["https://...", "https://..."],
+  "diagram_plan": {{"needed": true, "type": "flowchart | hierarchy | comparison | loop-stack | none", "reason": "why this visual helps or why no visual should be created"}},
   "diagram": "mermaid diagram as a single JSON string with \\n for newlines"
 }}
 
 Rules:
+- source_verdict:
+  * ingest = source contains durable educational signal for the wiki.
+  * source_only = source is mainly event/news/social context; keep links or provenance but write only the transferable educational core.
+  * reject = no durable educational value for this wiki. Use reject for recipes, shopping, celebrity gossip, announcements without transferable concepts, or pure hype.
+- educational_core: extract only reusable concepts, mechanisms, distinctions, failure modes, or implementation lessons. Do not include conference chronology, who-posted-what timelines, sponsor copy, social proof, or namedropping unless it defines the concept.
+- discarded_context: list 1-5 specific details intentionally excluded from durable notes, especially event chronology, hype context, or non-educational background.
+- knowledge_shape: choose the dominant structure before writing bullets. Use taxonomy for categories, mechanism for cause/effect or procedure, architecture for components/layers, argument for claims/tradeoffs, case_study for one concrete example, none for weak structure.
 - summary: {bullet_rule}
 - suggested_page: use an existing slug if one fits; otherwise create a lowercase-hyphenated slug
 - suggested_wikilinks: 3-6 related concepts as kebab-case slugs — prefer existing page slugs listed above
 - tags: pick 1-4 from this exact list only: {tags_list}
 - key_concepts: 4-8 specific terms or ideas from the content
 - references: pick the most valuable external links mentioned in the content (YouTube videos, GitHub repos, papers, key articles). Empty list [] if none. Max 5 links.
+- diagram_plan: decide whether a diagram is actually useful before drawing. Prefer no diagram over a generic hub-and-spoke summary. If source contains an existing diagram, reproduce its structure. If source has clean conceptual structure but no diagram, create a new useful visual from that structure.
 - diagram: {diagram_rule} Escape all newlines as \\n in the JSON string. No special chars in node labels.""",
     })
 
@@ -1185,12 +1337,17 @@ Rules:
             expect_json=True,
             required_json_keys=[
                 "title",
+                "source_verdict",
+                "educational_core",
+                "discarded_context",
+                "knowledge_shape",
                 "key_concepts",
                 "summary",
                 "suggested_page",
                 "suggested_wikilinks",
                 "tags",
                 "references",
+                "diagram_plan",
                 "diagram",
             ],
         ).strip()
@@ -1206,6 +1363,25 @@ Rules:
         data = json.loads(raw)
     except json.JSONDecodeError as e:
         raise HTTPException(500, f"LLM returned invalid JSON: {e}\nRaw: {raw[:300]}")
+
+    data = _normalize_extraction_contract(data, depth=depth)
+    telemetry.log_context_event(
+        "ingest_curation",
+        {
+            "task": "ingest_extract",
+            "source_url": source_url,
+            "depth": depth,
+            "source_verdict": data.get("source_verdict"),
+            "knowledge_shape": data.get("knowledge_shape"),
+            "educational_core_count": len(data.get("educational_core") or []),
+            "discarded_context_count": len(data.get("discarded_context") or []),
+            "diagram_planned": bool((data.get("diagram_plan") or {}).get("needed")),
+            "diagram_plan_type": (data.get("diagram_plan") or {}).get("type", "none"),
+        },
+    )
+    if data.get("source_verdict") == "reject":
+        reason = "; ".join(data.get("discarded_context") or data.get("summary") or [])
+        raise HTTPException(400, f"Content rejected: {reason or 'no durable educational value'}")
 
     # Enforce wikilink relevance and kebab-case normalization.
     data["suggested_wikilinks"] = _filter_suggested_wikilinks(
@@ -1233,12 +1409,15 @@ Rules:
             data["diagram"]
         )
 
-    should_diagram = _should_generate_diagram(
+    should_diagram = _diagram_plan_wants_diagram(data) or _should_generate_diagram(
         source_text=text,
         summary=data.get("summary", []),
         key_concepts=data.get("key_concepts", []),
         depth=depth,
     )
+
+    if data.get("knowledge_shape") == "none" and not _diagram_plan_wants_diagram(data):
+        should_diagram = False
 
     # Keep diagrams only when content has clear structural signal.
     if not should_diagram:
@@ -1596,6 +1775,7 @@ async def _background_extract(item_id: str, url: str) -> None:
                 "tags": extraction.get("tags", []),
                 "references": extraction.get("references", []),
                 "diagram": extraction.get("diagram", ""),
+                **_curation_fields(extraction),
                 "pending_extraction": False,
                 "extraction_error": None,
                 "extracted_at": datetime.now().isoformat(),
@@ -1643,6 +1823,11 @@ async def queue_url(req: IngestRequest):
         "suggested_wikilinks": [],
         "tags": [],
         "diagram": "",
+        "source_verdict": "ingest",
+        "educational_core": [],
+        "discarded_context": [],
+        "knowledge_shape": "none",
+        "diagram_plan": {"needed": False, "type": "none", "reason": "Extraction pending."},
         "pending_extraction": True,
         "queued_at": datetime.now().isoformat(),
     }
@@ -1663,8 +1848,8 @@ async def ingest_direct(req: IngestRequest):
     Used by the 'Quick save' button and iOS shortcut when the user
     has already decided to save and doesn't need a review step.
     """
-    if not req.url and not req.text and not req.image_base64:
-        raise HTTPException(400, "Provide url, text, or image_base64")
+    if not req.url and not req.text and not req.image_base64 and not req.images:
+        raise HTTPException(400, "Provide url, text, image_base64, or images")
 
     source_url = req.url or ""
 
@@ -1696,7 +1881,9 @@ async def ingest_direct(req: IngestRequest):
         "suggested_page": extraction["suggested_page"],
         "suggested_wikilinks": extraction["suggested_wikilinks"],
         "tags": extraction["tags"],
+        "references": extraction.get("references", []),
         "diagram": extraction.get("diagram", ""),
+        **_curation_fields(extraction),
         "staged_at": datetime.now().isoformat(),
         "status": "approved",
     }
@@ -1765,6 +1952,7 @@ async def queue_regenerate(item_id: str, req: RegenerateRequest):
             "key_concepts": updated.get("key_concepts", []),
             "references": updated.get("references", []),
             "diagram": updated.get("diagram", ""),
+            **_curation_fields(updated),
         },
     }
 
@@ -1783,9 +1971,13 @@ async def approve(item_id: str, req: ApproveRequest):
             trace = {
                 "ts": datetime.now().isoformat(),
                 "url": item.get("url", ""),
-                "source_type": "tweet" if _is_tweet_url(item.get("url", "")) else ("text" if not item.get("url") else "url"),
+                "source_type": item.get("source_type") or ("tweet" if _is_tweet_url(item.get("url", "")) else ("text" if not item.get("url") else "url")),
                 "approved": False,
                 "title": item.get("title", ""),
+                "summary": item.get("summary", [])[:6],
+                "key_concepts": item.get("key_concepts", [])[:8],
+                **_curation_fields(item),
+                "diagram": item.get("diagram", ""),
                 "suggested_page": item.get("suggested_page", ""),
                 "final_page": None,
                 "page_corrected": False,
@@ -1821,6 +2013,7 @@ async def approve(item_id: str, req: ApproveRequest):
                 "tags": extraction.get("tags", []),
                 "references": extraction.get("references", []),
                 "diagram": extraction.get("diagram", ""),
+                **_curation_fields(extraction),
                 "pending_extraction": False,
             })
         except Exception as _e:
@@ -1832,10 +2025,15 @@ async def approve(item_id: str, req: ApproveRequest):
 
     # Merge any human edits onto the item before writing
     if req.edits:
-        allowed = {"title", "summary", "suggested_page", "suggested_wikilinks", "tags", "diagram"}
+        allowed = {
+            "title", "summary", "suggested_page", "suggested_wikilinks", "tags",
+            "diagram", "source_verdict", "educational_core", "discarded_context",
+            "knowledge_shape", "diagram_plan",
+        }
         for k, v in req.edits.items():
             if k in allowed and v is not None:
                 item[k] = v
+        item.update(_normalize_extraction_contract(item, depth="medium"))
     item["suggested_page"] = identity.resolve_slug(item.get("suggested_page", "general"))
     item["suggested_wikilinks"] = [
         identity.resolve_slug(link) for link in item.get("suggested_wikilinks", [])
@@ -1889,9 +2087,13 @@ async def approve(item_id: str, req: ApproveRequest):
         trace = {
             "ts": datetime.now().isoformat(),
             "url": item.get("url", ""),
-            "source_type": "tweet" if _is_tweet_url(item.get("url", "")) else ("text" if not item.get("url") else "url"),
+            "source_type": item.get("source_type") or ("tweet" if _is_tweet_url(item.get("url", "")) else ("text" if not item.get("url") else "url")),
             "approved": True,
             "title": item.get("title", ""),
+            "summary": item.get("summary", [])[:6],
+            "key_concepts": item.get("key_concepts", [])[:8],
+            **_curation_fields(item),
+            "diagram": item.get("diagram", ""),
             "suggested_page": item.get("_original_suggested_page", item.get("suggested_page", "")),
             "final_page": item.get("suggested_page", ""),
             "page_corrected": item.get("_original_suggested_page", item.get("suggested_page", "")) != item.get("suggested_page", ""),
@@ -2809,9 +3011,9 @@ async def eval_system_action(candidate_id: str):
 
 
 @app.post("/evals/run")
-async def run_evals():
+async def run_evals(include_judge: bool = True):
     """Run the current replay eval suite and write an eval report."""
-    report = eval_harness.run_eval()
+    report = eval_harness.run_eval(include_judge=include_judge)
     actions = system_loop.route_eval_findings(report)
     return {"eval": report, "actions": actions}
 
@@ -4740,6 +4942,12 @@ async def store_image(req: IngestRequest):
     Returns the Obsidian-compatible embed path so the frontend can insert it.
     Also runs a quick vision pass to suggest a filename and caption.
     """
+    request_started = time.perf_counter()
+    stage_ms: dict[str, float] = {}
+
+    def _mark_stage(name: str, started: float) -> None:
+        stage_ms[name] = round((time.perf_counter() - started) * 1000, 1)
+
     all_images = list(req.images or [])
     if req.image_base64 and not all_images:
         all_images = [{"data": req.image_base64, "mediaType": "image/png"}]
@@ -4756,9 +4964,13 @@ async def store_image(req: IngestRequest):
     for i, img in enumerate(all_images):
         media_type = img.get("mediaType", "image/png")
         ext = media_type.split("/")[-1].replace("jpeg", "jpg")
+        started = time.perf_counter()
         raw_bytes = base64.b64decode(img["data"])
+        _mark_stage(f"decode_image_{i + 1}", started)
 
-        # Quick Haiku vision pass: get a short slug + one-line caption
+        # Best-effort vision caption. This is optional asset metadata, so avoid
+        # strict JSON contracts that create noisy reliability failures.
+        started = time.perf_counter()
         try:
             caption_raw = llm_client.complete(
                 task="image_caption",
@@ -4766,21 +4978,23 @@ async def store_image(req: IngestRequest):
                 max_tokens=120,
                 messages=[{"role": "user", "content": [
                     {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": img["data"]}},
-                    {"type": "text", "text": 'Return ONLY a JSON object: {"slug": "2-4-word-kebab-slug", "caption": "one sentence describing the diagram/image"}'},
+                    {"type": "text", "text": 'Describe this image for a personal knowledge vault. Prefer JSON like {"slug":"2-4-word-kebab-slug","caption":"one sentence"}, but a short one-line caption is acceptable.'},
                 ]}],
-                expect_json=True,
+                expect_json=False,
             ).strip()
-            s = caption_raw.find("{"); e2 = caption_raw.rfind("}") + 1
-            meta = json.loads(caption_raw[s:e2]) if s >= 0 else {}
+            meta = _parse_image_caption_response(caption_raw, index=i)
         except Exception:
-            meta = {}
+            meta = {"slug": _fallback_image_slug(i), "caption": ""}
+        _mark_stage(f"caption_image_{i + 1}", started)
 
-        slug = _re.sub(r"[^a-z0-9\-]", "", (meta.get("slug") or "image").lower().replace(" ", "-"))[:40] or "image"
+        slug = _re.sub(r"[^a-z0-9\-]", "", (meta.get("slug") or _fallback_image_slug(i)).lower().replace(" ", "-"))[:40] or _fallback_image_slug(i)
         suffix = f"-{i+1}" if i > 0 else ""
         filename = f"{today}-{slug}{suffix}.{ext}"
         file_path = assets_dir / filename
 
+        started = time.perf_counter()
         file_path.write_bytes(raw_bytes)
+        _mark_stage(f"write_image_{i + 1}", started)
 
         saved.append({
             "filename": filename,
@@ -4788,7 +5002,44 @@ async def store_image(req: IngestRequest):
             "caption": meta.get("caption", ""),
         })
 
-    return {"saved": saved}
+    total_ms = round((time.perf_counter() - request_started) * 1000, 1)
+    latency = {
+        "total_ms": total_ms,
+        "stage_ms": stage_ms,
+        "source_type": "store_image",
+        "image_count": len(all_images),
+    }
+    telemetry.log_context_event("store_image_latency", latency)
+    return {"saved": saved, "latency": latency}
+
+
+def _fallback_image_slug(index: int) -> str:
+    return f"image-{index + 1}"
+
+
+def _parse_image_caption_response(raw: str, index: int = 0) -> dict:
+    text = (raw or "").strip()
+    if not text:
+        return {"slug": _fallback_image_slug(index), "caption": ""}
+
+    parsed = None
+    start = text.find("{")
+    end = text.rfind("}") + 1
+    if start >= 0 and end > start:
+        try:
+            parsed = json.loads(text[start:end])
+        except json.JSONDecodeError:
+            parsed = None
+    if isinstance(parsed, dict):
+        slug = str(parsed.get("slug") or "").strip()
+        caption = str(parsed.get("caption") or "").strip()
+    else:
+        first_line = next((line.strip() for line in text.splitlines() if line.strip()), "")
+        slug = first_line
+        caption = first_line
+
+    slug = identity.slugify(slug)[:40] or _fallback_image_slug(index)
+    return {"slug": slug, "caption": caption[:220]}
 
 
 class ExpandNotesRequest(BaseModel):

@@ -389,6 +389,11 @@ function QueueSection({ onApproved, onExtractPreview }) {
                           suggested_page: item.suggested_page || "",
                           suggested_wikilinks: item.suggested_wikilinks || [],
                           diagram: item.diagram || "",
+                          source_verdict: item.source_verdict || "ingest",
+                          educational_core: item.educational_core || [],
+                          discarded_context: item.discarded_context || [],
+                          knowledge_shape: item.knowledge_shape || "none",
+                          diagram_plan: item.diagram_plan || {},
                         }
                       })}
                       className="px-3 py-2 border border-orange-200 text-orange-600 rounded-xl text-xs font-medium hover:bg-orange-50 transition-colors">
@@ -606,40 +611,63 @@ function IngestTab({ onApproved, onSwitchToChat }) {
 
     setLoading(true);
     try {
+      const processStarted = performance.now();
+      const timedApi = async (label, path, options) => {
+        const started = performance.now();
+        const result = await api(path, options);
+        return { label, result, ms: Math.round(performance.now() - started) };
+      };
       const body = {};
       const trimmed = input.trim();
       const firstLine = trimmed.split("\n")[0].trim();
       let data;
       if (!images.length && looksLikeMarkdownClip(trimmed)) {
-        data = await api("/ingest-markdown", {
+        const timed = await timedApi("ingest_markdown", "/ingest-markdown", {
           method: "POST",
           body: JSON.stringify({ markdown: trimmed }),
         });
+        data = timed.result;
+        data.client_latency = {
+          total_ms: Math.round(performance.now() - processStarted),
+          stage_ms: { [timed.label]: timed.ms },
+        };
       } else {
-        const hasText = !!(firstLine.startsWith("http://") || firstLine.startsWith("https://") || trimmed);
         if (firstLine.startsWith("http://") || firstLine.startsWith("https://")) body.url = firstLine;
         else if (trimmed) body.text = trimmed;
 
-        if (images.length && hasText) {
-          // Hybrid: process text normally + save images as assets in parallel
-          const [ingestData, imageData] = await Promise.all([
-            api("/ingest", { method: "POST", body: JSON.stringify(body) }),
-            api("/store-image", { method: "POST", body: JSON.stringify({ images: images.map(({ data, mediaType }) => ({ data, mediaType })) }) }),
+        if (images.length) {
+          body.images = images.map(({ data, mediaType }) => ({ data, mediaType }));
+          body.source_type = "lecture";
+          if (userNotes.trim()) body.user_notes = userNotes.trim();
+
+          // Vision ingest must receive the images even when text is present.
+          // Store assets separately so the final note can still embed originals.
+          const [ingestTimed, imageTimed] = await Promise.all([
+            timedApi("ingest_request", "/ingest", { method: "POST", body: JSON.stringify(body) }),
+            timedApi("store_image_request", "/store-image", { method: "POST", body: JSON.stringify({ images: images.map(({ data, mediaType }) => ({ data, mediaType })) }) }),
           ]);
+          const ingestData = ingestTimed.result;
+          const imageData = imageTimed.result;
+          ingestData.client_latency = {
+            total_ms: Math.round(performance.now() - processStarted),
+            stage_ms: {
+              [ingestTimed.label]: ingestTimed.ms,
+              [imageTimed.label]: imageTimed.ms,
+            },
+          };
           const embeds = (imageData.saved || []).map(s => s.obsidian_embed);
           if (embeds.length && ingestData.diff_preview) {
             ingestData.diff_preview.summary = [...(ingestData.diff_preview.summary || []), ...embeds];
           }
           data = ingestData;
           setImages([]);
-        } else if (images.length) {
-          // Pure image(s): vision extraction
-          body.images = images.map(({ data, mediaType }) => ({ data, mediaType }));
-          body.source_type = "lecture";
-          if (userNotes.trim()) body.user_notes = userNotes.trim();
-          data = await api("/ingest", { method: "POST", body: JSON.stringify(body) });
         } else {
-          data = await api("/ingest", { method: "POST", body: JSON.stringify(body) });
+          const timed = await timedApi("ingest_request", "/ingest", { method: "POST", body: JSON.stringify(body) });
+          data = timed.result;
+          data.client_latency = {
+            total_ms: Math.round(performance.now() - processStarted),
+            stage_ms: { [timed.label]: timed.ms },
+          };
         }
       }
       setPreview(data); setEdits(null);
@@ -708,10 +736,24 @@ function IngestTab({ onApproved, onSwitchToChat }) {
 
   function startEditing() {
     const d = preview.diff_preview;
-    setEdits({ title: d.title, summary: [...d.summary], suggested_page: d.suggested_page, suggested_wikilinks: [...d.suggested_wikilinks], tags: [...d.tags], diagram: d.diagram || "" });
+    setEdits({
+      title: d.title,
+      summary: [...d.summary],
+      suggested_page: d.suggested_page,
+      suggested_wikilinks: [...d.suggested_wikilinks],
+      tags: [...d.tags],
+      diagram: d.diagram || "",
+      source_verdict: d.source_verdict || "ingest",
+      educational_core: [...(d.educational_core || [])],
+      discarded_context: [...(d.discarded_context || [])],
+      knowledge_shape: d.knowledge_shape || "none",
+      diagram_plan: d.diagram_plan || {},
+    });
   }
   function setEdit(field, value) { setEdits(e => ({ ...e, [field]: value })); }
   const display = edits || preview?.diff_preview;
+  const serverLatency = preview?.latency || null;
+  const clientLatency = preview?.client_latency || null;
 
   async function handlePolish() {
     if (!display) return;
@@ -1052,6 +1094,91 @@ function IngestTab({ onApproved, onSwitchToChat }) {
           </div>
 
           <div className="px-5 py-4 space-y-5">
+            {(serverLatency || clientLatency) && (
+              <div className="rounded-xl border border-stone-200 bg-white px-3.5 py-3">
+                <div className="flex flex-wrap items-center gap-2">
+                  <p className="text-xs font-semibold text-stone-400 uppercase tracking-wider">Latency</p>
+                  {clientLatency && (
+                    <span className="text-xs px-2 py-0.5 rounded-full bg-blue-50 text-blue-700">
+                      client {clientLatency.total_ms}ms
+                    </span>
+                  )}
+                  {serverLatency && (
+                    <span className="text-xs px-2 py-0.5 rounded-full bg-stone-100 text-stone-700">
+                      server {serverLatency.total_ms}ms
+                    </span>
+                  )}
+                  {serverLatency?.image_count > 0 && (
+                    <span className="text-xs text-stone-500">{serverLatency.image_count} image{serverLatency.image_count > 1 ? "s" : ""}</span>
+                  )}
+                </div>
+                <div className="mt-2 grid md:grid-cols-2 gap-2">
+                  {serverLatency?.stage_ms && Object.entries(serverLatency.stage_ms).sort((a, b) => b[1] - a[1]).slice(0, 6).map(([stage, ms]) => (
+                    <div key={stage} className="flex justify-between gap-3 text-xs">
+                      <span className="text-stone-500 truncate">{stage}</span>
+                      <span className="font-medium text-stone-800">{ms}ms</span>
+                    </div>
+                  ))}
+                  {clientLatency?.stage_ms && Object.entries(clientLatency.stage_ms).sort((a, b) => b[1] - a[1]).slice(0, 3).map(([stage, ms]) => (
+                    <div key={stage} className="flex justify-between gap-3 text-xs">
+                      <span className="text-blue-500 truncate">{stage}</span>
+                      <span className="font-medium text-blue-700">{ms}ms</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {(display.source_verdict || display.knowledge_shape || (display.educational_core || []).length > 0 || (display.discarded_context || []).length > 0) && (
+              <div className="rounded-xl border border-stone-200 bg-stone-50/60 px-3.5 py-3 space-y-3">
+                <div className="flex flex-wrap items-center gap-2">
+                  <p className="text-xs font-semibold text-stone-400 uppercase tracking-wider">Curation</p>
+                  <span className={`text-xs px-2 py-0.5 rounded-full font-medium ${
+                    display.source_verdict === "source_only" ? "bg-amber-50 text-amber-700" :
+                    display.source_verdict === "reject" ? "bg-red-50 text-red-600" :
+                    "bg-emerald-50 text-emerald-700"
+                  }`}>
+                    {display.source_verdict || "ingest"}
+                  </span>
+                  <span className="text-xs px-2 py-0.5 rounded-full bg-white border border-stone-200 text-stone-600">
+                    {display.knowledge_shape || "none"}
+                  </span>
+                  {display.diagram_plan && (
+                    <span className="text-xs text-stone-500">
+                      Diagram: {display.diagram_plan.needed ? (display.diagram_plan.type || "planned") : "not needed"}
+                    </span>
+                  )}
+                </div>
+                {display.diagram_plan?.reason && (
+                  <p className="text-xs text-stone-500 leading-relaxed">{display.diagram_plan.reason}</p>
+                )}
+                {((display.educational_core || []).length > 0 || (display.discarded_context || []).length > 0) && (
+                  <div className="grid md:grid-cols-2 gap-3">
+                    {(display.educational_core || []).length > 0 && (
+                      <div>
+                        <p className="text-[11px] font-semibold text-stone-400 uppercase tracking-wider mb-1.5">Keep</p>
+                        <ul className="space-y-1">
+                          {display.educational_core.slice(0, 5).map((x, i) => (
+                            <li key={i} className="text-xs text-stone-700 leading-relaxed">{x}</li>
+                          ))}
+                        </ul>
+                      </div>
+                    )}
+                    {(display.discarded_context || []).length > 0 && (
+                      <div>
+                        <p className="text-[11px] font-semibold text-stone-400 uppercase tracking-wider mb-1.5">Discard</p>
+                        <ul className="space-y-1">
+                          {display.discarded_context.slice(0, 5).map((x, i) => (
+                            <li key={i} className="text-xs text-stone-500 leading-relaxed">{x}</li>
+                          ))}
+                        </ul>
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
+            )}
+
             {/* Summary bullets */}
             <div>
               <div className="flex items-center justify-between mb-2.5">
@@ -3695,6 +3822,12 @@ function OperationsTab() {
   const context = data?.context_summary || {};
   const llm = data?.llm_summary || { total_calls: 0, by_task: {} };
   const taskRows = Object.entries(llm.by_task || {}).sort((a, b) => (b[1].calls || 0) - (a[1].calls || 0));
+  const costTaskRows = Object.entries(llm.by_task || {}).sort((a, b) => (b[1].total_cost_usd || 0) - (a[1].total_cost_usd || 0));
+  const costRouteRows = Object.values(llm.by_route || {}).sort((a, b) => (b.total_cost_usd || 0) - (a.total_cost_usd || 0));
+  const expensiveCalls = llm.recent_expensive_calls || [];
+  const recentIngestLatency = context.recent_ingest_latency || [];
+  const recentStoreImageLatency = context.recent_store_image_latency || [];
+  const ingestSlowStages = context.ingest_slow_stages || [];
   const reports = data?.reports || [];
   const historyActions = data?.actions || [];
   const evalReports = reports.filter(r => r.name?.startsWith("eval-"));
@@ -3705,6 +3838,7 @@ function OperationsTab() {
     ["queue", "Queue"],
     ["evals", "Evals"],
     ["telemetry", "Telemetry"],
+    ["usage", "Usage"],
     ["reports", "Reports"],
     ["history", "History"],
   ];
@@ -3883,6 +4017,75 @@ function OperationsTab() {
           </div>}
 
           {view === "telemetry" && <div className="rounded-xl border border-stone-200 bg-white p-4">
+            <h3 className="text-sm font-semibold text-stone-900">Ingest Latency</h3>
+            <div className="mt-3 grid grid-cols-3 gap-2">
+              <StatTile label="Runs" value={context.ingest_latency_events || 0} />
+              <StatTile label="Median" value={`${context.ingest_latency_median_ms || 0}ms`} tone={(context.ingest_latency_median_ms || 0) > 20000 ? "amber" : "stone"} />
+              <StatTile label="P95" value={`${context.ingest_latency_p95_ms || 0}ms`} tone={(context.ingest_latency_p95_ms || 0) > 45000 ? "red" : "stone"} />
+            </div>
+            <div className="mt-2 grid grid-cols-3 gap-2">
+              <StatTile label="Image saves" value={context.store_image_latency_events || 0} />
+              <StatTile label="Save median" value={`${context.store_image_latency_median_ms || 0}ms`} tone={(context.store_image_latency_median_ms || 0) > 10000 ? "amber" : "stone"} />
+              <StatTile label="Save P95" value={`${context.store_image_latency_p95_ms || 0}ms`} tone={(context.store_image_latency_p95_ms || 0) > 25000 ? "red" : "stone"} />
+            </div>
+            <div className="mt-4 grid md:grid-cols-2 gap-4">
+              <div>
+                <p className="text-[11px] font-semibold text-stone-400 uppercase tracking-wider mb-2">Slow stages</p>
+                <div className="space-y-1.5">
+                  {ingestSlowStages.length === 0 ? (
+                    <p className="text-xs text-stone-400">No ingest latency samples yet.</p>
+                  ) : ingestSlowStages.slice(0, 6).map(row => (
+                    <div key={row.stage} className="flex justify-between gap-3 text-xs">
+                      <span className="text-stone-600 truncate">{row.stage}</span>
+                      <span className="font-medium text-stone-900">{row.avg_ms}ms avg</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+              <div>
+                <p className="text-[11px] font-semibold text-stone-400 uppercase tracking-wider mb-2">Recent runs</p>
+                <div className="space-y-1.5">
+                  {recentIngestLatency.length === 0 ? (
+                    <p className="text-xs text-stone-400">Run an ingest to populate this.</p>
+                  ) : recentIngestLatency.slice(-6).reverse().map((row, i) => (
+                    <div key={i} className="text-xs border border-stone-100 rounded-lg px-2 py-1.5">
+                      <div className="flex justify-between gap-3">
+                        <span className="text-stone-700">{row.source_type || "unknown"} · {row.image_count || 0} img</span>
+                        <span className="font-medium text-stone-900">{row.total_ms}ms</span>
+                      </div>
+                      {row.stage_ms && (
+                        <p className="text-[11px] text-stone-400 truncate mt-0.5">
+                          {Object.entries(row.stage_ms).sort((a, b) => b[1] - a[1]).slice(0, 3).map(([stage, ms]) => `${stage} ${ms}ms`).join(" · ")}
+                        </p>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              </div>
+            </div>
+            {recentStoreImageLatency.length > 0 && (
+              <div className="mt-4">
+                <p className="text-[11px] font-semibold text-stone-400 uppercase tracking-wider mb-2">Recent image saves</p>
+                <div className="grid md:grid-cols-2 gap-2">
+                  {recentStoreImageLatency.slice(-4).reverse().map((row, i) => (
+                    <div key={i} className="text-xs border border-stone-100 rounded-lg px-2 py-1.5">
+                      <div className="flex justify-between gap-3">
+                        <span className="text-stone-700">{row.image_count || 0} img saved</span>
+                        <span className="font-medium text-stone-900">{row.total_ms}ms</span>
+                      </div>
+                      {row.stage_ms && (
+                        <p className="text-[11px] text-stone-400 truncate mt-0.5">
+                          {Object.entries(row.stage_ms).sort((a, b) => b[1] - a[1]).slice(0, 3).map(([stage, ms]) => `${stage} ${ms}ms`).join(" · ")}
+                        </p>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+          </div>}
+
+          {view === "telemetry" && <div className="rounded-xl border border-stone-200 bg-white p-4">
             <h3 className="text-sm font-semibold text-stone-900">Recent Errors</h3>
             <div className="mt-3 space-y-2">
               {errors.length === 0 ? (
@@ -3893,6 +4096,88 @@ function OperationsTab() {
                   <p className="text-red-700 mt-0.5">{e.error || "contract failed"}</p>
                 </div>
               ))}
+            </div>
+          </div>}
+
+          {view === "usage" && <div className="grid grid-cols-2 md:grid-cols-4 gap-2">
+            <StatTile label="LLM calls" value={llm.total_calls || 0} />
+            <StatTile label="Tokens" value={(llm.total_tokens || 0).toLocaleString()} />
+            <StatTile label="Cost" value={`$${(llm.total_cost_usd || 0).toFixed(4)}`} tone={(llm.total_cost_usd || 0) > 1 ? "amber" : "stone"} />
+            <StatTile label="$/token" value={`$${(llm.cost_per_token_usd || 0).toExponential(2)}`} />
+          </div>}
+
+          {view === "usage" && <div className="rounded-xl border border-stone-200 bg-white overflow-hidden">
+            <div className="px-4 py-3 border-b border-stone-100">
+              <h3 className="text-sm font-semibold text-stone-900">Cost by Task</h3>
+            </div>
+            <div className="divide-y divide-stone-100">
+              {costTaskRows.length === 0 && <p className="text-sm text-stone-400 text-center py-8">No usage data yet.</p>}
+              {costTaskRows.map(([task, row]) => (
+                <div key={task} className="px-4 py-3 grid grid-cols-[1fr_auto] gap-3 items-center">
+                  <div className="min-w-0">
+                    <p className="text-sm font-medium text-stone-800 truncate">{task}</p>
+                    <p className="text-xs text-stone-400">
+                      {row.calls} calls · {(row.total_tokens || 0).toLocaleString()} tokens · avg ${Number(row.avg_cost_usd || 0).toFixed(5)}
+                      {row.estimated_cost_rate ? ` · ${(row.estimated_cost_rate * 100).toFixed(0)}% estimated` : ""}
+                    </p>
+                  </div>
+                  <div className="text-right">
+                    <p className="text-sm font-semibold text-stone-900">${Number(row.total_cost_usd || 0).toFixed(5)}</p>
+                    <p className="text-[11px] text-stone-400">${Number(row.cost_per_token_usd || 0).toExponential(2)}/token</p>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>}
+
+          {view === "usage" && <div className="grid md:grid-cols-2 gap-3">
+            <div className="rounded-xl border border-stone-200 bg-white overflow-hidden">
+              <div className="px-4 py-3 border-b border-stone-100">
+                <h3 className="text-sm font-semibold text-stone-900">Cost by Route</h3>
+              </div>
+              <div className="divide-y divide-stone-100">
+                {costRouteRows.length === 0 ? (
+                  <p className="text-sm text-stone-400 text-center py-8">No route usage yet.</p>
+                ) : costRouteRows.slice(0, 10).map(row => (
+                  <div key={`${row.task}-${row.provider}-${row.model}`} className="px-4 py-3">
+                    <div className="flex justify-between gap-3">
+                      <div className="min-w-0">
+                        <p className="text-xs font-medium text-stone-800 truncate">{row.task}</p>
+                        <p className="text-[11px] text-stone-400 truncate">{row.provider} · {row.model}</p>
+                      </div>
+                      <p className="text-xs font-semibold text-stone-900">${Number(row.total_cost_usd || 0).toFixed(5)}</p>
+                    </div>
+                    <p className="text-[11px] text-stone-400 mt-1">
+                      {(row.total_tokens || 0).toLocaleString()} tokens · {row.calls} calls · p95 {row.p95_ms}ms
+                    </p>
+                  </div>
+                ))}
+              </div>
+            </div>
+
+            <div className="rounded-xl border border-stone-200 bg-white overflow-hidden">
+              <div className="px-4 py-3 border-b border-stone-100">
+                <h3 className="text-sm font-semibold text-stone-900">Recent Expensive Calls</h3>
+              </div>
+              <div className="divide-y divide-stone-100">
+                {expensiveCalls.length === 0 ? (
+                  <p className="text-sm text-stone-400 text-center py-8">No expensive calls yet.</p>
+                ) : expensiveCalls.slice(0, 10).map((row, i) => (
+                  <div key={i} className="px-4 py-3">
+                    <div className="flex justify-between gap-3">
+                      <div className="min-w-0">
+                        <p className="text-xs font-medium text-stone-800 truncate">{row.task}</p>
+                        <p className="text-[11px] text-stone-400 truncate">{row.effective_provider || row.provider} · {row.effective_model || row.model}</p>
+                      </div>
+                      <p className="text-xs font-semibold text-stone-900">${Number(row.cost_usd || 0).toFixed(5)}</p>
+                    </div>
+                    <p className="text-[11px] text-stone-400 mt-1">
+                      {(row.total_tokens || 0).toLocaleString()} tokens · in {row.input_tokens || 0} / out {row.output_tokens || 0}
+                      {row.cost_estimated ? " · estimated" : ""}
+                    </p>
+                  </div>
+                ))}
+              </div>
             </div>
           </div>}
 

@@ -120,6 +120,8 @@ The remaining improvement is cost estimation. We log character counts today; exa
 
 ## FactoryMind Transfer
 
+Living handoff: [FACTORYMIND_TRANSFER.md](FACTORYMIND_TRANSFER.md)
+
 The FactoryMind version of this is stricter. Industrial agents cannot rely on "the answer looked good." The system must log the machine state, sensor window, tool/action selected, operator approval, latency, confidence, and post-action outcome.
 
 For FactoryMind, inference telemetry should eventually include:
