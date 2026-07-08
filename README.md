@@ -524,6 +524,8 @@ Operations header commands are separated by side effect:
 - **Find improvement candidates:** run the trace critic and stage action cards; does not apply them.
 - **Run system loop:** route telemetry into bounded actions; may auto-apply low-risk fixes and stage medium/high-risk changes.
 
+After a command finishes, Operations shows a Last operation banner with what ran, what changed, and what to inspect next. Read-only report commands route to Evals or Reports. Trace critic and system-loop runs route to Queue only when there are action candidates to review.
+
 ---
 
 ## Tag Normalization Script

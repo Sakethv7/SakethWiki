@@ -3887,6 +3887,35 @@ function OperationCommand({ title, detail, output, danger, busy, onClick, disabl
   );
 }
 
+function OperationNotice({ notice, onOpenReport }) {
+  if (!notice) return null;
+  const toneCls = notice.tone === "amber"
+    ? "border-amber-200 bg-amber-50 text-amber-900"
+    : notice.tone === "red"
+      ? "border-red-200 bg-red-50 text-red-900"
+      : "border-emerald-200 bg-emerald-50 text-emerald-900";
+  return (
+    <div className={`rounded-xl border px-4 py-3 ${toneCls}`}>
+      <div className="flex items-start justify-between gap-3">
+        <div className="min-w-0">
+          <p className="text-xs font-semibold uppercase tracking-wide opacity-70">Last operation</p>
+          <p className="text-sm font-semibold mt-0.5">{notice.title}</p>
+          <p className="text-xs mt-1 leading-relaxed">{notice.message}</p>
+          {notice.next && <p className="text-xs mt-1 leading-relaxed opacity-80">Next: {notice.next}</p>}
+        </div>
+        {notice.reportPath && (
+          <button
+            onClick={() => onOpenReport(notice.reportPath)}
+            className="shrink-0 px-2.5 py-1.5 rounded-md border border-current/20 bg-white/60 text-xs font-medium hover:bg-white"
+          >
+            Open report
+          </button>
+        )}
+      </div>
+    </div>
+  );
+}
+
 function OperationsTab() {
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(true);
@@ -3894,6 +3923,7 @@ function OperationsTab() {
   const [error, setError] = useState("");
   const [view, setView] = useState("queue");
   const [reportPreview, setReportPreview] = useState(null);
+  const [operationNotice, setOperationNotice] = useState(null);
 
   async function load() {
     setLoading(true);
@@ -3914,8 +3944,19 @@ function OperationsTab() {
     setBusy("loop");
     setError("");
     try {
-      await api("/system-loop/run?auto_apply=true", { method: "POST" });
+      const result = await api("/system-loop/run?auto_apply=true", { method: "POST" });
       await load();
+      const actions = result.actions || [];
+      const applied = actions.filter(a => a.applied).length;
+      const queued = actions.length - applied;
+      setView("queue");
+      setOperationNotice({
+        title: "System loop finished",
+        message: `Ran evals, inference reporting, trace critic, and routing. ${applied} action(s) auto-applied; ${queued} action(s) queued for review.`,
+        next: queued ? "Review the Action Queue before approving anything." : "No queued actions need approval right now.",
+        reportPath: result.report_path,
+        tone: queued ? "amber" : "emerald",
+      });
     } catch (e) {
       setError(e.message);
     } finally {
@@ -3927,8 +3968,16 @@ function OperationsTab() {
     setBusy("inference");
     setError("");
     try {
-      await api("/inference-report", { method: "POST" });
+      const result = await api("/inference-report", { method: "POST" });
       await load();
+      setView("reports");
+      setOperationNotice({
+        title: "Inference report written",
+        message: "Summarized LLM latency, contract failures, context events, token usage, and cost.",
+        next: "Open the report below, or use Telemetry/Usage for the live tables.",
+        reportPath: result.path,
+        tone: "emerald",
+      });
     } catch (e) {
       setError(e.message);
     } finally {
@@ -3940,8 +3989,17 @@ function OperationsTab() {
     setBusy("evals");
     setError("");
     try {
-      await api("/evals/run", { method: "POST" });
+      const result = await api("/evals/run", { method: "POST" });
       await load();
+      const evalResult = result.eval || {};
+      const routed = result.actions?.length || 0;
+      setView("evals");
+      setOperationNotice({
+        title: evalResult.passed ? "Safety evals passed" : "Safety evals found failures",
+        message: `Ran replay checks for preferences, retrieval, and ingest curation. ${routed} action candidate(s) were staged from eval findings.`,
+        next: routed ? "Open Queue if you want to inspect staged actions." : "Read the eval report for exact pass/fail details.",
+        tone: evalResult.passed ? "emerald" : "red",
+      });
     } catch (e) {
       setError(e.message);
     } finally {
@@ -3953,8 +4011,19 @@ function OperationsTab() {
     setBusy("critic");
     setError("");
     try {
-      await api("/trace-critic/run", { method: "POST" });
+      const result = await api("/trace-critic/run", { method: "POST" });
       await load();
+      const staged = result.staged?.length || 0;
+      setView(staged ? "queue" : "reports");
+      setOperationNotice({
+        title: result.ran ? "Trace critic finished" : "Trace critic did not run",
+        message: result.ran
+          ? `Reviewed recent traces and staged ${staged} action candidate(s).`
+          : `No trace actions were created: ${result.reason || "not enough trace evidence"}.`,
+        next: staged ? "Review the Action Queue. The critic does not approve actions for you." : "Open the trace critic report when available.",
+        reportPath: result.report_path,
+        tone: staged ? "amber" : "emerald",
+      });
     } catch (e) {
       setError(e.message);
     } finally {
@@ -3968,6 +4037,7 @@ function OperationsTab() {
     try {
       const report = await api("/reports/read", { method: "POST", body: JSON.stringify({ path }) });
       setReportPreview(report);
+      setView("reports");
     } catch (e) {
       setError(e.message);
     } finally {
@@ -4105,6 +4175,7 @@ function OperationsTab() {
       </div>
 
       {error && <div className="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-700">{error}</div>}
+      <OperationNotice notice={operationNotice} onOpenReport={openReport} />
       {loading && <p className="text-sm text-stone-400 py-8 text-center">Loading operations…</p>}
 
       {!loading && (

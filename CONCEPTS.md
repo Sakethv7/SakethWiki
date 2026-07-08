@@ -148,6 +148,8 @@ Action queues are approval surfaces, not debug dumps. A useful action card must 
 
 Operations commands must expose side effects in the label area. Safety evals and inference reports are read-only report writers. The trace critic proposes action cards. The system loop is the only header command allowed to auto-apply low-risk runtime changes, so it needs the strongest visual treatment and side-effect copy.
 
+Operations command results need a visible cause-and-effect trail. A finished command should leave a Last operation summary and route the user to the evidence surface it produced: evals to Evals, telemetry reports to Reports, and action-producing critic/system-loop runs to Queue.
+
 Ingestion is now a curation contract before it is a summary contract. The extractor must decide `source_verdict`, `educational_core`, `discarded_context`, `knowledge_shape`, and `diagram_plan` before producing bullets. `ingest` means the source has durable educational signal. `source_only` means the source is mostly event, social, or provenance context, so only the transferable core should enter the page. `reject` means the source has no durable value for this wiki and should return a 400 instead of polluting the queue.
 
 ```mermaid
