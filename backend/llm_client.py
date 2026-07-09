@@ -240,6 +240,7 @@ def _openai_compat_complete(
     messages: list[dict[str, Any]],
     system: Optional[Any],
     api_key: Optional[str],
+    expect_json: bool = False,
 ) -> str:
     if provider == "qwen":
         base_url = os.environ.get("QWEN_BASE_URL", "https://dashscope-intl.aliyuncs.com/compatible-mode/v1")
@@ -264,6 +265,11 @@ def _openai_compat_complete(
         "max_tokens": max_tokens,
         "messages": _to_openai_messages(messages, system),
     }
+    # Request structured output at the API level instead of only validating it
+    # client-side after the fact — cuts contract-failure/fallback rate for tasks
+    # with large required-key sets (e.g. INGEST_EXTRACT's 8-key contract).
+    if expect_json:
+        payload["response_format"] = {"type": "json_object"}
     headers = {"Content-Type": "application/json"}
     if key:
         headers["Authorization"] = f"Bearer {key}"
@@ -317,13 +323,13 @@ def complete(
     primary_text = ""
     input_chars = telemetry.estimate_chars({"system": system, "messages": messages})
 
-    def _log(*, text: str = "", fallback_used: bool = False, fallback_model: str = "", contract_ok: bool = False, error: str = "") -> None:
+    def _log(*, text: str = "", used_model: Optional[str] = None, fallback_used: bool = False, fallback_model: str = "", contract_ok: bool = False, error: str = "") -> None:
         telemetry.log_llm_call(
             {
                 "task": key,
                 "provider": provider,
                 "requested_provider": requested_provider,
-                "model": resolved_model,
+                "model": used_model or resolved_model,
                 "fallback_model": fallback_model,
                 "duration_ms": round((time.perf_counter() - started) * 1000, 1),
                 "input_chars": input_chars,
@@ -355,6 +361,7 @@ def complete(
                 messages=messages,
                 system=system,
                 api_key=api_key,
+                expect_json=expect_json,
             )
     except Exception as e:
         primary_err = e
@@ -383,12 +390,12 @@ def complete(
         )
     except Exception as fallback_err:
         err = f"{type(fallback_err).__name__}: {fallback_err}"
-        _log(text=primary_text, fallback_used=True, fallback_model=fallback_model, contract_ok=False, error=err)
+        _log(text=primary_text, used_model=fallback_model, fallback_used=True, fallback_model=fallback_model, contract_ok=False, error=err)
         raise
     if _valid_contract(fallback_text, expect_json, required_json_keys):
-        _log(text=fallback_text, fallback_used=True, fallback_model=fallback_model, contract_ok=True)
+        _log(text=fallback_text, used_model=fallback_model, fallback_used=True, fallback_model=fallback_model, contract_ok=True)
         return fallback_text
-    _log(text=fallback_text, fallback_used=True, fallback_model=fallback_model, contract_ok=False, error="LLM fallback contract failed")
+    _log(text=fallback_text, used_model=fallback_model, fallback_used=True, fallback_model=fallback_model, contract_ok=False, error="LLM fallback contract failed")
     raise RuntimeError(
         f"LLM fallback contract failed for task={key} provider={provider}→anthropic model={resolved_model}→{fallback_model}"
     )

@@ -196,6 +196,7 @@ def summarize_context_events(events: Iterable[dict[str, Any]] | None = None) -> 
     rows = list(events) if events is not None else read_context_events()
     extraction_rows = [r for r in rows if r.get("event_type") == "ingest_context"]
     chat_rows = [r for r in rows if r.get("event_type") == "chat_context"]
+    latency_rows = [r for r in rows if r.get("event_type") == "ingest_latency"]
 
     low_coverage = [
         r for r in extraction_rows
@@ -205,6 +206,10 @@ def summarize_context_events(events: Iterable[dict[str, Any]] | None = None) -> 
         r for r in chat_rows
         if int(r.get("retrieved_chunks_dropped", 0) or 0) > 0
     ]
+    latency_durations = [
+        float(r.get("duration_ms", 0) or 0) for r in latency_rows if r.get("duration_ms") is not None
+    ]
+    latency_failures = sum(1 for r in latency_rows if r.get("success") is False)
 
     return {
         "total_events": len(rows),
@@ -214,6 +219,10 @@ def summarize_context_events(events: Iterable[dict[str, Any]] | None = None) -> 
         "chat_events_with_dropped_chunks": len(dropped_chat),
         "recent_low_coverage": low_coverage[-10:],
         "recent_dropped_chat_context": dropped_chat[-10:],
+        "ingest_latency_runs": len(latency_rows),
+        "ingest_latency_median_ms": round(statistics.median(latency_durations), 1) if latency_durations else 0,
+        "ingest_latency_p95_ms": round(_percentile(latency_durations, 95), 1) if latency_durations else 0,
+        "ingest_latency_failures": latency_failures,
     }
 
 

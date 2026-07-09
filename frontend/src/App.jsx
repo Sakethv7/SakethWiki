@@ -3542,7 +3542,7 @@ function StatusBadge({ status }) {
   return <span className={`px-2 py-0.5 rounded-full text-[10px] font-semibold ring-1 ${cls}`}>{status || "candidate"}</span>;
 }
 
-function StatTile({ label, value, tone = "stone" }) {
+function StatTile({ label, value, tone = "stone", onClick, title }) {
   const cls = tone === "red"
     ? "border-red-100 bg-red-50 text-red-900"
     : tone === "amber"
@@ -3550,11 +3550,16 @@ function StatTile({ label, value, tone = "stone" }) {
       : tone === "emerald"
         ? "border-emerald-100 bg-emerald-50 text-emerald-900"
         : "border-stone-200 bg-white text-stone-900";
+  const Tag = onClick ? "button" : "div";
   return (
-    <div className={`rounded-lg border px-3 py-2 ${cls}`}>
+    <Tag
+      onClick={onClick}
+      title={title}
+      className={`rounded-lg border px-3 py-2 text-left w-full ${cls} ${onClick ? "cursor-pointer hover:brightness-95 transition" : ""}`}
+    >
       <p className="text-[10px] uppercase tracking-wide opacity-60">{label}</p>
       <p className="text-lg font-semibold mt-0.5">{value}</p>
-    </div>
+    </Tag>
   );
 }
 
@@ -3694,7 +3699,10 @@ function OperationsTab() {
   const errors = data?.errors || [];
   const context = data?.context_summary || {};
   const llm = data?.llm_summary || { total_calls: 0, by_task: {} };
-  const taskRows = Object.entries(llm.by_task || {}).sort((a, b) => (b[1].calls || 0) - (a[1].calls || 0));
+  const taskRisk = (row) => Math.max(row.contract_failure_rate || 0, row.fallback_rate || 0);
+  const taskRows = Object.entries(llm.by_task || {}).sort((a, b) => (taskRisk(b[1]) - taskRisk(a[1])) || ((b[1].calls || 0) - (a[1].calls || 0)));
+  const rateColorClass = (rate) => rate >= 0.3 ? "text-red-600" : rate >= 0.1 ? "text-amber-600" : "text-emerald-600";
+  const worstTask = taskRows.length && taskRisk(taskRows[0][1]) > 0 ? taskRows[0] : null;
   const reports = data?.reports || [];
   const historyActions = data?.actions || [];
   const evalReports = reports.filter(r => r.name?.startsWith("eval-"));
@@ -3741,11 +3749,26 @@ function OperationsTab() {
 
       {!loading && (
         <>
-          <div className="grid grid-cols-2 md:grid-cols-4 gap-2">
+          <div className="grid grid-cols-2 md:grid-cols-5 gap-2">
             <StatTile label="LLM calls" value={llm.total_calls || 0} />
             <StatTile label="Pending actions" value={pending.length} tone={pending.length ? "amber" : "stone"} />
             <StatTile label="Applied actions" value={applied.length} tone="emerald" />
-            <StatTile label="Errors" value={errors.length} tone={errors.length ? "red" : "stone"} />
+            <StatTile
+              label="Errors (last 200 calls)"
+              value={errors.length >= 50 ? "50+" : errors.length}
+              tone={errors.length ? "red" : "stone"}
+              title="Capped to the last 50 failures within the most recent 200 LLM calls — click to inspect"
+              onClick={() => setView("telemetry")}
+            />
+            {worstTask && (
+              <StatTile
+                label={`Worst task: ${worstTask[0]}`}
+                value={`${(Math.max(worstTask[1].fallback_rate || 0, worstTask[1].contract_failure_rate || 0) * 100).toFixed(0)}%`}
+                tone={taskRisk(worstTask[1]) >= 0.3 ? "red" : taskRisk(worstTask[1]) >= 0.1 ? "amber" : "emerald"}
+                title="Highest fallback or contract-failure rate across all tasks — click to inspect"
+                onClick={() => setView("telemetry")}
+              />
+            )}
           </div>
 
           <div className="flex gap-1 rounded-lg bg-stone-100 p-1">
@@ -3862,11 +3885,16 @@ function OperationsTab() {
                 <div key={task} className="px-4 py-3 grid grid-cols-[1fr_auto] gap-3 items-center">
                   <div className="min-w-0">
                     <p className="text-sm font-medium text-stone-800 truncate">{task}</p>
-                    <p className="text-xs text-stone-400">{row.calls} calls · median {row.median_ms}ms · fallback {(row.fallback_rate * 100).toFixed(1)}%</p>
+                    <p className="text-xs text-stone-400">{row.calls} calls · median {row.median_ms}ms</p>
                   </div>
-                  <span className={`text-xs font-medium ${row.contract_failure_rate || row.error_rate ? "text-red-600" : "text-emerald-600"}`}>
-                    {((row.contract_failure_rate || 0) * 100).toFixed(1)}% contract fail
-                  </span>
+                  <div className="flex flex-col items-end gap-0.5">
+                    <span className={`text-xs font-medium ${rateColorClass(row.fallback_rate || 0)}`}>
+                      {((row.fallback_rate || 0) * 100).toFixed(1)}% fallback
+                    </span>
+                    <span className={`text-xs font-medium ${rateColorClass(row.contract_failure_rate || 0)}`}>
+                      {((row.contract_failure_rate || 0) * 100).toFixed(1)}% contract fail
+                    </span>
+                  </div>
                 </div>
               ))}
             </div>
@@ -3879,6 +3907,17 @@ function OperationsTab() {
               <StatTile label="Chat events" value={context.chat_events || 0} />
               <StatTile label="Low coverage" value={context.low_source_coverage_events || 0} tone={context.low_source_coverage_events ? "amber" : "stone"} />
               <StatTile label="Dropped chunks" value={context.chat_events_with_dropped_chunks || 0} tone={context.chat_events_with_dropped_chunks ? "amber" : "stone"} />
+            </div>
+          </div>}
+
+          {view === "telemetry" && <div className="rounded-xl border border-stone-200 bg-white p-4">
+            <h3 className="text-sm font-semibold text-stone-900">Ingest Latency</h3>
+            <p className="text-xs text-stone-400 mt-0.5">Time from extraction request to result, per /ingest call — separate from ingest event count above.</p>
+            <div className="mt-3 grid grid-cols-2 md:grid-cols-4 gap-2">
+              <StatTile label="Runs" value={context.ingest_latency_runs || 0} title="Ingest calls that reached the latency instrumentation — should track Ingest events above" />
+              <StatTile label="Median" value={`${context.ingest_latency_median_ms || 0}ms`} />
+              <StatTile label="P95" value={`${context.ingest_latency_p95_ms || 0}ms`} />
+              <StatTile label="Failures" value={context.ingest_latency_failures || 0} tone={context.ingest_latency_failures ? "red" : "stone"} />
             </div>
           </div>}
 

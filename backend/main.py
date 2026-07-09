@@ -16,6 +16,7 @@ import os
 import random
 import re as _re
 import shutil
+import time
 import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -1028,6 +1029,7 @@ def _extract_with_sonnet(text: str, images: Optional[list], source_url: str,
     - Long-form (>4000 chars) or images → Sonnet (complex reasoning needed)
     - Short/medium text → Haiku (~8x cheaper, quality fine for structured extraction)
     """
+    _ingest_started = time.perf_counter()
     tags_list = ", ".join(VALID_TAGS)
     existing_pages = existing_pages or []
 
@@ -1195,6 +1197,16 @@ Rules:
             ],
         ).strip()
     except Exception as e:
+        telemetry.log_context_event(
+            "ingest_latency",
+            {
+                "task": "ingest_extract",
+                "source_url": source_url,
+                "depth": depth,
+                "duration_ms": round((time.perf_counter() - _ingest_started) * 1000, 1),
+                "success": False,
+            },
+        )
         raise HTTPException(500, f"LLM extraction failed: {e}")
     if raw.startswith("```"):
         raw = raw.split("```")[1]
@@ -1205,6 +1217,16 @@ Rules:
     try:
         data = json.loads(raw)
     except json.JSONDecodeError as e:
+        telemetry.log_context_event(
+            "ingest_latency",
+            {
+                "task": "ingest_extract",
+                "source_url": source_url,
+                "depth": depth,
+                "duration_ms": round((time.perf_counter() - _ingest_started) * 1000, 1),
+                "success": False,
+            },
+        )
         raise HTTPException(500, f"LLM returned invalid JSON: {e}\nRaw: {raw[:300]}")
 
     # Enforce wikilink relevance and kebab-case normalization.
@@ -1265,6 +1287,16 @@ Rules:
                 key_concepts=data.get("key_concepts", []),
             )
 
+    telemetry.log_context_event(
+        "ingest_latency",
+        {
+            "task": "ingest_extract",
+            "source_url": source_url,
+            "depth": depth,
+            "duration_ms": round((time.perf_counter() - _ingest_started) * 1000, 1),
+            "success": True,
+        },
+    )
     return data
 
 
@@ -2635,14 +2667,17 @@ prompt_hints must be actionable, specific, and short — they will be directly i
 - "The tag Agentic is frequently corrected to Agents — use Agents for tool-use and orchestration content"
 """
 
-    raw = llm_client.complete(
-        task="analyze_traces",
-        model=None,
-        max_tokens=2000,
-        messages=[{"role": "user", "content": prompt}],
-        expect_json=True,
-        required_json_keys=["patterns", "prompt_hints", "summary"],
-    ).strip()
+    try:
+        raw = llm_client.complete(
+            task="analyze_traces",
+            model=None,
+            max_tokens=2000,
+            messages=[{"role": "user", "content": prompt}],
+            expect_json=True,
+            required_json_keys=["patterns", "prompt_hints", "summary"],
+        ).strip()
+    except Exception as e:
+        raise HTTPException(500, f"Trace analysis failed: {e}")
     if raw.startswith("```"):
         raw = raw.split("```")[1]
         if raw.startswith("json"):
