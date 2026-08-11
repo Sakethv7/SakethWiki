@@ -183,8 +183,10 @@ cd frontend && npm run build
 | POST | `/ingest-markdown` | Stage pasted markdown clip directly to curation-aware intelligence queue |
 | POST | `/inbox/process` | Scan `_wiki/inbox/*.md` and stage clips to queue |
 | GET | `/queue` | List all pending review items |
+| GET | `/queue-status?ids=` | Resolve staged clip ids to pending/saved/rejected/unknown, for callers that staged items earlier and want their outcome |
 | POST | `/approve/{id}` | Approve or reject a queued item |
 | POST | `/chat` | Chat with your wiki through the persistent memory index |
+| POST | `/chat-notes` | Attach a typed correction, contradiction, example, or nuance note to a chat answer trace |
 | GET | `/pages?folder=` | List pages in a folder (concepts, sources, insights, meta) |
 | GET | `/page/{name}` | Full content + parsed structured data for a page |
 | DELETE | `/page/{name}` | Delete a page |
@@ -241,6 +243,21 @@ Set `open_thread: true` to add a `deep-dive` tag to the saved concept page — m
 ```
 
 Asking "what do I know about X" returns a structured `knowledge_card` alongside the answer.
+
+### POST /chat-notes
+
+```json
+{
+  "note_type": "nuance",
+  "note": "A weaker judge can work for first-pass triage, not final authority.",
+  "question": "Can Llama 3.2 judge Llama 3.3?",
+  "answer_excerpt": "Yes, but capability matters.",
+  "pages_read": ["llm-as-judge"],
+  "sources": ["_wiki/cs/llm-as-judge.md"]
+}
+```
+
+Valid `note_type` values are `correction`, `contradiction`, `example`, and `nuance`. Chat notes append `event_type: chat_note` rows to `_wiki/meta/traces.jsonl` and `chat_note` rows to context telemetry. They are review evidence, not automatic concept-page edits.
 
 ### GET /lint
 
@@ -427,7 +444,7 @@ No request body needed. Displays in the **Dashboard** tab:
 
 ## Self-Learning System
 
-Every approve/reject event writes a trace to `_wiki/meta/traces.jsonl`. Once a week (auto) or on demand via the 🧠 Learn button in Browse, the routed analysis model (default Anthropic Sonnet) analyzes traces and writes structured findings to `_wiki/meta/system-insights.md`:
+Every approve/reject event writes a trace to `_wiki/meta/traces.jsonl`. Chat-note events also write typed trace evidence when you add corrections, contradictions, examples, or nuance under a chat answer. Once a week (auto) or on demand via the 🧠 Learn button in Browse, the routed analysis model (default Anthropic Sonnet) analyzes traces and writes structured findings to `_wiki/meta/system-insights.md`:
 
 - Which page suggestions were wrong most often
 - Tag confusion patterns (e.g. `Agentic` vs `Agents`)
@@ -435,7 +452,7 @@ Every approve/reject event writes a trace to `_wiki/meta/traces.jsonl`. Once a w
 - **Prompt hints** — auto-injected into the next extraction prompt so corrections propagate automatically
 - Routing and architecture recommendations surfaced to you
 
-The loop: approve → trace → weekly analysis → insights → extraction prompt → better next extraction.
+The ingestion loop is approve → trace → weekly analysis → insights → extraction prompt → better next extraction. The chat-note loop is answer → typed note → trace/telemetry → review evidence for better concept pages and future answers.
 
 ### GET /random-concept
 
@@ -526,6 +543,13 @@ Operations header commands are separated by side effect:
 
 After a command finishes, Operations shows a Last operation banner with what ran, what changed, and what to inspect next. Read-only report commands route to Evals or Reports. Trace critic and system-loop runs route to Queue only when there are action candidates to review.
 
+Operations → Evals separates two layers:
+
+- **System-level eval:** checks trace schema integrity, chat/context telemetry visibility, dropped retrieved chunks, low source coverage, LLM task errors, pending action candidates, and the recent system-action trace stream.
+- **Wiki/content eval:** replays preference memory, retrieval cases, and ingestion curation quality.
+
+Runtime edits should be justified by system-level evidence first. Wiki cleanup issues belong in Browse/Health or curation review, not in the same score as routing, context-budget, or telemetry failures.
+
 For high-stakes planning, use a brain/executor split: an expensive planning model proposes the plan, invariants, and acceptance checks; Codex executes the patch, runs tests, and commits. The handoff artifact should be plain Markdown with goal, constraints, files likely involved, acceptance checks, and explicit non-goals.
 
 ---
@@ -604,3 +628,32 @@ Processed files are moved to:
 ```bash
 ~/SakethVault/_wiki/inbox/processed/
 ```
+
+## Lekhni Integration
+
+[Lekhni](https://github.com/Sakethv7/lekhni) is a separate local app that
+turns recordings, transcripts, and pasted notes into generated Markdown
+notes. It's the upstream source for a third capture path, alongside the Web
+Clipper and inbox flows above: a Lekhni session note with a technical note
+type (system design, talk, AI engineering, paper/research) can carry a
+`## Reusable Patterns` section, and each pattern in it becomes its own
+SakethWiki clip.
+
+- **Transport:** Lekhni's `bridge_sakethwiki.py` posts each pattern to
+  `POST /ingest-markdown` with `source_url` set to `lekhni://<session_id>`,
+  so every clip traces back to the Lekhni session it came from.
+- **Dedup:** if a clip with the same content was already staged in a prior
+  push, `/ingest-markdown` returns `409` and Lekhni reconciles it against
+  `_wiki/meta/processed_clips.jsonl` instead of re-queuing a duplicate.
+- **Intelligence + Decision:** identical to the Web Clipper flow above —
+  clips land in the same HITL queue and go through the same
+  approve/reject/merge decision.
+- **Status round-trip:** Lekhni polls `GET /queue-status?ids=...` to find
+  out whether previously staged items were approved or rejected, since
+  approve/reject removes them from the live `/queue` and their outcome only
+  survives in `traces.jsonl`. This is how a Lekhni session shows a
+  `sent` / `partial` / `saved` / `rejected` badge without SakethWiki having
+  to push anything back to Lekhni.
+
+In short: Lekhni decides what's worth reviewing and stages it; SakethWiki
+decides what's worth keeping and where it lives long-term.
