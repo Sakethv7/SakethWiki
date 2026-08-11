@@ -123,6 +123,10 @@ incident_closed
 
 The trace should be replayable. If the same sensor window is replayed later, the system should be able to compare old and new diagnosis behavior.
 
+SakethWiki now also records typed chat notes as trace evidence: correction, contradiction, example, and nuance. The FactoryMind equivalent should be operator feedback labels on agent diagnoses. A correction says the diagnosis or suggested action was wrong. A contradiction says two evidence sources disagree and should not be auto-resolved. An example adds a concrete machine case. A nuance adds operating conditions where the diagnosis is only partly true. These labels should shape future evals and review queues before they ever mutate control policy.
+
+SakethWiki now separates wiki/content eval from system-level eval. FactoryMind needs the same split. Content eval can check whether a manual section or diagnosis explanation is useful. System eval must check trace completeness, sensor-window replayability, latency, route/tool failures, safety-gate triggers, pending operator approvals, and whether a proposed runtime change is justified. Do not let documentation cleanup scores stand in for machine-control health.
+
 ## ESP32 Starting Point
 
 For early ESP32 work, do not begin with a broad autonomous agent. Begin with a small deterministic signal loop:

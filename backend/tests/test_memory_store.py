@@ -2,6 +2,7 @@ from pathlib import Path
 from datetime import datetime, timedelta
 import asyncio
 import base64
+import json
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -465,6 +466,91 @@ def test_store_image_skips_large_optional_caption(monkeypatch, tmp_path):
     assert result["saved"][0]["filename"].endswith("image-1.png")
     assert context["store_image_latency_events"] == 1
     assert context["recent_store_image_latency"][0]["caption_skipped_count"] == 1
+
+
+def test_chat_notes_write_trace_and_telemetry(monkeypatch, tmp_path):
+    vault = tmp_path / "vault"
+    (vault / "_wiki" / "meta").mkdir(parents=True)
+    monkeypatch.setenv("VAULT_PATH", str(vault))
+
+    result = asyncio.run(main.add_chat_note(main.ChatNoteRequest(
+        note_type="nuance",
+        note="A weaker judge is fine for first-pass triage, not final authority.",
+        question="Can Llama 3.2 judge Llama 3.3?",
+        answer_excerpt="Yes, but capability matters.",
+        pages_read=["llm-as-judge", "agent-evaluation-methods-evals"],
+        sources=["_wiki/cs/llm-as-judge.md"],
+    )))
+
+    traces_path = vault / "_wiki" / "meta" / "traces.jsonl"
+    trace = json.loads(traces_path.read_text(encoding="utf-8").splitlines()[0])
+    summary = telemetry.summarize_context_events()
+
+    assert result["success"] is True
+    assert trace["event_type"] == "chat_note"
+    assert trace["note_type"] == "nuance"
+    assert "approved" not in trace
+    assert summary["chat_note_events"] == 1
+    assert summary["chat_note_type_counts"]["nuance"] == 1
+    assert summary["chat_note_top_pages"][0]["page"] == "agent-evaluation-methods-evals"
+
+
+def test_chat_notes_reject_unknown_type(monkeypatch, tmp_path):
+    vault = tmp_path / "vault"
+    (vault / "_wiki" / "meta").mkdir(parents=True)
+    monkeypatch.setenv("VAULT_PATH", str(vault))
+
+    try:
+        asyncio.run(main.add_chat_note(main.ChatNoteRequest(note_type="idea", note="too vague")))
+    except Exception as exc:
+        assert getattr(exc, "status_code", None) == 400
+    else:
+        raise AssertionError("unknown chat note type should fail")
+
+
+def test_system_level_eval_reports_runtime_gates(monkeypatch, tmp_path):
+    vault = tmp_path / "vault"
+    (vault / "_wiki" / "meta").mkdir(parents=True)
+    monkeypatch.setenv("VAULT_PATH", str(vault))
+
+    main._append_trace({
+        "ts": "2026-07-13T10:00:00",
+        "approved": True,
+        "final_page": "rag",
+        "source_type": "text",
+    })
+    telemetry.log_context_event(
+        "chat_context",
+        {
+            "query": "what do I know about rag",
+            "retrieved_chunks_dropped": 2,
+            "context_chars_used": 6000,
+            "context_chars_dropped": 1200,
+        },
+    )
+    telemetry.log_system_action({
+        "action": "flag_chat_context_drops",
+        "reason": "test dropped chunks",
+        "applied": False,
+    })
+    system_loop.upsert_action_candidate({
+        "risk": "medium",
+        "action": "increase_chat_context_budget",
+        "target": "chat_answer",
+        "reason": "test pending action",
+        "proposed_change": {"chat_context_budget": 9000},
+        "current_state": {"chat_context_budget": 6000},
+    })
+
+    result = eval_harness.run_system_level_eval()
+
+    assert result["suite"] == "system_level"
+    assert result["passed"] is True
+    assert result["trace_counts"]["approved"] == 1
+    assert result["telemetry_counts"]["chat_events"] == 1
+    assert result["telemetry_counts"]["pending_actions"] == 1
+    assert any(gate["name"] == "dropped_chat_context" and not gate["passed"] for gate in result["gates"])
+    assert result["recent_system_actions"][-1]["action"] == "flag_chat_context_drops"
 
 
 def test_llm_client_complete_runs_on_python39(monkeypatch, tmp_path):

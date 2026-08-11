@@ -165,6 +165,8 @@ knowledge queries additionally parse top concept page into knowledge_card
 Return: {answer, knowledge_card?, sources}
 ```
 
+**Note loop:** Chat answers can call `/chat-notes` with one of four note types: `correction`, `contradiction`, `example`, or `nuance`. The backend writes `event_type: chat_note` to `_wiki/meta/traces.jsonl` and `chat_note` context telemetry, including related pages and the original question. These notes are audit evidence for later concept-page improvement; they do not auto-patch Markdown.
+
 **Design shift:** Markdown is still the source of truth, but it is no longer the retrieval index. The durable retrieval layer lives in `_wiki/meta/memory.db`, which stores page metadata plus chunked snippets and optional embeddings.
 
 ### 5. Learning Dashboard
@@ -433,6 +435,12 @@ last_evolution: 2026-04-18
   "was_duplicate": false
 }
 ```
+
+### System-Level Eval
+
+System-level eval is separate from wiki/content eval. Wiki eval checks preference replay, retrieval cases, and ingestion curation. System eval checks whether the control loop itself is observable and safe to edit: trace schema integrity, chat/context telemetry, dropped retrieved chunks, low source coverage, LLM task errors, pending action candidates, and recent system-action traces.
+
+Runtime changes such as context-budget increases, routing overrides, eval-case exclusions, and review-queue actions should be justified by system-level evidence. Concept-page cleanup belongs in Health/Browse or curation review, not in the same gate as system behavior.
 
 ---
 

@@ -186,6 +186,8 @@ The Chat tab sends the user question to `POST /chat`. The backend syncs `_wiki/m
 
 Identity resolution expands aliases before retrieval. A query like "retrieval augmented generation" can land on `rag`. The chat answer receives retrieved snippets, current understanding, source page names, wiki index context, and chat-style preferences. If the query asks "what do I know about X?", the response can include a structured knowledge card from `parse_concept_page`.
 
+Chat answers now have a typed note loop through `POST /chat-notes`. The user can attach `correction`, `contradiction`, `example`, or `nuance` to an answer and the pages it read. These notes append `event_type: chat_note` rows to `_wiki/meta/traces.jsonl` and `chat_note` rows to context telemetry. They are candidate evidence for shaping concept pages and future answers; they do not directly mutate Markdown because raw note capture is not the same as durable knowledge.
+
 ### Browse Path
 
 The Browse tab calls `GET /pages` and `GET /page/{name}`. `vault_reader.py` searches the vault folders, resolves aliases, parses frontmatter, extracts the current-understanding block, source sections, related wikilinks, diagrams, maturity, and backlinks. Concept pages render as structured views; non-concept Markdown can still render as raw content.
@@ -200,6 +202,8 @@ Health check linting can call an LLM for higher-level inconsistencies and gaps, 
 
 Consolidation is conservative. `/consolidation-candidates` only proposes duplicate candidates. `/consolidate` is the destructive path and now has a safety gate; weak pairs require `force=true`.
 
+Evals are split by responsibility. Wiki/content evals check preference replay, retrieval cases, and ingestion curation. System-level evals check runtime gates: trace schema integrity, chat/context telemetry visibility, dropped retrieved chunks, low source coverage, LLM task errors, and pending system actions. Operations shows the system gates and recent system action trace stream before the older wiki-quality eval report, because system health decides whether runtime edits are justified.
+
 ### Feedback Loops
 
 There are three feedback loops:
@@ -207,6 +211,8 @@ There are three feedback loops:
 - Trace loop: approvals/rejections write `traces.jsonl`, and weekly analysis turns patterns into `system-insights.md` prompt hints.
 - Preference loop: the same traces update `preferences.json`, which biases future page/tag choices and chat style.
 - Memory loop: Markdown writes resync into `memory.db`, which improves future chat retrieval.
+- Chat-note loop: corrections, contradictions, examples, and nuance from chat write typed trace and telemetry evidence, making visible how the user is shaping answers before any concept page is patched.
+- System-eval loop: telemetry, traces, and action candidates are evaluated separately from wiki content so runtime edits are justified by system evidence, not by vague cleanup instincts.
 
 Mistake to avoid: thinking of this as a RAG app with a wiki attached. The Markdown vault is the source of truth. Retrieval, preferences, review queues, and consolidation are derived systems around it.
 

@@ -321,6 +321,7 @@ def summarize_context_events(events: Iterable[dict[str, Any]] | None = None) -> 
     latency_rows = [r for r in rows if r.get("event_type") == "ingest_latency"]
     store_image_latency_rows = [r for r in rows if r.get("event_type") == "store_image_latency"]
     chat_rows = [r for r in rows if r.get("event_type") == "chat_context"]
+    chat_note_rows = [r for r in rows if r.get("event_type") == "chat_note"]
 
     low_coverage = [
         r for r in extraction_rows
@@ -340,6 +341,19 @@ def summarize_context_events(events: Iterable[dict[str, Any]] | None = None) -> 
         shape_counts[shape] = shape_counts.get(shape, 0) + 1
         if row.get("diagram_planned"):
             diagram_planned += 1
+    chat_note_type_counts: dict[str, int] = {}
+    chat_note_target_counts: dict[str, int] = {}
+    for row in chat_note_rows:
+        note_type = str(row.get("note_type") or "unknown")
+        chat_note_type_counts[note_type] = chat_note_type_counts.get(note_type, 0) + 1
+        for page in row.get("pages_read") or []:
+            page_name = str(page).strip()
+            if page_name:
+                chat_note_target_counts[page_name] = chat_note_target_counts.get(page_name, 0) + 1
+    chat_note_top_pages = [
+        {"page": page, "count": count}
+        for page, count in sorted(chat_note_target_counts.items(), key=lambda x: (-x[1], x[0].lower()))[:10]
+    ]
 
     latency_values = [float(r.get("total_ms", 0) or 0) for r in latency_rows]
     store_latency_values = [float(r.get("total_ms", 0) or 0) for r in store_image_latency_rows]
@@ -375,6 +389,7 @@ def summarize_context_events(events: Iterable[dict[str, Any]] | None = None) -> 
         "ingest_latency_events": len(latency_rows),
         "store_image_latency_events": len(store_image_latency_rows),
         "chat_events": len(chat_rows),
+        "chat_note_events": len(chat_note_rows),
         "low_source_coverage_events": len(low_coverage),
         "chat_events_with_dropped_chunks": len(dropped_chat),
         "ingest_latency_median_ms": round(statistics.median(latency_values), 1) if latency_values else 0,
@@ -387,9 +402,12 @@ def summarize_context_events(events: Iterable[dict[str, Any]] | None = None) -> 
         "curation_verdict_counts": verdict_counts,
         "curation_shape_counts": shape_counts,
         "curation_diagram_planned": diagram_planned,
+        "chat_note_type_counts": chat_note_type_counts,
+        "chat_note_top_pages": chat_note_top_pages,
         "recent_low_coverage": low_coverage[-10:],
         "recent_dropped_chat_context": dropped_chat[-10:],
         "recent_ingest_curation": curation_rows[-10:],
+        "recent_chat_notes": chat_note_rows[-10:],
     }
 
 
@@ -437,6 +455,11 @@ def generate_inference_report() -> dict[str, Any]:
         f"- `{r.get('source_verdict', 'unknown')}` / `{r.get('knowledge_shape', 'unknown')}` "
         f"diagram={r.get('diagram_planned', False)} from {r.get('source_url', '')}"
         for r in context_summary["recent_ingest_curation"]
+    ]
+    chat_note_lines = [
+        f"- `{r.get('note_type', 'unknown')}` on {', '.join(r.get('pages_read') or []) or 'no linked page'} "
+        f"for query `{str(r.get('question', ''))[:90]}`"
+        for r in context_summary["recent_chat_notes"]
     ]
     latency_lines = [
         f"- {r.get('total_ms', 0)} ms total; stages={json.dumps(r.get('stage_ms', {}), sort_keys=True)}; "
@@ -487,11 +510,13 @@ total_llm_cost_usd: {llm_summary.get("total_cost_usd", 0)}
 - Store-image latency events: {context_summary["store_image_latency_events"]}
 - Store-image latency median / p95: {context_summary["store_image_latency_median_ms"]} ms / {context_summary["store_image_latency_p95_ms"]} ms
 - Chat context events: {context_summary["chat_events"]}
+- Chat note events: {context_summary["chat_note_events"]}
 - Low source coverage events: {context_summary["low_source_coverage_events"]}
 - Chat events with dropped chunks: {context_summary["chat_events_with_dropped_chunks"]}
 - Curation verdicts: {json.dumps(context_summary["curation_verdict_counts"], sort_keys=True)}
 - Knowledge shapes: {json.dumps(context_summary["curation_shape_counts"], sort_keys=True)}
 - Diagrams planned: {context_summary["curation_diagram_planned"]}
+- Chat note types: {json.dumps(context_summary["chat_note_type_counts"], sort_keys=True)}
 
 ### Recent Low Source Coverage
 
@@ -504,6 +529,10 @@ total_llm_cost_usd: {llm_summary.get("total_cost_usd", 0)}
 ### Recent Ingest Curation
 
 {chr(10).join(curation_lines) if curation_lines else "- None"}
+
+### Recent Chat Notes
+
+{chr(10).join(chat_note_lines) if chat_note_lines else "- None"}
 
 ### Ingest Latency
 

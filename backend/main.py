@@ -90,6 +90,7 @@ LINT_CACHE_TTL_SECONDS  = 86400  # 24 h — lint report cache validity
 WEEKLY_ANALYSIS_INTERVAL_SECONDS = 3600  # scheduler checks every hour
 SOURCE_VERDICTS = {"ingest", "source_only", "reject"}
 KNOWLEDGE_SHAPES = {"taxonomy", "mechanism", "architecture", "argument", "case_study", "none"}
+CHAT_NOTE_TYPES = {"correction", "contradiction", "example", "nuance"}
 
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -188,6 +189,15 @@ class OpenThreadRequest(BaseModel):
 class ChatRequest(BaseModel):
     message: str
     history: list = []
+
+
+class ChatNoteRequest(BaseModel):
+    note_type: str
+    note: str
+    question: str = ""
+    answer_excerpt: str = ""
+    pages_read: list = []
+    sources: list = []
 
 
 class PreferenceReviewRequest(BaseModel):
@@ -1924,6 +1934,51 @@ async def get_queue():
     return {"items": queue_manager.get_all()}
 
 
+@app.get("/queue-status")
+async def queue_status(ids: str):
+    """Resolve the outcome of previously staged clip ids: pending, saved, rejected, or unknown.
+
+    Approve/reject remove an item from the queue, so once it's gone the only
+    record of what happened is its trace in traces.jsonl (item_id now logged
+    there for exactly this lookup).
+    """
+    requested = [item_id.strip() for item_id in ids.split(",") if item_id.strip()]
+    results: dict[str, dict] = {item_id: {"status": "unknown"} for item_id in requested}
+
+    for item_id in requested:
+        if queue_manager.get_by_id(item_id):
+            results[item_id] = {"status": "pending"}
+
+    remaining = {item_id for item_id in requested if results[item_id]["status"] == "unknown"}
+    if remaining:
+        vault_path = Path(os.environ.get("VAULT_PATH", "/Users/sakethv7/SakethVault"))
+        traces_path = vault_path / "_wiki" / "meta" / "traces.jsonl"
+        if traces_path.exists():
+            with open(traces_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        trace = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    trace_id = trace.get("item_id")
+                    if trace_id in remaining:
+                        if trace.get("approved"):
+                            results[trace_id] = {
+                                "status": "saved",
+                                "final_page": trace.get("final_page", ""),
+                            }
+                        else:
+                            results[trace_id] = {"status": "rejected"}
+                        remaining.discard(trace_id)
+                    if not remaining:
+                        break
+
+    return {"results": results}
+
+
 @app.post("/queue/regenerate/{item_id}")
 async def queue_regenerate(item_id: str, req: RegenerateRequest):
     item = queue_manager.get_by_id(item_id)
@@ -1970,6 +2025,7 @@ async def approve(item_id: str, req: ApproveRequest):
         try:
             trace = {
                 "ts": datetime.now().isoformat(),
+                "item_id": item_id,
                 "url": item.get("url", ""),
                 "source_type": item.get("source_type") or ("tweet" if _is_tweet_url(item.get("url", "")) else ("text" if not item.get("url") else "url")),
                 "approved": False,
@@ -2086,6 +2142,7 @@ async def approve(item_id: str, req: ApproveRequest):
     try:
         trace = {
             "ts": datetime.now().isoformat(),
+            "item_id": item_id,
             "url": item.get("url", ""),
             "source_type": item.get("source_type") or ("tweet" if _is_tweet_url(item.get("url", "")) else ("text" if not item.get("url") else "url")),
             "approved": True,
@@ -2354,6 +2411,51 @@ async def chat(req: ChatRequest):
         "pages_read": relevant_names,
         **({"knowledge_card": knowledge_card} if knowledge_card else {}),
     }
+
+
+@app.post("/chat-notes")
+async def add_chat_note(req: ChatNoteRequest):
+    note_type = (req.note_type or "").strip().lower()
+    note = (req.note or "").strip()
+    if note_type not in CHAT_NOTE_TYPES:
+        raise HTTPException(400, f"note_type must be one of {sorted(CHAT_NOTE_TYPES)}")
+    if not note:
+        raise HTTPException(400, "note cannot be empty")
+
+    pages_read = [
+        identity.resolve_slug(str(page))
+        for page in (req.pages_read or [])
+        if str(page).strip()
+    ][:12]
+    sources = [str(source).strip() for source in (req.sources or []) if str(source).strip()][:12]
+    trace_id = f"chat-note-{uuid.uuid4().hex[:12]}"
+    trace = {
+        "id": trace_id,
+        "ts": datetime.now().isoformat(),
+        "event_type": "chat_note",
+        "note_type": note_type,
+        "status": "candidate",
+        "question": (req.question or "").strip()[:1000],
+        "answer_excerpt": (req.answer_excerpt or "").strip()[:1600],
+        "note": note[:4000],
+        "pages_read": pages_read,
+        "sources": sources,
+        "target_pages": pages_read,
+        "source_type": "chat_note",
+    }
+    _append_trace(trace)
+    telemetry.log_context_event(
+        "chat_note",
+        {
+            "trace_id": trace_id,
+            "note_type": note_type,
+            "note_chars": len(note),
+            "question": trace["question"],
+            "pages_read": pages_read,
+            "target_pages_count": len(pages_read),
+        },
+    )
+    return {"success": True, "id": trace_id, "note_type": note_type, "target_pages": pages_read}
 
 
 # ── /interview ───────────────────────────────────────────────────────────────
@@ -2848,12 +2950,14 @@ async def analyze_traces():
 
     prompt = f"""You are analyzing usage traces from a personal knowledge wiki system to find patterns and suggest improvements.
 
-Here are {len(traces)} traces (each is one approve/reject event):
+Here are {len(traces)} traces. Most are approve/reject ingestion events; some have event_type=chat_note and capture typed user feedback on chat answers:
 
 {trace_summary}
 
 Fields:
 - approved: was the item approved (True) or rejected (False)
+- event_type: chat_note means the user attached correction, contradiction, example, or nuance to a chat answer
+- note_type / note / target_pages: chat-note label, user note text, and related wiki pages
 - suggested_page / final_page: what the AI suggested vs what the user chose
 - page_corrected: True if user changed the suggested page
 - evolution_type: extends/refines/supersedes/duplicates/contradicts
@@ -3099,6 +3203,7 @@ async def read_report(req: ReportPathRequest):
 async def operations_overview():
     llm_summary = telemetry.summarize_llm_calls()
     context_summary = telemetry.summarize_context_events()
+    eval_summary = eval_harness.run_system_level_eval()
     actions = telemetry.read_system_actions(limit=50)
     candidates = system_loop.list_action_candidates()
     errors = [
@@ -3120,7 +3225,7 @@ async def operations_overview():
     return {
         "llm_summary": llm_summary,
         "context_summary": context_summary,
-        "eval_summary": None,
+        "eval_summary": eval_summary,
         "actions": actions,
         "candidates": candidates,
         "errors": errors,

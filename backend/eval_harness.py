@@ -43,6 +43,10 @@ def eval_cases_path() -> Path:
     return _meta_dir() / "eval-cases.json"
 
 
+def action_candidates_path() -> Path:
+    return _meta_dir() / "system-action-candidates.json"
+
+
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:
     if not path.exists():
         return []
@@ -57,6 +61,15 @@ def _read_jsonl(path: Path) -> list[dict[str, Any]]:
         if isinstance(row, dict):
             rows.append(row)
     return rows
+
+
+def _read_json_file(path: Path, default: Any) -> Any:
+    if not path.exists():
+        return default
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return default
 
 
 def load_eval_exclusions() -> dict[str, Any]:
@@ -457,6 +470,134 @@ Cases:
     }
 
 
+def run_system_level_eval() -> dict[str, Any]:
+    """Evaluate runtime/control-loop health, not concept-page quality."""
+    traces = _read_jsonl(_traces_path())
+    context = telemetry.summarize_context_events()
+    llm = telemetry.summarize_llm_calls()
+    actions = telemetry.read_system_actions(limit=200)
+    candidates_data = _read_json_file(action_candidates_path(), {"candidates": []})
+    candidates = [c for c in candidates_data.get("candidates", []) if isinstance(c, dict)] if isinstance(candidates_data, dict) else []
+    pending_statuses = {"candidate", "needs_approval", "eval_ready", "eval_failed", "apply_failed"}
+    pending = [c for c in candidates if c.get("status", "candidate") in pending_statuses]
+
+    trace_types: dict[str, int] = {}
+    approved = 0
+    rejected = 0
+    malformed_trace_events = 0
+    for trace in traces:
+        event_type = str(trace.get("event_type") or ("approval" if "approved" in trace else "unknown"))
+        trace_types[event_type] = trace_types.get(event_type, 0) + 1
+        if trace.get("approved") is True:
+            approved += 1
+            if not trace.get("final_page"):
+                malformed_trace_events += 1
+        elif trace.get("approved") is False:
+            rejected += 1
+
+    task_risks = []
+    for task, row in (llm.get("by_task") or {}).items():
+        error_rate = float(row.get("error_rate", 0) or 0)
+        contract_failure_rate = float(row.get("contract_failure_rate", 0) or 0)
+        fallback_rate = float(row.get("fallback_rate", 0) or 0)
+        if error_rate or contract_failure_rate or fallback_rate >= 0.2:
+            task_risks.append({
+                "task": task,
+                "calls": row.get("calls", 0),
+                "error_rate": error_rate,
+                "contract_failure_rate": contract_failure_rate,
+                "fallback_rate": fallback_rate,
+            })
+    task_risks.sort(key=lambda r: (r["error_rate"] + r["contract_failure_rate"] + r["fallback_rate"]), reverse=True)
+
+    gates = [
+        {
+            "name": "trace_events_present",
+            "passed": len(traces) > 0,
+            "value": len(traces),
+            "threshold": "> 0",
+            "level": "fail",
+        },
+        {
+            "name": "trace_schema_integrity",
+            "passed": malformed_trace_events == 0,
+            "value": malformed_trace_events,
+            "threshold": "0 malformed approval traces",
+            "level": "fail",
+        },
+        {
+            "name": "chat_context_visibility",
+            "passed": int(context.get("chat_events", 0) or 0) > 0,
+            "value": context.get("chat_events", 0),
+            "threshold": "> 0 chat telemetry events",
+            "level": "warn",
+        },
+        {
+            "name": "dropped_chat_context",
+            "passed": int(context.get("chat_events_with_dropped_chunks", 0) or 0) == 0,
+            "value": context.get("chat_events_with_dropped_chunks", 0),
+            "threshold": "0 dropped-context events",
+            "level": "warn",
+        },
+        {
+            "name": "low_ingest_source_coverage",
+            "passed": int(context.get("low_source_coverage_events", 0) or 0) == 0,
+            "value": context.get("low_source_coverage_events", 0),
+            "threshold": "0 low-coverage ingest events",
+            "level": "warn",
+        },
+        {
+            "name": "llm_task_errors",
+            "passed": len(task_risks) == 0,
+            "value": len(task_risks),
+            "threshold": "0 tasks with errors, contract failures, or high fallback",
+            "level": "warn",
+        },
+        {
+            "name": "pending_system_actions",
+            "passed": len(pending) == 0,
+            "value": len(pending),
+            "threshold": "0 pending action candidates",
+            "level": "warn",
+        },
+    ]
+    hard_failures = [gate for gate in gates if gate["level"] == "fail" and not gate["passed"]]
+    warnings = [gate for gate in gates if gate["level"] == "warn" and not gate["passed"]]
+
+    return {
+        "suite": "system_level",
+        "passed": not hard_failures,
+        "warning_count": len(warnings),
+        "gates": gates,
+        "trace_counts": {
+            "total": len(traces),
+            "approved": approved,
+            "rejected": rejected,
+            "by_event_type": trace_types,
+        },
+        "telemetry_counts": {
+            "llm_calls": llm.get("total_calls", 0),
+            "chat_events": context.get("chat_events", 0),
+            "chat_note_events": context.get("chat_note_events", 0),
+            "ingest_events": context.get("ingest_events", 0),
+            "system_actions": len(actions),
+            "pending_actions": len(pending),
+        },
+        "task_risks": task_risks[:10],
+        "recent_system_actions": actions[-10:],
+        "pending_actions": [
+            {
+                "id": c.get("id"),
+                "action": c.get("action"),
+                "risk": c.get("risk"),
+                "status": c.get("status"),
+                "reason": c.get("reason"),
+            }
+            for c in pending[:10]
+        ],
+    }
+
+
 def run_eval(candidate: dict[str, Any] | None = None, include_judge: bool = False) -> dict[str, Any]:
     preference = run_preference_replay_eval()
     retrieval = run_retrieval_eval()
@@ -470,6 +611,7 @@ def run_eval(candidate: dict[str, Any] | None = None, include_judge: bool = Fals
         "failures": [],
     }
     context = telemetry.summarize_context_events()
+    system_level = run_system_level_eval()
 
     candidate_result = None
     passed = True
@@ -553,6 +695,7 @@ def run_eval(candidate: dict[str, Any] | None = None, include_judge: bool = Fals
         "retrieval": retrieval,
         "ingest_curation": curation,
         "ingest_curation_judge": curation_judge,
+        "system_level": system_level,
         "context": context,
     }
     write_eval_report(report)
@@ -612,6 +755,7 @@ def write_eval_report(report: dict[str, Any]) -> Path:
     retrieval = report["retrieval"]
     curation = report.get("ingest_curation", {})
     curation_judge = report.get("ingest_curation_judge", {})
+    system_level = report.get("system_level", {})
     candidate = report.get("candidate") or {}
     failures = [
         *pref.get("failures", []),
@@ -631,12 +775,43 @@ def write_eval_report(report: dict[str, Any]) -> Path:
             f"- Passed: `{candidate.get('passed')}`",
             *[f"- Reason: {reason}" for reason in candidate.get("reasons", [])],
         ]
+    gate_lines = [
+        f"- {'PASS' if gate.get('passed') else gate.get('level', 'warn').upper()} `{gate.get('name')}`: {gate.get('value')} (target: {gate.get('threshold')})"
+        for gate in system_level.get("gates", [])
+    ]
+    task_risk_lines = [
+        f"- `{risk.get('task')}` calls={risk.get('calls')} errors={risk.get('error_rate')} contracts={risk.get('contract_failure_rate')} fallbacks={risk.get('fallback_rate')}"
+        for risk in system_level.get("task_risks", [])
+    ]
+    pending_action_lines = [
+        f"- `{row.get('action')}` {row.get('status')} {row.get('risk')}: {row.get('reason')}"
+        for row in system_level.get("pending_actions", [])
+    ]
     content = f"""---
 generated_at: {report["generated_at"]}
 passed: {str(report["passed"]).lower()}
 ---
 
 # Eval Report
+
+## System-Level Eval
+
+- Passed hard gates: {system_level.get("passed")}
+- Warnings: {system_level.get("warning_count")}
+- Trace counts: {json.dumps(system_level.get("trace_counts", {}), sort_keys=True)}
+- Telemetry counts: {json.dumps(system_level.get("telemetry_counts", {}), sort_keys=True)}
+
+### System Gates
+
+{chr(10).join(gate_lines) if gate_lines else "- No system gates recorded"}
+
+### Runtime Task Risks
+
+{chr(10).join(task_risk_lines) if task_risk_lines else "- None"}
+
+### Pending System Actions
+
+{chr(10).join(pending_action_lines) if pending_action_lines else "- None"}
 
 ## Candidate Gate
 

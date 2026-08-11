@@ -97,7 +97,12 @@ async function api(path, opts = {}) {
   }
   if (!res.ok) {
     const err = await res.json().catch(() => ({ detail: res.statusText }));
-    throw new Error(err.detail || res.statusText);
+    const detail = err.detail;
+    const message = typeof detail === "string" ? detail
+      : detail?.message ? detail.message
+      : detail ? JSON.stringify(detail)
+      : res.statusText;
+    throw new Error(message);
   }
   if (res.status === 204) return null;
   return res.json();
@@ -173,6 +178,13 @@ const VALID_TAGS = [
   "Finance", "Investing", "Business", "Startups", "Economics",
   // Meta
   "Productivity", "Learning", "Health", "Mental-models", "Career",
+];
+
+const CHAT_NOTE_TYPES = [
+  { id: "nuance", label: "Nuance", tone: "amber" },
+  { id: "correction", label: "Correction", tone: "red" },
+  { id: "contradiction", label: "Contradiction", tone: "violet" },
+  { id: "example", label: "Example", tone: "emerald" },
 ];
 
 // ── INGEST TAB ────────────────────────────────────────────────────────────────
@@ -1394,6 +1406,8 @@ function ChatTab() {
   const [loading, setLoading] = useState(false);
   const [thinking, setThinking] = useState("");
   const [savedIdx, setSavedIdx] = useState(new Set());
+  const [noteDrafts, setNoteDrafts] = useState({});
+  const [savedNotes, setSavedNotes] = useState(new Set());
   const bottomRef = useRef();
 
   useEffect(() => {
@@ -1422,6 +1436,35 @@ function ChatTab() {
       await api("/save-answer", { method: "POST", body: JSON.stringify({ question: msg.question || "Chat insight", answer: msg.content, sources: msg.sources || [], pages_read: msg.pages_read || [] }) });
       setSavedIdx(prev => new Set([...prev, idx]));
     } catch (e) { alert(`Save failed: ${e.message}`); }
+  }
+
+  function updateNoteDraft(idx, patch) {
+    setNoteDrafts(prev => ({
+      ...prev,
+      [idx]: { note_type: "nuance", note: "", ...(prev[idx] || {}), ...patch },
+    }));
+  }
+
+  async function handleSaveNote(msg, idx) {
+    const draft = noteDrafts[idx] || { note_type: "nuance", note: "" };
+    if (!draft.note?.trim()) return;
+    try {
+      await api("/chat-notes", {
+        method: "POST",
+        body: JSON.stringify({
+          note_type: draft.note_type || "nuance",
+          note: draft.note,
+          question: msg.question || "Chat note",
+          answer_excerpt: (msg.content || "").slice(0, 1200),
+          sources: msg.sources || [],
+          pages_read: msg.pages_read || [],
+        }),
+      });
+      setSavedNotes(prev => new Set([...prev, idx]));
+      updateNoteDraft(idx, { note: "" });
+    } catch (e) {
+      alert(`Note save failed: ${e.message}`);
+    }
   }
 
   function handleKey(e) {
@@ -1484,6 +1527,36 @@ function ChatTab() {
                     </button>
                   )}
                 </div>
+                {!msg.isError && (
+                  <div className="rounded-xl border border-stone-200 bg-stone-50 px-3 py-2 space-y-2">
+                    <div className="flex items-center gap-1 flex-wrap">
+                      {CHAT_NOTE_TYPES.map(type => {
+                        const active = (noteDrafts[i]?.note_type || "nuance") === type.id;
+                        return (
+                          <button key={type.id} onClick={() => updateNoteDraft(i, { note_type: type.id })}
+                            className={`text-[11px] px-2 py-1 rounded-md border transition-colors ${
+                              active ? "bg-white border-stone-300 text-stone-800 shadow-sm" : "border-transparent text-stone-400 hover:text-stone-700"
+                            }`}>
+                            {type.label}
+                          </button>
+                        );
+                      })}
+                      {savedNotes.has(i) && <span className="ml-auto text-[11px] text-emerald-600">Saved to traces</span>}
+                    </div>
+                    <div className="flex gap-2">
+                      <textarea
+                        value={noteDrafts[i]?.note || ""}
+                        onChange={e => updateNoteDraft(i, { note: e.target.value })}
+                        placeholder="Add nuance, correction, contradiction, or example..."
+                        className="flex-1 min-h-[42px] max-h-28 resize-y rounded-lg border border-stone-200 bg-white px-2.5 py-2 text-xs text-stone-700 placeholder:text-stone-400 focus:outline-none focus:ring-2 focus:ring-orange-200"
+                      />
+                      <button onClick={() => handleSaveNote(msg, i)} disabled={!noteDrafts[i]?.note?.trim()}
+                        className="self-end shrink-0 rounded-lg bg-stone-900 px-3 py-2 text-xs font-medium text-white disabled:opacity-30">
+                        Add note
+                      </button>
+                    </div>
+                  </div>
+                )}
               </div>
             )}
           </div>
@@ -2841,6 +2914,7 @@ const FOLDERS = [
 function BrowseTab() {
   const [folder, setFolder] = useState("cs");
   const [pages, setPages] = useState([]);
+  const [pagesError, setPagesError] = useState(false);
   const [search, setSearch] = useState("");
   const [deepDiveFilter, setDeepDiveFilter] = useState(false);
   const [selected, setSelected] = useState(null);
@@ -2893,7 +2967,7 @@ function BrowseTab() {
 
   function reloadPages(f = folder) {
     const url = f === "recent" ? `/vault/recent-pages` : `/pages?folder=${f}`;
-    api(url).then(d => setPages(d.pages)).catch(() => {});
+    api(url).then(d => { setPages(d.pages); setPagesError(false); }).catch(() => setPagesError(true));
   }
 
   function switchFolder(f) {
@@ -2913,8 +2987,15 @@ function BrowseTab() {
     const pagesUrl = folder === "recent" ? `/vault/recent-pages` : `/pages?folder=${folder}`;
     const tryLoad = () => {
       api(pagesUrl)
-        .then(d => { if (d.pages?.length > 0) setPages(d.pages); else if (attempts++ < 15) setTimeout(tryLoad, 2000); })
-        .catch(() => { if (attempts++ < 15) setTimeout(tryLoad, 2000); });
+        .then(d => {
+          setPagesError(false);
+          if (d.pages?.length > 0) setPages(d.pages);
+          else if (attempts++ < 15) setTimeout(tryLoad, 2000);
+        })
+        .catch(() => {
+          if (attempts++ < 15) setTimeout(tryLoad, 2000);
+          else setPagesError(true);
+        });
     };
     tryLoad();
   }, [folder]);
@@ -3345,13 +3426,13 @@ function BrowseTab() {
       <div className="flex-1 overflow-y-auto space-y-2">
         {filtered.length === 0 && (
           <div className="flex flex-col items-center justify-center pt-12 space-y-3">
-            <div className="w-10 h-10 bg-stone-100 rounded-2xl flex items-center justify-center">
-              <svg className="w-5 h-5 text-stone-300" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/></svg>
+            <div className={`w-10 h-10 rounded-2xl flex items-center justify-center ${pagesError ? "bg-red-50" : "bg-stone-100"}`}>
+              <svg className={`w-5 h-5 ${pagesError ? "text-red-300" : "text-stone-300"}`} fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/></svg>
             </div>
-            <p className="text-sm text-stone-400">
-              {pages.length === 0 ? `No pages in ${folder} yet` : "No matches"}
+            <p className={`text-sm ${pagesError ? "text-red-400" : "text-stone-400"}`}>
+              {pagesError ? "Can't reach the backend — check it's running on :8001" : pages.length === 0 ? `No pages in ${folder} yet` : "No matches"}
             </p>
-            {pages.length === 0 && (
+            {(pages.length === 0 || pagesError) && (
               <button onClick={() => reloadPages()} className="text-xs text-orange-500 hover:text-orange-600">
                 Reload
               </button>
@@ -4008,10 +4089,10 @@ function OperationsTab() {
       const routed = result.actions?.length || 0;
       setView("evals");
       setOperationNotice({
-        title: evalResult.passed ? "Safety evals passed" : "Safety evals found failures",
-        message: `Ran replay checks for preferences, retrieval, and ingest curation. ${routed} action candidate(s) were staged from eval findings.`,
-        next: routed ? "Open Queue if you want to inspect staged actions." : "Read the eval report for exact pass/fail details.",
-        tone: evalResult.passed ? "emerald" : "red",
+        title: evalResult.system_level?.passed === false ? "System eval found hard failures" : "System eval finished",
+        message: `Checked system gates plus retrieval, preference, and curation replay. ${routed} action candidate(s) were staged from findings.`,
+        next: routed ? "Open Queue if you want to inspect staged actions." : "Read System-Level Eval and the eval report for exact gates.",
+        tone: evalResult.system_level?.passed === false ? "red" : (evalResult.system_level?.warning_count ? "amber" : "emerald"),
       });
     } catch (e) {
       setError(e.message);
@@ -4105,6 +4186,7 @@ function OperationsTab() {
   const lowActions = (data?.actions || []).filter(a => a.applied).slice(-10).reverse();
   const errors = data?.errors || [];
   const context = data?.context_summary || {};
+  const systemEval = data?.eval_summary || {};
   const llm = data?.llm_summary || { total_calls: 0, by_task: {} };
   const taskRows = Object.entries(llm.by_task || {}).sort((a, b) => (b[1].calls || 0) - (a[1].calls || 0));
   const costTaskRows = Object.entries(llm.by_task || {}).sort((a, b) => (b[1].total_cost_usd || 0) - (a[1].total_cost_usd || 0));
@@ -4113,6 +4195,13 @@ function OperationsTab() {
   const recentIngestLatency = context.recent_ingest_latency || [];
   const recentStoreImageLatency = context.recent_store_image_latency || [];
   const ingestSlowStages = context.ingest_slow_stages || [];
+  const chatNoteTypes = context.chat_note_type_counts || {};
+  const recentChatNotes = context.recent_chat_notes || [];
+  const chatNoteTopPages = context.chat_note_top_pages || [];
+  const systemGates = systemEval.gates || [];
+  const failedSystemGates = systemGates.filter(g => !g.passed);
+  const taskRisks = systemEval.task_risks || [];
+  const recentSystemActions = systemEval.recent_system_actions || [];
   const reports = data?.reports || [];
   const historyActions = data?.actions || [];
   const evalReports = reports.filter(r => r.name?.startsWith("eval-"));
@@ -4193,10 +4282,11 @@ function OperationsTab() {
 
       {!loading && (
         <>
-          <div className="grid grid-cols-2 md:grid-cols-4 gap-2">
+          <div className="grid grid-cols-2 md:grid-cols-5 gap-2">
             <StatTile label="LLM calls" value={llm.total_calls || 0} />
             <StatTile label="Pending actions" value={pending.length} tone={pending.length ? "amber" : "stone"} />
             <StatTile label="Applied actions" value={applied.length} tone="emerald" />
+            <StatTile label="Chat notes" value={context.chat_note_events || 0} tone={context.chat_note_events ? "amber" : "stone"} />
             <StatTile label="Errors" value={errors.length} tone={errors.length ? "red" : "stone"} />
           </div>
 
@@ -4288,9 +4378,87 @@ function OperationsTab() {
             </div>
           </div>}
 
+          {view === "evals" && <div className="rounded-xl border border-stone-200 bg-white p-4">
+            <div className="flex items-start justify-between gap-3">
+              <div>
+                <h3 className="text-sm font-semibold text-stone-900">System-Level Eval</h3>
+                <p className="text-xs text-stone-400 mt-0.5">Runtime gates for traces, telemetry, context, model calls, and action backlog.</p>
+              </div>
+              <span className={`text-xs font-medium px-2 py-1 rounded-md ${
+                systemEval.passed === false ? "bg-red-50 text-red-700" : (systemEval.warning_count ? "bg-amber-50 text-amber-700" : "bg-emerald-50 text-emerald-700")
+              }`}>
+                {systemEval.passed === false ? "Hard fail" : `${systemEval.warning_count || 0} warning${(systemEval.warning_count || 0) === 1 ? "" : "s"}`}
+              </span>
+            </div>
+            <div className="mt-3 grid grid-cols-2 md:grid-cols-5 gap-2">
+              <StatTile label="Traces" value={systemEval.trace_counts?.total || 0} />
+              <StatTile label="LLM calls" value={systemEval.telemetry_counts?.llm_calls || 0} />
+              <StatTile label="Chat events" value={systemEval.telemetry_counts?.chat_events || 0} />
+              <StatTile label="System actions" value={systemEval.telemetry_counts?.system_actions || 0} />
+              <StatTile label="Pending actions" value={systemEval.telemetry_counts?.pending_actions || 0} tone={systemEval.telemetry_counts?.pending_actions ? "amber" : "stone"} />
+            </div>
+            <div className="mt-4 grid md:grid-cols-2 gap-4">
+              <div>
+                <p className="text-[11px] font-semibold text-stone-400 uppercase tracking-wider mb-2">Gates</p>
+                <div className="space-y-1.5">
+                  {systemGates.length === 0 ? (
+                    <p className="text-xs text-stone-400">No system eval has run yet.</p>
+                  ) : systemGates.map(gate => (
+                    <div key={gate.name} className="flex items-center justify-between gap-3 rounded-lg border border-stone-100 px-2 py-1.5 text-xs">
+                      <span className="font-mono text-stone-700 truncate">{gate.name}</span>
+                      <span className={`shrink-0 font-medium ${gate.passed ? "text-emerald-600" : gate.level === "fail" ? "text-red-600" : "text-amber-600"}`}>
+                        {gate.passed ? "pass" : gate.level} · {String(gate.value)}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+              <div>
+                <p className="text-[11px] font-semibold text-stone-400 uppercase tracking-wider mb-2">System trace stream</p>
+                <div className="space-y-1.5">
+                  {recentSystemActions.length === 0 ? (
+                    <p className="text-xs text-stone-400">No system actions logged yet.</p>
+                  ) : recentSystemActions.slice(-6).reverse().map((row, i) => (
+                    <div key={i} className="text-xs border border-stone-100 rounded-lg px-2 py-1.5">
+                      <div className="flex justify-between gap-3">
+                        <span className="font-medium text-stone-800 truncate">{row.action || "system_action"}</span>
+                        <span className={row.applied ? "text-emerald-600" : "text-stone-400"}>{row.applied ? "applied" : "queued"}</span>
+                      </div>
+                      <p className="text-[11px] text-stone-500 truncate mt-0.5">{row.reason || row.next || "No reason recorded"}</p>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            </div>
+            {(failedSystemGates.length > 0 || taskRisks.length > 0) && (
+              <div className="mt-4 grid md:grid-cols-2 gap-4">
+                <div>
+                  <p className="text-[11px] font-semibold text-stone-400 uppercase tracking-wider mb-2">Open gates</p>
+                  <div className="space-y-1.5">
+                    {failedSystemGates.map(gate => (
+                      <p key={gate.name} className={`text-xs ${gate.level === "fail" ? "text-red-700" : "text-amber-700"}`}>
+                        {gate.name}: {String(gate.value)}; target {gate.threshold}
+                      </p>
+                    ))}
+                  </div>
+                </div>
+                <div>
+                  <p className="text-[11px] font-semibold text-stone-400 uppercase tracking-wider mb-2">Task risks</p>
+                  <div className="space-y-1.5">
+                    {taskRisks.length === 0 ? <p className="text-xs text-stone-400">No task-level route risks.</p> : taskRisks.slice(0, 6).map(row => (
+                      <p key={row.task} className="text-xs text-stone-700 truncate">
+                        {row.task}: errors {(row.error_rate * 100).toFixed(1)}%, contract {(row.contract_failure_rate * 100).toFixed(1)}%, fallback {(row.fallback_rate * 100).toFixed(1)}%
+                      </p>
+                    ))}
+                  </div>
+                </div>
+              </div>
+            )}
+          </div>}
+
           {view === "evals" && <div className="grid md:grid-cols-2 gap-3">
             <div className="rounded-xl border border-stone-200 bg-white p-4">
-              <h3 className="text-sm font-semibold text-stone-900">Risk Buckets</h3>
+              <h3 className="text-sm font-semibold text-stone-900">Action Risk Buckets</h3>
               <div className="mt-3 space-y-2 text-xs">
                 <div className="flex justify-between"><span className="text-emerald-700">Low risk auto-applied</span><span className="font-medium text-stone-900">{lowActions.length}</span></div>
                 <div className="flex justify-between"><span className="text-amber-700">Medium staged/eval</span><span className="font-medium text-stone-900">{mediumRisk.length}</span></div>
@@ -4355,8 +4523,49 @@ function OperationsTab() {
             <div className="mt-3 grid grid-cols-2 gap-2">
               <StatTile label="Ingest events" value={context.ingest_events || 0} />
               <StatTile label="Chat events" value={context.chat_events || 0} />
+              <StatTile label="Chat notes" value={context.chat_note_events || 0} tone={context.chat_note_events ? "amber" : "stone"} />
               <StatTile label="Low coverage" value={context.low_source_coverage_events || 0} tone={context.low_source_coverage_events ? "amber" : "stone"} />
               <StatTile label="Dropped chunks" value={context.chat_events_with_dropped_chunks || 0} tone={context.chat_events_with_dropped_chunks ? "amber" : "stone"} />
+            </div>
+          </div>}
+
+          {view === "telemetry" && <div className="rounded-xl border border-stone-200 bg-white p-4">
+            <h3 className="text-sm font-semibold text-stone-900">Chat Note Shaping</h3>
+            <div className="mt-3 grid grid-cols-2 md:grid-cols-4 gap-2">
+              {CHAT_NOTE_TYPES.map(type => (
+                <StatTile key={type.id} label={type.label} value={chatNoteTypes[type.id] || 0} tone={(chatNoteTypes[type.id] || 0) ? "amber" : "stone"} />
+              ))}
+            </div>
+            <div className="mt-4 grid md:grid-cols-2 gap-4">
+              <div>
+                <p className="text-[11px] font-semibold text-stone-400 uppercase tracking-wider mb-2">Recent notes</p>
+                <div className="space-y-1.5">
+                  {recentChatNotes.length === 0 ? (
+                    <p className="text-xs text-stone-400">Add notes under chat answers to populate this.</p>
+                  ) : recentChatNotes.slice(-6).reverse().map((row, i) => (
+                    <div key={i} className="text-xs border border-stone-100 rounded-lg px-2 py-1.5">
+                      <div className="flex justify-between gap-3">
+                        <span className="font-medium text-stone-800 capitalize">{row.note_type || "note"}</span>
+                        <span className="text-stone-400">{(row.pages_read || []).slice(0, 2).map(p => `[[${p}]]`).join(" ") || "unlinked"}</span>
+                      </div>
+                      <p className="text-[11px] text-stone-500 truncate mt-0.5">{row.question || "Chat note"}</p>
+                    </div>
+                  ))}
+                </div>
+              </div>
+              <div>
+                <p className="text-[11px] font-semibold text-stone-400 uppercase tracking-wider mb-2">Pages shaped</p>
+                <div className="space-y-1.5">
+                  {chatNoteTopPages.length === 0 ? (
+                    <p className="text-xs text-stone-400">No page targets yet.</p>
+                  ) : chatNoteTopPages.map(row => (
+                    <div key={row.page} className="flex justify-between gap-3 text-xs">
+                      <span className="font-mono text-stone-600 truncate">[[{row.page}]]</span>
+                      <span className="font-medium text-stone-900">{row.count}</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
             </div>
           </div>}
 
