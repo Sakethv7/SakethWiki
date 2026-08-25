@@ -1,0 +1,264 @@
+// SakethWiki -- a native window around the local dashboard.
+//
+// This is deliberately thin, mirroring Job Tracker's launcher
+// (~/App Job Tracker/macapp/main.swift). All behaviour lives in the app
+// served from 127.0.0.1:5173 (Vite) with its API on 127.0.0.1:8001; this
+// bundle exists to give that page a Dock icon, an app identity, and a
+// window of its own instead of a browser tab among forty others. It holds
+// no application logic and stores no data.
+//
+// It does NOT own the server. launch.sh starts and restarts the backend and
+// frontend directly (no launchd agent for this project). The one thing this
+// app does to the server is start it if it is unexpectedly down, so a Dock
+// click is never a dead end.
+
+import Cocoa
+import WebKit
+
+let dashboardURL = URL(string: "http://127.0.0.1:5173")!
+let healthURL = URL(string: "http://127.0.0.1:5173")!
+
+// Baked in at build time so the installed bundle can find launch.sh
+// wherever the project lives. See build_macos_app.sh.
+let projectRoot = Bundle.main.object(forInfoDictionaryKey: "SWProjectRoot") as? String
+
+final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDelegate {
+    private var window: NSWindow!
+    private var webView: WKWebView!
+    private var statusLabel: NSTextField!
+    private var spinner: NSProgressIndicator!
+    private var overlay: NSVisualEffectView!
+    private var retryButton: NSButton!
+    private var hasLoaded = false
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        buildMenu()
+        buildWindow()
+        NSApp.activate(ignoringOtherApps: true)
+        start()
+    }
+
+    private func buildMenu() {
+        let appName = "SakethWiki"
+        let mainMenu = NSMenu()
+
+        let appItem = NSMenuItem()
+        let appMenu = NSMenu()
+        appMenu.addItem(withTitle: "About \(appName)", action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)), keyEquivalent: "")
+        appMenu.addItem(.separator())
+        appMenu.addItem(withTitle: "Hide \(appName)", action: #selector(NSApplication.hide(_:)), keyEquivalent: "h")
+        appMenu.addItem(withTitle: "Quit \(appName)", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        appItem.submenu = appMenu
+        mainMenu.addItem(appItem)
+
+        let editItem = NSMenuItem()
+        let editMenu = NSMenu(title: "Edit")
+        editMenu.addItem(withTitle: "Cut", action: #selector(NSText.cut(_:)), keyEquivalent: "x")
+        editMenu.addItem(withTitle: "Copy", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
+        editMenu.addItem(withTitle: "Paste", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
+        editMenu.addItem(withTitle: "Select All", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
+        editItem.submenu = editMenu
+        mainMenu.addItem(editItem)
+
+        let viewItem = NSMenuItem()
+        let viewMenu = NSMenu(title: "View")
+        viewMenu.addItem(withTitle: "Reload", action: #selector(reload), keyEquivalent: "r")
+        viewMenu.addItem(withTitle: "Enter Full Screen", action: #selector(NSWindow.toggleFullScreen(_:)), keyEquivalent: "f")
+        viewItem.submenu = viewMenu
+        mainMenu.addItem(viewItem)
+
+        NSApp.mainMenu = mainMenu
+    }
+
+    private func buildWindow() {
+        window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 1240, height: 840),
+            styleMask: [.titled, .closable, .miniaturizable, .resizable],
+            backing: .buffered,
+            defer: false
+        )
+        window.title = "SakethWiki"
+        window.minSize = NSSize(width: 720, height: 560)
+        window.setFrameAutosaveName("SakethWikiMain")
+        window.isReleasedWhenClosed = false
+
+        let configuration = WKWebViewConfiguration()
+        webView = WKWebView(frame: .zero, configuration: configuration)
+        webView.navigationDelegate = self
+        webView.uiDelegate = self
+        webView.autoresizingMask = [.width, .height]
+
+        let content = NSView(frame: NSRect(x: 0, y: 0, width: 1240, height: 840))
+        content.autoresizingMask = [.width, .height]
+        webView.frame = content.bounds
+        content.addSubview(webView)
+
+        overlay = NSVisualEffectView(frame: content.bounds)
+        overlay.autoresizingMask = [.width, .height]
+        overlay.material = .windowBackground
+        overlay.blendingMode = .behindWindow
+
+        spinner = NSProgressIndicator()
+        spinner.style = .spinning
+        spinner.controlSize = .small
+        spinner.startAnimation(nil)
+
+        statusLabel = NSTextField(labelWithString: "Starting SakethWiki…")
+        statusLabel.alignment = .center
+        statusLabel.textColor = .secondaryLabelColor
+        statusLabel.font = .systemFont(ofSize: 13)
+
+        retryButton = NSButton(title: "Try again", target: self, action: #selector(retry))
+        retryButton.bezelStyle = .rounded
+        retryButton.isHidden = true
+
+        let stack = NSStackView(views: [spinner, statusLabel, retryButton])
+        stack.orientation = .vertical
+        stack.alignment = .centerX
+        stack.spacing = 14
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        overlay.addSubview(stack)
+        NSLayoutConstraint.activate([
+            stack.centerXAnchor.constraint(equalTo: overlay.centerXAnchor),
+            stack.centerYAnchor.constraint(equalTo: overlay.centerYAnchor),
+        ])
+
+        content.addSubview(overlay)
+        window.contentView = content
+        window.center()
+        window.makeKeyAndOrderFront(nil)
+    }
+
+    // MARK: - Startup
+
+    private func start() {
+        showOverlay(message: "Starting SakethWiki…", spinning: true, retry: false)
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            if isServerHealthy() {
+                DispatchQueue.main.async { self?.loadDashboard() }
+                return
+            }
+            startServer()
+            let deadline = Date().addingTimeInterval(25)
+            while Date() < deadline {
+                if isServerHealthy() {
+                    DispatchQueue.main.async { self?.loadDashboard() }
+                    return
+                }
+                Thread.sleep(forTimeInterval: 0.35)
+            }
+            DispatchQueue.main.async {
+                self?.showOverlay(
+                    message: "Could not reach SakethWiki on 127.0.0.1:5173.\nCheck /tmp/sakethwiki-*.log.",
+                    spinning: false,
+                    retry: true
+                )
+            }
+        }
+    }
+
+    private func loadDashboard() {
+        webView.load(URLRequest(url: dashboardURL, cachePolicy: .reloadIgnoringLocalCacheData))
+    }
+
+    private func showOverlay(message: String, spinning: Bool, retry: Bool) {
+        statusLabel.stringValue = message
+        spinner.isHidden = !spinning
+        if spinning { spinner.startAnimation(nil) } else { spinner.stopAnimation(nil) }
+        retryButton.isHidden = !retry
+        overlay.isHidden = false
+    }
+
+    @objc private func retry() { start() }
+
+    @objc private func reload() {
+        if hasLoaded { webView.reload() } else { start() }
+    }
+
+    // MARK: - WKNavigationDelegate
+
+    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        hasLoaded = true
+        overlay.isHidden = true
+    }
+
+    func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
+        showOverlay(message: "The dashboard failed to load.\n\(error.localizedDescription)", spinning: false, retry: true)
+    }
+
+    func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
+        showOverlay(message: "The dashboard failed to load.\n\(error.localizedDescription)", spinning: false, retry: true)
+    }
+
+    func webView(_ webView: WKWebView,
+                 decidePolicyFor navigationAction: WKNavigationAction,
+                 decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
+        guard let url = navigationAction.request.url else {
+            decisionHandler(.allow)
+            return
+        }
+        if url.host == "127.0.0.1" || url.host == "localhost" || url.scheme == "about" {
+            decisionHandler(.allow)
+        } else {
+            NSWorkspace.shared.open(url)
+            decisionHandler(.cancel)
+        }
+    }
+
+    func webView(_ webView: WKWebView,
+                 createWebViewWith configuration: WKWebViewConfiguration,
+                 for navigationAction: WKNavigationAction,
+                 windowFeatures: WKWindowFeatures) -> WKWebView? {
+        if let url = navigationAction.request.url { NSWorkspace.shared.open(url) }
+        return nil
+    }
+
+    // MARK: - Lifecycle
+
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
+
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        if !flag { window.makeKeyAndOrderFront(nil) }
+        return true
+    }
+}
+
+// MARK: - Server
+
+func isServerHealthy() -> Bool {
+    var request = URLRequest(url: healthURL)
+    request.timeoutInterval = 2
+    request.httpMethod = "GET"
+    let semaphore = DispatchSemaphore(value: 0)
+    var healthy = false
+    URLSession.shared.dataTask(with: request) { _, response, _ in
+        if let http = response as? HTTPURLResponse, http.statusCode == 200 { healthy = true }
+        semaphore.signal()
+    }.resume()
+    _ = semaphore.wait(timeout: .now() + 3)
+    return healthy
+}
+
+/// Best-effort start. launch.sh is the normal owner of the process; this
+/// only matters when the backend/frontend are not already running.
+func startServer() {
+    guard let root = projectRoot else { return }
+    let script = "\(root)/launch.sh"
+    guard FileManager.default.isExecutableFile(atPath: script) else { return }
+
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: "/bin/bash")
+    // launch.sh ends by calling `open` on the dashboard URL, which would
+    // race a browser window against this one. SW_NO_OPEN suppresses it.
+    process.arguments = ["-c", "SW_NO_OPEN=1 '\(script)' >/dev/null 2>&1"]
+    process.currentDirectoryURL = URL(fileURLWithPath: root)
+    try? process.run()
+}
+
+// MARK: - Entry point
+
+let application = NSApplication.shared
+let delegate = AppDelegate()
+application.delegate = delegate
+application.setActivationPolicy(.regular)
+application.run()

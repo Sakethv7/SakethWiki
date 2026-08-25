@@ -195,13 +195,20 @@ function QueueSection({ onApproved, onExtractPreview }) {
   const [expandedId, setExpandedId] = useState(null);
   const [approvingId, setApprovingId] = useState(null);
   const [extractingId, setExtractingId] = useState(null);
+  const [selectedIds, setSelectedIds] = useState(() => new Set());
+  const [batchBusy, setBatchBusy] = useState(false);
+  const [actionError, setActionError] = useState("");
+  const [batchResult, setBatchResult] = useState(null);
   const [extractError, setExtractError] = useState(null); // { id, message }
   const [lastAction, setLastAction] = useState(null); // { type: 'saved'|'skipped', title, time }
 
   async function loadQueue() {
     try {
       const data = await api("/queue");
-      setItems(data.items || []);
+      const queued = data.items || [];
+      setItems(queued);
+      const currentIds = new Set(queued.map(item => item.id));
+      setSelectedIds(previous => new Set([...previous].filter(id => currentIds.has(id))));
       setLoaded(true);
     } catch {}
   }
@@ -223,29 +230,84 @@ function QueueSection({ onApproved, onExtractPreview }) {
     return () => clearInterval(interval);
   }, []);
 
+  useEffect(() => {
+    const currentIds = new Set(items.map(item => item.id));
+    setSelectedIds(previous => new Set([...previous].filter(id => currentIds.has(id))));
+  }, [items]);
+
   async function handleReject(id) {
     const title = items.find(i => i.id === id)?.title || "item";
     setApprovingId(id);
+    setActionError("");
     try {
       await api(`/approve/${id}`, { method: "POST", body: JSON.stringify({ approved: false }) });
       await loadQueue();
       if (expandedId === id) setExpandedId(null);
       setLastAction({ type: "skipped", title, time: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) });
-    } catch {}
+    } catch (e) {
+      setActionError(e.message || "Reject failed");
+    }
     setApprovingId(null);
   }
 
   async function handleApprove(id) {
     const title = items.find(i => i.id === id)?.title || "item";
     setApprovingId(id);
+    setActionError("");
     try {
       await api(`/approve/${id}`, { method: "POST", body: JSON.stringify({ approved: true }) });
       await loadQueue();
       onApproved?.();
       if (expandedId === id) setExpandedId(null);
       setLastAction({ type: "saved", title, time: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) });
-    } catch {}
+    } catch (e) {
+      setActionError(e.message || "Approval failed");
+    }
     setApprovingId(null);
+  }
+
+  function toggleSelected(id) {
+    setSelectedIds(previous => {
+      const next = new Set(previous);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+    setBatchResult(null);
+  }
+
+  async function handleBatchDecision(approved) {
+    const ids = [...selectedIds];
+    if (!ids.length) return;
+    const selectedItems = items.filter(item => selectedIds.has(item.id));
+    if (approved && selectedItems.some(item => item.pending_extraction || item.extraction_error)) {
+      setActionError("Pending or failed extractions cannot be approved. Remove them from the selection or reject them.");
+      return;
+    }
+    const verb = approved ? "approve" : "reject";
+    if (!window.confirm(`${verb[0].toUpperCase()}${verb.slice(1)} ${ids.length} selected wiki candidate${ids.length === 1 ? "" : "s"}?`)) return;
+
+    setBatchBusy(true);
+    setActionError("");
+    setBatchResult(null);
+    try {
+      const data = await api("/queue/batch-decision", {
+        method: "POST",
+        body: JSON.stringify({ item_ids: ids, approved }),
+      });
+      const succeeded = new Set((data.results || []).filter(result => result.success).map(result => result.item_id));
+      setSelectedIds(previous => new Set([...previous].filter(id => !succeeded.has(id))));
+      setBatchResult(data);
+      if (approved && data.completed_count > 0) onApproved?.();
+      if (data.failed_count > 0) {
+        const failures = (data.results || []).filter(result => !result.success).map(result => result.message).join("; ");
+        setActionError(failures || `${data.failed_count} item(s) failed`);
+      }
+      await loadQueue();
+    } catch (e) {
+      setActionError(e.message || `Bulk ${verb} failed`);
+    }
+    setBatchBusy(false);
   }
 
   async function handleQuickSave(item) {
@@ -313,6 +375,35 @@ function QueueSection({ onApproved, onExtractPreview }) {
           <button onClick={() => setExtractError(null)} className="shrink-0 text-red-400 hover:text-red-600">✕</button>
         </div>
       )}
+      {actionError && (
+        <div className="flex items-start gap-2 bg-red-50 border border-red-100 text-red-600 rounded-xl px-3 py-2 text-xs">
+          <span className="flex-1">{actionError}</span>
+          <button onClick={() => setActionError("")} className="shrink-0 text-red-400 hover:text-red-600">✕</button>
+        </div>
+      )}
+      {batchResult && (
+        <div className={`rounded-xl px-3 py-2 text-xs border ${batchResult.failed_count ? "bg-amber-50 border-amber-100 text-amber-700" : "bg-emerald-50 border-emerald-100 text-emerald-700"}`}>
+          {batchResult.completed_count} {batchResult.decision}, {batchResult.failed_count} failed.
+        </div>
+      )}
+      {items.length > 0 && (
+        <div className="sticky top-2 z-10 flex flex-wrap items-center gap-2 rounded-xl border border-stone-200 bg-white/95 px-3 py-2 shadow-sm backdrop-blur">
+          <span className="text-xs font-medium text-stone-600">{selectedIds.size} selected</span>
+          <button onClick={() => setSelectedIds(new Set(items.filter(item => !item.pending_extraction && !item.extraction_error).map(item => item.id)))} disabled={batchBusy}
+            className="text-xs text-stone-500 hover:text-stone-800 disabled:opacity-40">Select all ready</button>
+          <button onClick={() => setSelectedIds(new Set())} disabled={batchBusy || selectedIds.size === 0}
+            className="text-xs text-stone-400 hover:text-stone-700 disabled:opacity-40">Clear</button>
+          <div className="flex-1" />
+          <button onClick={() => handleBatchDecision(false)} disabled={batchBusy || selectedIds.size === 0}
+            className="px-3 py-1.5 border border-red-200 text-red-600 rounded-lg text-xs font-medium hover:bg-red-50 disabled:opacity-40">
+            Reject selected
+          </button>
+          <button onClick={() => handleBatchDecision(true)} disabled={batchBusy || selectedIds.size === 0}
+            className="px-3 py-1.5 bg-stone-900 text-white rounded-lg text-xs font-semibold hover:bg-stone-800 disabled:opacity-40">
+            {batchBusy ? "Working…" : "Approve selected"}
+          </button>
+        </div>
+      )}
       {items.length === 0 && loaded && !lastAction && (
         <p className="text-xs text-stone-400 px-1">Nothing in queue — paste a URL above to ingest.</p>
       )}
@@ -321,13 +412,17 @@ function QueueSection({ onApproved, onExtractPreview }) {
         const isExpanded = expandedId === item.id;
         const isPending = item.pending_extraction;
         const isBusy = approvingId === item.id || extractingId === item.id;
+        const isSelected = selectedIds.has(item.id);
         const bullets = item.summary || [];
         const tags = item.tags || [];
         const page = item.suggested_page || "";
 
         return (
-          <div key={item.id} className="bg-white rounded-2xl border border-stone-200 shadow-sm overflow-hidden">
+          <div key={item.id} className={`bg-white rounded-2xl border shadow-sm overflow-hidden ${isSelected ? "border-orange-300 ring-1 ring-orange-100" : "border-stone-200"}`}>
             <div className="px-4 py-3 flex items-start gap-3 cursor-pointer" onClick={() => setExpandedId(isExpanded ? null : item.id)}>
+              <input type="checkbox" checked={isSelected} aria-label={`Select ${title}`}
+                onClick={(event) => event.stopPropagation()} onChange={() => toggleSelected(item.id)} disabled={batchBusy}
+                className="mt-1 h-4 w-4 rounded border-stone-300 accent-orange-500 disabled:opacity-40" />
               <div className="flex-1 min-w-0">
                 <div className="flex items-center gap-2 flex-wrap">
                   {isPending && (
@@ -343,7 +438,17 @@ function QueueSection({ onApproved, onExtractPreview }) {
                 </div>
                 {page && page !== "unprocessed" && <span className="text-xs font-mono text-stone-400">/{page}</span>}
               </div>
-              <svg className={`w-4 h-4 text-stone-400 shrink-0 mt-0.5 transition-transform ${isExpanded ? "rotate-180" : ""}`} fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7"/></svg>
+              {!isPending && !item.extraction_error && (
+                <button onClick={(event) => { event.stopPropagation(); handleApprove(item.id); }} disabled={isBusy || batchBusy}
+                  className="shrink-0 px-2.5 py-1.5 bg-stone-900 text-white rounded-lg text-[11px] font-semibold hover:bg-stone-800 disabled:opacity-40">
+                  {approvingId === item.id ? "Saving…" : "Approve"}
+                </button>
+              )}
+              <button onClick={(event) => { event.stopPropagation(); handleReject(item.id); }} disabled={isBusy || batchBusy}
+                className="shrink-0 px-2.5 py-1.5 border border-red-200 text-red-600 rounded-lg text-[11px] font-medium hover:bg-red-50 disabled:opacity-40">
+                Reject
+              </button>
+              <svg className={`w-4 h-4 text-stone-400 shrink-0 mt-1.5 transition-transform ${isExpanded ? "rotate-180" : ""}`} fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7"/></svg>
             </div>
 
             {isExpanded && (
@@ -375,7 +480,7 @@ function QueueSection({ onApproved, onExtractPreview }) {
                 <div className="px-4 py-3 border-t border-stone-100 bg-stone-50/40 flex gap-2">
                   {isPending ? (
                     <>
-                      <button onClick={() => handleQuickSave(item)} disabled={isBusy}
+                      <button onClick={() => handleQuickSave(item)} disabled={isBusy || batchBusy}
                         className="flex-1 py-2 bg-stone-900 text-white rounded-xl text-xs font-semibold hover:bg-stone-800 disabled:opacity-40 transition-colors">
                         {extractingId === item.id ? (
                           <span className="flex items-center justify-center gap-1.5">
@@ -384,7 +489,7 @@ function QueueSection({ onApproved, onExtractPreview }) {
                           </span>
                         ) : "Save now"}
                       </button>
-                      <button onClick={() => handleExtract(item)} disabled={isBusy}
+                      <button onClick={() => handleExtract(item)} disabled={isBusy || batchBusy}
                         className="px-3 py-2 border border-stone-200 text-stone-600 rounded-xl text-xs font-medium hover:bg-stone-50 disabled:opacity-40 transition-colors">
                         Preview
                       </button>
@@ -411,13 +516,13 @@ function QueueSection({ onApproved, onExtractPreview }) {
                       className="px-3 py-2 border border-orange-200 text-orange-600 rounded-xl text-xs font-medium hover:bg-orange-50 transition-colors">
                       Review
                     </button>
-                    <button onClick={() => handleApprove(item.id)} disabled={isBusy}
+                    <button onClick={() => handleApprove(item.id)} disabled={isBusy || batchBusy}
                       className="flex-1 py-2 bg-stone-900 text-white rounded-xl text-xs font-semibold hover:bg-stone-800 disabled:opacity-40 transition-colors">
                       {approvingId === item.id ? "Saving…" : "Save to wiki"}
                     </button>
                     </>
                   )}
-                  <button onClick={() => handleReject(item.id)} disabled={isBusy}
+                  <button onClick={() => handleReject(item.id)} disabled={isBusy || batchBusy}
                     className="px-4 py-2 border border-stone-200 text-stone-500 rounded-xl text-xs font-medium hover:bg-stone-50 disabled:opacity-40 transition-colors">
                     Skip
                   </button>

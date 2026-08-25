@@ -25,6 +25,8 @@ frontend/node_modules/
 
 # Build output
 frontend/dist/
+build/
+backup/
 
 # macOS
 .DS_Store

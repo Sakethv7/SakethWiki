@@ -121,9 +121,13 @@ def _strip_fences(text: str) -> str:
     t = text.strip()
     if t.startswith("```"):
         lines = t.split("\n", 1)
-        t = lines[1] if len(lines) > 1 else ""
-        if t.endswith("```"):
-            t = t[: t.rfind("```")]
+        rest = lines[1] if len(lines) > 1 else ""
+        # Cut at the closing fence rather than requiring it to be the very
+        # last thing in the string — models sometimes add prose (e.g. a
+        # "Reasoning:" section) after the fenced block, which would otherwise
+        # leave that trailing text in place and break JSON parsing.
+        close_idx = rest.find("```")
+        t = rest[:close_idx] if close_idx != -1 else rest
     return t.strip()
 
 
@@ -419,6 +423,14 @@ def complete(
     # Ollama can't handle images — route vision tasks directly to Anthropic
     # Cloud providers (openai_compat covers Gemini/OpenAI/DeepSeek) handle vision themselves
     if has_images and provider == "ollama":
+        provider = "anthropic"
+
+    # A caller naming an explicit Claude model (e.g. "structured extraction,
+    # no deep reasoning" callsites in main.py) wants that model specifically,
+    # not the default provider's model. Without this, _model_for_task below
+    # silently discards the request whenever the configured default provider
+    # isn't anthropic and substitutes that provider's own default model.
+    if model and str(model).startswith("claude-") and provider != "anthropic":
         provider = "anthropic"
 
     resolved_model = _model_for_task(task, provider, model, has_images)

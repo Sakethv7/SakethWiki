@@ -180,6 +180,11 @@ class ApproveRequest(BaseModel):
     open_thread: bool = False  # if True, add deep-dive tag to the concept page
 
 
+class BatchDecisionRequest(BaseModel):
+    item_ids: list[str]
+    approved: bool
+
+
 class OpenThreadRequest(BaseModel):
     title: str
     notes: str = ""  # free-form "what I want to learn"
@@ -2012,10 +2017,9 @@ async def queue_regenerate(item_id: str, req: RegenerateRequest):
     }
 
 
-# ── /approve/{item_id} ────────────────────────────────────────────────────────
+# ── queue decisions ───────────────────────────────────────────────────────────
 
-@app.post("/approve/{item_id}")
-async def approve(item_id: str, req: ApproveRequest):
+async def _decide_queue_item(item_id: str, req: ApproveRequest):
     item = queue_manager.get_by_id(item_id)
     if not item:
         raise HTTPException(404, f"Item {item_id} not found in queue")
@@ -2174,6 +2178,64 @@ async def approve(item_id: str, req: ApproveRequest):
         "evolution_type": evolution.get("evolution_type", "extends"),
         "evolution_reason": evolution.get("evolution_reason", ""),
         **({"deep_dive_tagged": True} if deep_dive_tagged else {}),
+    }
+
+
+@app.post("/approve/{item_id}")
+async def approve(item_id: str, req: ApproveRequest):
+    return await _decide_queue_item(item_id, req)
+
+
+@app.post("/queue/batch-decision")
+async def batch_queue_decision(req: BatchDecisionRequest):
+    item_ids = [item_id.strip() for item_id in req.item_ids if isinstance(item_id, str) and item_id.strip()]
+    if not 1 <= len(item_ids) <= 100:
+        raise HTTPException(422, "item_ids must contain between 1 and 100 non-empty IDs")
+    if len(item_ids) != len(req.item_ids):
+        raise HTTPException(422, "item_ids must not contain empty values")
+    if len(set(item_ids)) != len(item_ids):
+        raise HTTPException(422, "item_ids must be unique")
+
+    results = []
+    for item_id in item_ids:
+        item = queue_manager.get_by_id(item_id)
+        if req.approved and item and (item.get("pending_extraction") or item.get("extraction_error")):
+            results.append({
+                "item_id": item_id,
+                "success": False,
+                "code": "not_ready",
+                "message": f"Item {item_id} is not ready for approval",
+            })
+            continue
+        try:
+            result = await _decide_queue_item(item_id, ApproveRequest(approved=req.approved))
+            results.append({"item_id": item_id, **result})
+        except HTTPException as exc:
+            code = "not_found" if exc.status_code == 404 else "decision_failed"
+            results.append({
+                "item_id": item_id,
+                "success": False,
+                "code": code,
+                "message": str(exc.detail),
+            })
+        except Exception as exc:
+            logger.exception("Batch queue decision failed for %s", item_id)
+            results.append({
+                "item_id": item_id,
+                "success": False,
+                "code": "decision_failed",
+                "message": str(exc),
+            })
+
+    completed_count = sum(1 for result in results if result.get("success"))
+    failed_count = len(results) - completed_count
+    return {
+        "success": failed_count == 0,
+        "decision": "approved" if req.approved else "rejected",
+        "requested_count": len(item_ids),
+        "completed_count": completed_count,
+        "failed_count": failed_count,
+        "results": results,
     }
 
 
@@ -2948,11 +3010,14 @@ async def analyze_traces():
     # Build compact trace summary for the prompt
     trace_summary = json.dumps(traces[-SELF_LEARN_TRACE_WINDOW:], indent=2)
 
-    prompt = f"""You are analyzing usage traces from a personal knowledge wiki system to find patterns and suggest improvements.
+    # Static instructions go in `system` (auto prompt-cached). The trace dump
+    # — by far the largest and most repeated part of this call, since
+    # back-to-back "Run analysis" clicks often see an unchanged window — is
+    # its own cached content block so repeat calls hit cache instead of
+    # re-billing the full window every time.
+    system_prompt = """You are analyzing usage traces from a personal knowledge wiki system to find patterns and suggest improvements.
 
-Here are {len(traces)} traces. Most are approve/reject ingestion events; some have event_type=chat_note and capture typed user feedback on chat answers:
-
-{trace_summary}
+Most traces are approve/reject ingestion events; some have event_type=chat_note and capture typed user feedback on chat answers.
 
 Fields:
 - approved: was the item approved (True) or rejected (False)
@@ -2969,7 +3034,7 @@ Fields:
 Analyze these traces and write a structured insights report. Be specific — name actual page slugs, actual tags, actual patterns you see in the data.
 
 Respond with a JSON object (no markdown fences):
-{{
+{
   "patterns": [
     "pattern description 1",
     "pattern description 2"
@@ -2994,18 +3059,31 @@ Respond with a JSON object (no markdown fences):
     "Larger structural change worth considering"
   ],
   "summary": "2-3 sentence overall summary of system health"
-}}
+}
 
 prompt_hints must be actionable, specific, and short — they will be directly injected into the extraction system prompt. E.g.:
 - "Twitter content about agent tooling maps to existing pages more often than it needs a new page — prefer existing slugs"
 - "The tag Agentic is frequently corrected to Agents — use Agents for tool-use and orchestration content"
 """
 
+    user_content = [
+        {
+            "type": "text",
+            "text": f"Here are the {len(traces[-SELF_LEARN_TRACE_WINDOW:])} most recent traces:\n\n{trace_summary}",
+            "cache_control": {"type": "ephemeral"},
+        },
+        {
+            "type": "text",
+            "text": f"(Total traces recorded so far: {len(traces)}.)",
+        },
+    ]
+
     raw = llm_client.complete(
         task="analyze_traces",
         model=None,
         max_tokens=2000,
-        messages=[{"role": "user", "content": prompt}],
+        system=system_prompt,
+        messages=[{"role": "user", "content": user_content}],
         expect_json=True,
         required_json_keys=["patterns", "prompt_hints", "summary"],
     ).strip()

@@ -16,4 +16,6 @@ nohup /bin/bash -c "export PATH='/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:
 
 # Wait for Vite to be ready then open browser
 sleep 5
-open "http://localhost:5173"
+if [[ -z "${SW_NO_OPEN:-}" ]]; then
+  open "http://localhost:5173"
+fi

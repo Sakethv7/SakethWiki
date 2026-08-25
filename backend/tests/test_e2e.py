@@ -123,7 +123,10 @@ class TestIngestText:
             "text": "Best chocolate chip cookie recipe: 2 cups flour, 1 cup butter, 1 cup sugar. Bake at 375F for 12 minutes."
         })
         assert r.status_code == 400, f"Expected 400 for off-topic, got {r.status_code}"
-        assert "relevant" in r.json().get("detail", "").lower() or "topic" in r.json().get("detail", "").lower()
+        # main.py's actual rejection message is "Content rejected: <reason>" (see
+        # main.py's source_verdict handling) — it doesn't use the words "relevant"
+        # or "topic", so check for the real prefix instead of stale keywords.
+        assert r.json().get("detail", "").lower().startswith("content rejected")
 
     def test_ingest_empty_body_rejected(self):
         r = client.post("/ingest", json={})
