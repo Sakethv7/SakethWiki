@@ -1267,7 +1267,7 @@ def _extract_with_sonnet(text: str, images: Optional[list], source_url: str,
         bullet_rule = "2-3 bullets — each a sharp, distinct insight. Neutral, precise technical prose (no first-person, no 'I learned')."
         diagram_rule = 'Return "" — short content rarely benefits from a diagram.'
         content_budget = 3000
-        max_out = 800
+        max_out = 1200  # 800 truncated the 13-key JSON contract mid-response
 
     content_budget = _ingest_source_budget(content_budget)
     source_chars_total = len(text or "")
