@@ -1130,6 +1130,38 @@ def _normalize_diagram_plan(value) -> dict:
     }
 
 
+def _normalize_mermaid(diagram: str) -> str:
+    """Clean up the three things Haiku reliably gets wrong in Mermaid output."""
+    if not diagram or not diagram.strip():
+        return diagram
+    text = diagram
+
+    # `graph TD` -> `flowchart TD`. Mermaid treats them the same; flowchart is
+    # the documented form and the one the extraction prompt asks for.
+    text = _re.sub(
+        r"^(\s*)graph(\s+(?:TB|TD|BT|RL|LR))?(\s*)$",
+        lambda m: f"{m.group(1)}flowchart{m.group(2) or ''}{m.group(3)}",
+        text,
+        count=1,
+        flags=_re.M,
+    )
+
+    # Uniform edge label: Haiku emits `-->|staging|` on every arrow, which
+    # conveys nothing. When every edge carries the same label, strip them all.
+    pipe_labels = _re.findall(r"(?:-{2,3}>|={2,3}>)\s*\|([^|]*)\|", text)
+    edge_count = len(_re.findall(r"-{2,3}>|={2,3}>", text))
+    distinct = {lbl.strip() for lbl in pipe_labels if lbl.strip()}
+    if len(pipe_labels) >= 2 and len(pipe_labels) == edge_count and len(distinct) == 1:
+        text = _re.sub(r"((?:-{2,3}>|={2,3}>))\s*\|[^|]*\|", r"\1", text)
+
+    # `:::accent` used but `classDef accent` never defined -> add the class the
+    # theme expects so the node actually renders highlighted.
+    if _re.search(r":::\s*accent\b", text) and not _re.search(r"classDef\s+accent\b", text):
+        text = text.rstrip() + "\n    classDef accent fill:#c4573a,color:#fff\n"
+
+    return text
+
+
 def _normalize_extraction_contract(data: dict, depth: str) -> dict:
     """Backfill and constrain the curation contract before queueing or writing."""
     verdict = str(data.get("source_verdict") or "ingest").strip().lower()
@@ -1155,6 +1187,9 @@ def _normalize_extraction_contract(data: dict, depth: str) -> dict:
     # Short content can still be a useful note, but should not invent diagrams.
     if depth == "short" and not data["diagram_plan"].get("needed"):
         data["knowledge_shape"] = "none"
+
+    if data.get("diagram"):
+        data["diagram"] = _normalize_mermaid(data["diagram"])
     return data
 
 
