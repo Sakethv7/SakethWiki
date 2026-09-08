@@ -433,12 +433,20 @@ No request body needed. Displays in the **Dashboard** tab:
 ```
 ~/SakethVault/
 └── _wiki/
-    ├── concepts/     ← One .md per concept — evolves over time
-    ├── sources/      ← One .md per URL ingested (immutable record)
-    ├── insights/     ← Synthesised insight pages
-    ├── meta/         ← System pages (index, log)
-    └── index.md      ← Auto-rebuilt on every write
+    ├── cs/            ← Concept pages: CS / ML / DSA / systems — evolve over time
+    ├── science/       ← Concept pages: math and science
+    ├── sources/       ← One .md per URL ingested (immutable record)
+    ├── insights/      ← Synthesised insight pages
+    ├── open-threads/  ← Concepts flagged for deeper research (deep-dive)
+    ├── lectures/      ← Lecture / talk capture notes
+    ├── assets/        ← Pasted images referenced by pages
+    ├── meta/          ← System state (memory.db, traces.jsonl, telemetry, index cache)
+    └── index.md       ← Auto-rebuilt on every write
 ```
+
+> A `humanities/` folder is recognised by the reader but is not a Browse tab
+> until it holds pages. Concept retrieval and the knowledge graph currently
+> span `cs/` and `science/`.
 
 ---
 

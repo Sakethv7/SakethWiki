@@ -536,7 +536,7 @@ function QueueSection({ onApproved, onExtractPreview }) {
   );
 }
 
-function HistorySection() {
+function HistorySection({ onOpenPage }) {
   const [entries, setEntries] = useState([]);
   const [open, setOpen] = useState(false);
 
@@ -556,7 +556,10 @@ function HistorySection() {
         <div className="mt-2 space-y-1">
           {entries.length === 0 && <p className="text-xs text-stone-400 px-1">No history yet.</p>}
           {entries.filter(e => e.type !== "delete").map((e, i) => {
-            const page = e.written_to.replace(/^_wiki\/[^/]+\//, "").replace(/\.md$/, "");
+            const writtenTo = e.written_to || "";
+            const writtenMatch = writtenTo.match(/^_wiki\/([^/]+)\/([^/]+)\.md$/);
+            const page = writtenMatch ? writtenMatch[2] : "";
+            const pageFolder = writtenMatch ? writtenMatch[1] : "";
             const tagsArr = e.tags ? e.tags.replace(/^\[|\]$/g, "").split(",").map(t => t.trim()).filter(Boolean) : [];
             const label = e.type === "ingest"
               ? page || e.source.split("/").pop() || "untitled"
@@ -566,7 +569,15 @@ function HistorySection() {
             return (
               <div key={i} className="flex items-start gap-2.5 px-3 py-2 bg-white border border-stone-100 rounded-xl text-xs">
                 <span className="shrink-0 text-stone-300 font-mono">{e.ts.slice(5)}</span>
-                <span className="flex-1 text-stone-600 truncate">{label}</span>
+                {page ? (
+                  <button type="button" onClick={() => onOpenPage?.(page, pageFolder)}
+                    className="flex-1 min-w-0 text-left text-orange-600 hover:text-orange-700 hover:underline truncate"
+                    title={`Open ${page} in Browse`}>
+                    {label}
+                  </button>
+                ) : (
+                  <span className="flex-1 text-stone-600 truncate">{label}</span>
+                )}
                 {tagsArr.slice(0, 2).map(t => (
                   <span key={t} className="shrink-0 text-[10px] px-1.5 py-0.5 bg-stone-100 text-stone-500 rounded-full">{t}</span>
                 ))}
@@ -604,7 +615,7 @@ function looksLikeMarkdownClip(text) {
   return frontmatter || (longEnough && ((heading && bullet) || (heading && linkRef) || (bullet && linkRef) || codeFence));
 }
 
-function IngestTab({ onApproved, onSwitchToChat }) {
+function IngestTab({ onApproved, onSwitchToChat, onOpenPage }) {
   const [input, setInput] = useState("");
   const [images, setImages] = useState([]);
   const [userNotes, setUserNotes] = useState("");
@@ -1147,7 +1158,7 @@ function IngestTab({ onApproved, onSwitchToChat }) {
       )}
 
       {!preview && <QueueSection key={queueKey} onApproved={() => { onApproved?.(); setQueueKey(k => k + 1); }} onExtractPreview={(data) => { setPreview(data); setEdits(null); setQueueKey(k => k + 1); }} />}
-      {!preview && <HistorySection />}
+      {!preview && <HistorySection onOpenPage={onOpenPage} />}
 
       {preview && display && (
         <div className="bg-white rounded-2xl border border-stone-200 shadow-sm overflow-hidden">
@@ -1970,13 +1981,13 @@ function ConceptPageView({ page }) {
             title="View evolution timeline"
           >
             <span className="text-lg">{page.evolution_badge}</span>
-            <span className="text-xs font-semibold uppercase tracking-wide opacity-70">Current understanding</span>
+            <span className="text-sm font-semibold uppercase tracking-wide opacity-70">Current understanding</span>
           </button>
           <div className="flex items-center gap-1.5 shrink-0">
             {maturity !== undefined && (
               <>
                 <div className="flex items-center gap-1 px-2 py-1 bg-white/50 rounded-lg">
-                  <span className="text-xs font-medium text-stone-700">{maturity}</span>
+                  <span className="text-xs font-medium text-stone-700">Maturity {maturity}/100</span>
                   <div className="w-16 h-1.5 bg-stone-200 rounded-full overflow-hidden">
                     <div
                       className={`h-full transition-colors ${
@@ -1990,7 +2001,8 @@ function ConceptPageView({ page }) {
                   <button
                     onClick={recalcMaturity}
                     disabled={recalculating}
-                    title="Recalculate maturity score"
+                    aria-label="Recalculate maturity score"
+                    title="Recalculate maturity from backlinks, sources, revisions, activity, and contradictions"
                     className="ml-0.5 text-stone-400 hover:text-stone-600 disabled:opacity-40 transition-colors"
                   >
                     <svg className={`w-3 h-3 ${recalculating ? "animate-spin" : ""}`} fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -2009,7 +2021,7 @@ function ConceptPageView({ page }) {
                   className="text-xs px-2 py-1 bg-white/50 rounded-lg text-stone-500 hover:text-stone-700 disabled:opacity-40"
                   title="Calculate maturity score"
                 >
-                  {recalculating ? "…" : "Score"}
+                    {recalculating ? "…" : "Calculate maturity"}
                 </button>
                 <span className="text-xs opacity-50">·</span>
               </>
@@ -2019,7 +2031,7 @@ function ConceptPageView({ page }) {
             <span className="text-xs opacity-60">{page.entry_count} {page.entry_count === 1 ? "source" : "sources"}</span>
           </div>
         </div>
-        <p className="text-sm leading-relaxed font-medium">
+        <p className="text-lg leading-relaxed font-medium">
           {page.current_understanding || "No understanding captured yet."}
         </p>
         {page.evolution_note && (
@@ -2052,7 +2064,7 @@ function ConceptPageView({ page }) {
                 <button onClick={() => toggleSection(i)}
                   className="w-full flex items-center justify-between px-4 py-2.5 hover:bg-stone-50 transition-colors text-left">
                   <div className="flex items-center gap-2 min-w-0">
-                    <span className="text-xs font-medium text-stone-700 truncate">
+                    <span className="text-base font-medium text-stone-700 truncate">
                       {sec.url ? <a href={sec.url} target="_blank" rel="noreferrer" onClick={e => e.stopPropagation()} className="hover:text-orange-600 transition-colors">{sec.title || sec.url}</a> : (sec.title || "Source")}
                     </span>
                   </div>
@@ -2064,9 +2076,9 @@ function ConceptPageView({ page }) {
                 {expandedSections.has(i) && (
                   <div className="px-4 pb-3 border-t border-stone-50 space-y-2">
                     {sec.bullets?.length > 0 && (
-                      <ul className="space-y-1 mt-2">
+                      <ul className="space-y-2 mt-3">
                         {sec.bullets.map((b, j) => (
-                          <li key={j} className="flex gap-2 text-xs text-stone-600">
+                          <li key={j} className="flex gap-2 text-base leading-relaxed text-stone-700">
                             <span className="text-orange-400 shrink-0 mt-0.5">•</span>
                             <span>{b}</span>
                           </li>
@@ -2074,7 +2086,7 @@ function ConceptPageView({ page }) {
                       </ul>
                     )}
                     {sec.key_insight && (
-                      <p className="text-xs text-stone-500 border-l-2 border-orange-200 pl-2 italic mt-1">{sec.key_insight}</p>
+                      <p className="text-sm text-stone-600 border-l-2 border-orange-200 pl-3 italic mt-2">{sec.key_insight}</p>
                     )}
                     {sec.diagram && <MermaidDiagram chart={sec.diagram} />}
                     {sec.related?.length > 0 && (
@@ -3010,13 +3022,12 @@ const FOLDERS = [
   { key: "recent", label: "🕐 Recent" },
   { key: "cs", label: "CS / ML" },
   { key: "science", label: "Science" },
-  { key: "humanities", label: "Humanities" },
   { key: "sources", label: "Sources" },
   { key: "insights", label: "Insights" },
   { key: "open-threads", label: "🔍 Threads" },
 ];
 
-function BrowseTab() {
+function BrowseTab({ openTarget }) {
   const [folder, setFolder] = useState("cs");
   const [pages, setPages] = useState([]);
   const [pagesError, setPagesError] = useState(false);
@@ -3147,6 +3158,12 @@ function BrowseTab() {
     finally { setPageLoading(false); }
   }
 
+  useEffect(() => {
+    if (!openTarget?.name) return;
+    if (openTarget.folder && folder !== openTarget.folder) setFolder(openTarget.folder);
+    openPage(openTarget.name);
+  }, [openTarget?.name, openTarget?.folder]);
+
   async function handleRandom() {
     try {
       const data = await api("/random-concept");
@@ -3210,9 +3227,10 @@ function BrowseTab() {
       } else if (sortBy === "entry_count") {
         return (b.entry_count || 0) - (a.entry_count || 0);
       } else {
-        // "updated" — sort by last_updated date descending (newest first)
-        const dateA = new Date(a.last_updated || 0).getTime();
-        const dateB = new Date(b.last_updated || 0).getTime();
+        // "updated" — use precise save time; date-only metadata ties all pages
+        // saved on the same day and incorrectly falls back to directory order.
+        const dateA = new Date(a.last_saved_at || a.last_updated || 0).getTime();
+        const dateB = new Date(b.last_saved_at || b.last_updated || 0).getTime();
         return dateB - dateA;
       }
     });
@@ -5279,12 +5297,18 @@ function BackendStatus() {
 
 export default function App() {
   const [tab, setTab] = useState("ingest");
+  const [browseTarget, setBrowseTarget] = useState(null);
   const [tagGroups, setTagGroups] = useState({});
 
   useEffect(() => { fetchTagGroups().then(setTagGroups); }, []);
 
   function refreshTagGroups() {
     fetchTagGroups().then(setTagGroups);
+  }
+
+  function openSavedPage(name, folder) {
+    setBrowseTarget({ name, folder });
+    setTab("browse");
   }
 
   return (
@@ -5323,8 +5347,8 @@ export default function App() {
 
       {/* Main content */}
       <main className="flex-1 flex flex-col overflow-hidden">
-        <div className="flex-1 overflow-y-auto p-4 max-w-2xl mx-auto w-full">
-          {tab === "ingest" && <IngestTab onApproved={refreshTagGroups} onSwitchToChat={() => setTab("chat")} />}
+        <div className={`${tab === "browse" ? "max-w-6xl" : "max-w-2xl"} flex-1 overflow-y-auto p-4 mx-auto w-full`}>
+          {tab === "ingest" && <IngestTab onApproved={refreshTagGroups} onSwitchToChat={() => setTab("chat")} onOpenPage={openSavedPage} />}
           {tab === "chat" && (
             <div className="flex flex-col" style={{ height: "calc(100vh - 120px)" }}>
               <ChatTab />
@@ -5333,7 +5357,7 @@ export default function App() {
           {tab === "interview" && <InterviewTab />}
           {tab === "browse" && (
             <div className="flex flex-col" style={{ height: "calc(100vh - 120px)" }}>
-              <BrowseTab />
+              <BrowseTab openTarget={browseTarget} />
             </div>
           )}
           {tab === "dashboard" && <DashboardTab onNavigateToConcept={() => setTab("browse")} />}

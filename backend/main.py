@@ -2812,7 +2812,7 @@ async def recent_pages(days: int = 7):
         for p in vault_reader.list_pages_in_folder(folder):
             if (p.get("last_updated") or p.get("date") or "") >= cutoff:
                 all_pages.append(p)
-    all_pages.sort(key=lambda p: p.get("last_updated") or p.get("date") or "", reverse=True)
+    all_pages.sort(key=lambda p: p.get("last_saved_at") or p.get("last_updated") or p.get("date") or "", reverse=True)
     return {"pages": all_pages}
 
 
@@ -3474,13 +3474,6 @@ async def get_backlinks(page_name: str):
 @app.get("/review-queue")
 async def review_queue(limit: int = 50, min_priority: str = "low"):
     """Return active review queue ranked by maturity, staleness, backlinks, and conflicts."""
-    pages = active_review.build_queue(limit=limit, min_priority=min_priority)
-    return {"pages": pages, "total": len(pages)}
-
-
-@app.get("/active-review")
-async def active_review_queue(limit: int = 50, min_priority: str = "low"):
-    """Explicit active review endpoint for weak, stale, orphaned, or conflicting concepts."""
     pages = active_review.build_queue(limit=limit, min_priority=min_priority)
     return {"pages": pages, "total": len(pages)}
 

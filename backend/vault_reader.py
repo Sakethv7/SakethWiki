@@ -37,11 +37,15 @@ def _dirs():
     }
 
 def _concept_dirs() -> list:
-    """All dirs that hold concept pages (domain subfolders)."""
+    """All dirs that hold concept pages (domain subfolders).
+
+    `humanities/` was dropped in the lean refactor — it held zero pages. Re-add
+    `wiki / "humanities"` here and the Browse folder tab if humanities notes
+    start existing.
+    """
     wiki = _vault() / "_wiki"
     return [
         wiki / "cs",
-        wiki / "humanities",
         wiki / "science",
     ]
 
@@ -76,6 +80,7 @@ def list_pages_in_folder(folder: str = "concepts") -> list[dict]:
             "title": meta.get("title", md_file.stem),
             "tags": meta.get("tags", []),
             "last_updated": meta.get("last_updated", ""),
+            "last_saved_at": datetime.fromtimestamp(md_file.stat().st_mtime).isoformat(timespec="seconds"),
             "entry_count": int(meta.get("entry_count", 1)),
             "word_count": word_count,
         })
@@ -107,6 +112,7 @@ def list_concept_pages() -> list[dict]:
                 "title": meta.get("title", md_file.stem),
                 "tags": meta.get("tags", []),
                 "last_updated": meta.get("last_updated", ""),
+                "last_saved_at": datetime.fromtimestamp(md_file.stat().st_mtime).isoformat(timespec="seconds"),
                 "entry_count": int(meta.get("entry_count", 1)),
                 "word_count": len(content.split()),
             })
@@ -118,6 +124,15 @@ def build_backlinks_index() -> dict[str, list[str]]:
     Scan all concept pages for [[wikilinks]] and build a reverse index.
     Returns {page_name: [list of page_names that link TO it]}.
     """
+    # Resolve every link against one alias snapshot. Calling resolve_slug() for
+    # each wikilink would rebuild the alias map (and rescan the vault) thousands
+    # of times on every page-open request.
+    aliases = identity.alias_map()
+
+    def resolve_from_snapshot(value: str) -> str:
+        slug = identity.slugify(value)
+        return aliases.get(slug, slug)
+
     # First pass: collect all outbound links per page
     outbound: dict[str, list[str]] = {}
     for concept_dir in _concept_dirs():
@@ -129,7 +144,7 @@ def build_backlinks_index() -> dict[str, list[str]]:
             except OSError:
                 continue
             links = re.findall(r"\[\[([^\]]+)\]\]", content)
-            outbound[md_file.stem] = [identity.resolve_slug(l) for l in links]
+            outbound[md_file.stem] = [resolve_from_snapshot(link) for link in links]
 
     # Second pass: invert to backlinks
     backlinks: dict[str, list[str]] = {}
@@ -274,7 +289,9 @@ def parse_concept_page(page_name: str) -> Optional[dict]:
 
         # Extract title + url + date from header
         title, url, date = "", "", ""
-        linked = re.match(r"##\s+\[([^\]]+)\]\(([^)]+)\)\s*·\s*(\d{4}-\d{2}-\d{2})", header)
+        # Accept empty markdown destinations (`[Title]()`), which are used by
+        # generated pages and should render as the clean title, not raw syntax.
+        linked = re.match(r"##\s+\[([^\]]+)\]\(([^)]*)\)\s*·\s*(\d{4}-\d{2}-\d{2})", header)
         plain  = re.match(r"##\s+(.+?)\s*·\s*(\d{4}-\d{2}-\d{2})", header)
         if linked:
             title, url, date = linked.group(1), linked.group(2), linked.group(3)

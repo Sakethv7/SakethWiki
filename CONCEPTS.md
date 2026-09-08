@@ -81,7 +81,7 @@ flowchart TD
     FE -->|Capture URL/text/image| ING[POST /ingest]
     FE -->|Ask question| CHAT[POST /chat]
     FE -->|Browse page| PAGE[GET /page/name]
-    FE -->|Health/review| REVIEW[GET /active-review\nGET /lint\nGET /consolidation-candidates]
+    FE -->|Health/review| REVIEW[GET /review-queue\nGET /lint\nGET /consolidation-candidates]
 
     ING --> FETCH{Input type}
     FETCH -->|URL| HTML[httpx fetch\nBeautifulSoup parse]
@@ -196,7 +196,7 @@ The Browse tab calls `GET /pages` and `GET /page/{name}`. `vault_reader.py` sear
 
 Maintenance is split into three safety levels.
 
-Active review is deterministic. `/active-review` ranks weak, stale, orphaned, thin, or conflicting pages using maturity, backlinks, read/update signals, entry count, word count, and warning markers. This tells you what to inspect next.
+Active review is deterministic. `/review-queue` ranks weak, stale, orphaned, thin, or conflicting pages using maturity, backlinks, read/update signals, entry count, word count, and warning markers. This tells you what to inspect next. (An `/active-review` alias existed and was removed in the lean refactor; it was byte-identical to `/review-queue`.)
 
 Health check linting can call an LLM for higher-level inconsistencies and gaps, then combines that with deterministic link and identity audits. It should report issues before applying changes.
 
@@ -403,7 +403,6 @@ graph LR
     E[frontmatter maturity] --> B
     F[conflict markers] --> B
     B --> G[priority score]
-    G --> H[/active-review]
     G --> I[/review-queue]
 ```
 
