@@ -110,8 +110,8 @@ app.add_middleware(
 
 URL_SCRAPE_CHAR_LIMIT   = 5000   # max chars kept from fetched URL body
 URL_SCRAPE_LINK_LIMIT   = 20     # max external links scraped per page
-RAG_TOP_K               = 10     # top-k pages considered for chat context
-RAG_CONTEXT_BUDGET      = 6000   # total chars of vault context injected into chat
+RAG_TOP_K               = int(os.environ.get("RAG_TOP_K", 5))          # top-k pages for chat/interview context
+RAG_CONTEXT_BUDGET      = int(os.environ.get("RAG_CONTEXT_BUDGET", 4000))  # chars of vault context injected into chat/interview
 SELF_LEARN_TRACE_WINDOW = 100    # last N traces sent to Sonnet for weekly analysis
 LINT_CACHE_TTL_SECONDS  = 86400  # 24 h — lint report cache validity
 WEEKLY_ANALYSIS_INTERVAL_SECONDS = 3600  # scheduler checks every hour

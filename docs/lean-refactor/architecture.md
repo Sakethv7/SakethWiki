@@ -148,12 +148,19 @@ JSONL logs, so the two sinks agree.
   (`10 → 5`, `6000 → 4000`). Both stay env-overridable; measure `pages_read` and
   answer quality on real questions, revert via env if recall drops.
 
-## Open questions
+## Resolved during implementation
 
-1. **Ollama routing for cheap tasks** — the plan routes `tag_classify` to local
-   Ollama *when configured*. If Ollama is absent the task must fall back to the
-   default provider, not fail. Confirm that `llm_client` already degrades this
-   way, or add the guard during implementation.
-2. **Langfuse cost fields** — Langfuse can compute cost itself from a model price
-   table, or take the number we send. Plan: send our own number so it matches the
-   JSONL and honors the `LLM_PRICE_*` overrides.
+- **Ollama routing for cheap tasks** — `llm_client` has no reachability check, so
+  a stopped Ollama would fail the call rather than degrade. Rather than add a
+  probe, `.env.example` documents the `tag_classify` → Ollama option **paired
+  with `LLM_FALLBACK_TAG_CLASSIFY=true`**, so a failure falls back to Anthropic
+  via the existing contract-fallback guardrail. Left commented out so the
+  default install (no Ollama) is unaffected.
+- **Interview verify/grade routing** — the old `.env.example` hard-routed these
+  to `ollama/qwen3:14b`. Since verification is now opt-in and should work when
+  invoked, those lines are commented out; the tasks use the default provider
+  unless the user opts into local Ollama.
+- **Langfuse cost fields** — cost/token numbers are put in the span `metadata`
+  from the same `_usage_with_estimates` values used for the JSONL log, so both
+  sinks agree and `LLM_PRICE_*` overrides are honored. `usage_details` (token
+  counts) is passed to Langfuse's native field.
