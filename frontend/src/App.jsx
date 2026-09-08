@@ -4946,15 +4946,30 @@ function ScoreBadge({ score }) {
   );
 }
 
+const INTERVIEW_VERIFY_KEY = "sw_interview_want_verification";
+
+function loadWantVerification() {
+  try { return localStorage.getItem(INTERVIEW_VERIFY_KEY) === "1"; }
+  catch { return false; }
+}
+
 function InterviewTab() {
   const [question, setQuestion] = useState("");
   const [myAnswer, setMyAnswer] = useState("");
   const [showMyAnswer, setShowMyAnswer] = useState(false);
+  const [wantVerification, setWantVerification] = useState(loadWantVerification);
   const [loading, setLoading] = useState(false);
-  const [stage, setStage] = useState(""); // "wiki" | "verifying" | ""
   const [result, setResult] = useState(null);
   const [gapStatus, setGapStatus] = useState({}); // index → "adding"|"added"|"error"
   const [error, setError] = useState(null);
+
+  function toggleVerification() {
+    setWantVerification(v => {
+      const next = !v;
+      try { localStorage.setItem(INTERVIEW_VERIFY_KEY, next ? "1" : "0"); } catch {}
+      return next;
+    });
+  }
 
   async function handleSubmit() {
     if (!question.trim() || loading) return;
@@ -4962,14 +4977,13 @@ function InterviewTab() {
     setResult(null);
     setError(null);
     setGapStatus({});
-    setStage("wiki");
     try {
-      setStage("verifying");
       const data = await api("/interview", {
         method: "POST",
         body: JSON.stringify({
           question: question.trim(),
           user_answer: showMyAnswer && myAnswer.trim() ? myAnswer.trim() : null,
+          want_verification: wantVerification,
         }),
       });
       setResult(data);
@@ -4977,7 +4991,6 @@ function InterviewTab() {
       setError(e.message);
     } finally {
       setLoading(false);
-      setStage("");
     }
   }
 
@@ -5043,6 +5056,17 @@ function InterviewTab() {
           )}
         </div>
 
+        {/* Verify toggle — runs the extra verifier pass + gap list. Persisted. */}
+        <label className="flex items-center gap-2 text-xs text-stone-500 cursor-pointer select-none">
+          <input
+            type="checkbox"
+            checked={wantVerification}
+            onChange={toggleVerification}
+            className="rounded border-stone-300 text-orange-500 focus:ring-orange-300"
+          />
+          Verify the wiki answer and list knowledge gaps
+        </label>
+
         <div className="flex items-center justify-between">
           <p className="text-xs text-stone-400">⌘↵ to submit</p>
           <button
@@ -5050,7 +5074,7 @@ function InterviewTab() {
             disabled={loading || !question.trim()}
             className="px-4 py-2 rounded-lg bg-orange-500 text-white text-sm font-medium hover:bg-orange-600 disabled:opacity-40 disabled:cursor-not-allowed"
           >
-            {loading ? (stage === "wiki" ? "Searching wiki…" : "Verifying…") : "Run"}
+            {loading ? "Running…" : "Run"}
           </button>
         </div>
       </div>
@@ -5083,7 +5107,8 @@ function InterviewTab() {
             )}
           </div>
 
-          {/* Verification */}
+          {/* Verification — only when the user opted in */}
+          {result.verification && (
           <div className="bg-white rounded-xl border border-stone-200 p-4 space-y-3">
             <div className="flex items-center justify-between">
               <p className="text-xs font-semibold text-stone-400 uppercase tracking-wide">Verification</p>
@@ -5131,6 +5156,7 @@ function InterviewTab() {
               <p className="text-xs text-emerald-600">No gaps found — wiki answer looks complete.</p>
             )}
           </div>
+          )}
 
           {/* User grading */}
           {grading && (
