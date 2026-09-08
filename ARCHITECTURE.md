@@ -168,6 +168,8 @@ Return: {answer, knowledge_card?, sources}
 
 **Note loop:** Chat answers can call `/chat-notes` with one of four note types: `correction`, `contradiction`, `example`, or `nuance`. The backend writes `event_type: chat_note` to `_wiki/meta/traces.jsonl` and `chat_note` context telemetry, including related pages and the original question. These notes are audit evidence for later concept-page improvement; they do not auto-patch Markdown.
 
+**Observability:** every LLM call routes through `llm_client.complete()`, which writes a row to `telemetry.py`'s JSONL logs and — when `LANGFUSE_*` env is set — emits one generation span to Langfuse (model, tokens, cost, latency, contract/fallback/retry state). Langfuse is optional and non-blocking; a failure there never reaches the caller.
+
 **Design shift:** Markdown is still the source of truth, but it is no longer the retrieval index. The durable retrieval layer lives in `_wiki/meta/memory.db`, which stores page metadata plus chunked snippets and optional embeddings.
 
 **Index freshness:** `memory_store.search` no longer rebuilds the index per query. Single-page writes call `memory_store.index_page` / `remove_page` directly (approve, edit-page, quick-note, add-link, create-stub, consolidate, fix-page, delete-page). A full `sync_index()` runs at startup, after a vault-wide POV rewrite, and on demand via `POST /memory/reindex` — the escape hatch for edits made outside the app (git pull, Obsidian).

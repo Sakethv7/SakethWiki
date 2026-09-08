@@ -113,6 +113,24 @@ Contract fallback guardrail (implemented in `llm_client`):
 - `LLM_FALLBACK_<TASK>=true|false` for per-task control.
 - Critical tasks default to fallback even when global flag is unset.
 
+### LLM Observability (Langfuse, optional)
+
+`llm_client.complete()` emits one generation span per task — model, tokens,
+cost, latency, `contract_ok`, `fallback_used`, retry attempts — to
+[Langfuse](https://langfuse.com). It is a **no-op** unless both
+`LANGFUSE_PUBLIC_KEY` and `LANGFUSE_SECRET_KEY` are set and `langfuse` is
+installed (`pip install langfuse`). A Langfuse outage never affects a request.
+
+```bash
+LANGFUSE_PUBLIC_KEY=pk-lf-...
+LANGFUSE_SECRET_KEY=sk-lf-...
+LANGFUSE_HOST=https://cloud.langfuse.com   # or your self-hosted URL
+```
+
+Start with Langfuse Cloud's free tier; move `LANGFUSE_HOST` to a self-hosted
+instance later with no other change. The local `telemetry.py` JSONL logs keep
+writing alongside Langfuse.
+
 ### Config + Docs Sync Policy
 
 This repo follows a strict sync policy on behavior changes:

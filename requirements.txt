@@ -7,3 +7,6 @@ pydantic>=2.0.0
 tavily-python>=0.7.0
 qrcode[pil]>=8.0
 watchdog>=6.0.0
+# Optional: LLM observability. Spans are a no-op unless LANGFUSE_PUBLIC_KEY /
+# LANGFUSE_SECRET_KEY are set. Safe to leave uninstalled.
+langfuse>=2.0.0

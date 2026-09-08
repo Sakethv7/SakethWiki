@@ -122,6 +122,63 @@ def _call_with_retry(call, *, provider: str, model: str) -> tuple[CompletionResu
     raise RuntimeError("unreachable retry state")
 
 
+# ── Langfuse observability (optional) ─────────────────────────────────────────
+# One generation observation per completed task. Entirely no-op unless
+# LANGFUSE_PUBLIC_KEY / LANGFUSE_SECRET_KEY are set and the SDK is installed.
+# A Langfuse failure must never surface to the caller — everything is swallowed.
+
+_LF_CLIENT = None
+_LF_RESOLVED = False
+
+
+def _langfuse_client():
+    global _LF_CLIENT, _LF_RESOLVED
+    if _LF_RESOLVED:
+        return _LF_CLIENT
+    _LF_RESOLVED = True
+    if not (os.environ.get("LANGFUSE_PUBLIC_KEY") and os.environ.get("LANGFUSE_SECRET_KEY")):
+        return None
+    try:
+        from langfuse import Langfuse  # reads LANGFUSE_* from env
+        _LF_CLIENT = Langfuse()
+    except Exception as e:  # ImportError, bad config, version drift
+        logger.warning("Langfuse disabled (init failed): %s", e)
+        _LF_CLIENT = None
+    return _LF_CLIENT
+
+
+def _lf_emit(*, task, model, input_payload, output_text, usage, metadata, error):
+    client = _langfuse_client()
+    if client is None:
+        return
+    kwargs = dict(
+        name=str(task),
+        model=str(model),
+        input=input_payload,
+        output=(output_text or None),
+        metadata=metadata,
+    )
+    if error:
+        kwargs["level"] = "ERROR"
+        kwargs["status_message"] = str(error)[:1000]
+    if usage:
+        usage_details = {
+            "input": int(usage.get("input_tokens", 0) or 0),
+            "output": int(usage.get("output_tokens", 0) or 0),
+        }
+    else:
+        usage_details = None
+    try:
+        if hasattr(client, "start_generation"):          # langfuse v3 low-level SDK
+            client.start_generation(usage_details=usage_details, **kwargs).end()
+        elif hasattr(client, "generation"):              # langfuse v2
+            if usage_details:
+                kwargs["usage"] = usage_details
+            client.generation(**kwargs)
+    except Exception as e:
+        logger.warning("Langfuse emit failed for task=%s: %s", task, e)
+
+
 def _task_key(task: str) -> str:
     return "".join(c if c.isalnum() else "_" for c in task).upper()
 
@@ -564,6 +621,31 @@ def complete(
                 "fallback_attempts": fallback_attempts,
                 "error": error,
             }
+        )
+        _lf_emit(
+            task=key,
+            model=effective_model,
+            input_payload=(
+                f"<{len(messages)} message(s), image blocks omitted>"
+                if has_images else {"system": system, "messages": messages}
+            ),
+            output_text=text,
+            usage=usage,
+            metadata={
+                "provider": effective_provider,
+                "requested_provider": requested_provider,
+                "fallback_used": fallback_used,
+                "fallback_model": fallback_model,
+                "contract_ok": contract_ok,
+                "expect_json": bool(expect_json),
+                "has_images": has_images,
+                "max_tokens": max_tokens,
+                "duration_ms": round((time.perf_counter() - started) * 1000, 1),
+                "primary_attempts": primary_attempts,
+                "fallback_attempts": fallback_attempts,
+                **{k: v for k, v in cost.items() if "cost" in k or "token" in k},
+            },
+            error=error or None,
         )
 
     try:
