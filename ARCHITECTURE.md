@@ -150,11 +150,12 @@ File modifications on disk + ackedMap updated
 ```
 User question
     ↓
-sync_index() → detect changed/deleted pages and refresh memory.db
-    ↓
-SQLite memory search over chunked notes
+SQLite memory search over chunked notes (no per-query vault scan;
+  the index is refreshed on write events and at startup — see below)
     ↓
 optional embedding rerank (only if EMBED_ENABLED=true)
+    ↓
+if the index returns nothing: one keyword-scan fallback (find_relevant_pages)
     ↓
 top page hits + snippets + current understanding
     ↓
@@ -168,6 +169,10 @@ Return: {answer, knowledge_card?, sources}
 **Note loop:** Chat answers can call `/chat-notes` with one of four note types: `correction`, `contradiction`, `example`, or `nuance`. The backend writes `event_type: chat_note` to `_wiki/meta/traces.jsonl` and `chat_note` context telemetry, including related pages and the original question. These notes are audit evidence for later concept-page improvement; they do not auto-patch Markdown.
 
 **Design shift:** Markdown is still the source of truth, but it is no longer the retrieval index. The durable retrieval layer lives in `_wiki/meta/memory.db`, which stores page metadata plus chunked snippets and optional embeddings.
+
+**Index freshness:** `memory_store.search` no longer rebuilds the index per query. Single-page writes call `memory_store.index_page` / `remove_page` directly (approve, edit-page, quick-note, add-link, create-stub, consolidate, fix-page, delete-page). A full `sync_index()` runs at startup, after a vault-wide POV rewrite, and on demand via `POST /memory/reindex` — the escape hatch for edits made outside the app (git pull, Obsidian).
+
+**Interview** (`/interview`) uses the same retrieval path as `/chat` and writes an `event_type: interview` trace plus an `interview_context` telemetry event, so practice reps feed the weekly self-learning analysis. Verification is opt-in (`want_verification`); grading runs only when the user submits their own answer.
 
 ### 5. Learning Dashboard
 

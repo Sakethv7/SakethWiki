@@ -1,10 +1,11 @@
 """
 SakethWiki FastAPI backend.
 
-POST /ingest      — fetch URL / accept text/image, extract via Sonnet, stage to queue
+POST /ingest      — fetch URL / accept text/image, extract via routed LLM, stage to queue
 GET  /queue       — list pending HITL items
 POST /approve/{id} — approve or reject a queued item
-POST /chat        — keyword-matched RAG chat via Haiku
+POST /chat        — RAG chat over the SQLite memory index (keyword-scan fallback)
+POST /interview   — same retrieval as /chat; opt-in verifier + answer grader
 GET  /pages       — list all concept pages with metadata
 GET  /page/{name} — full content of a concept page
 """
@@ -64,11 +65,37 @@ from contextlib import asynccontextmanager
 async def lifespan(app):
     """Start background tasks on app startup."""
     memory_store.initialize()
+    _schedule_memory_sync()  # refresh the index once, off the request path
     asyncio.create_task(_weekly_analysis_scheduler())
     # Start folder watcher for screenshot inbox
     import image_watcher
     image_watcher.start()
     yield
+
+
+def _schedule_memory_sync() -> None:
+    """Refresh the SQLite memory index in the background.
+
+    Retrieval (`memory_store.search`) no longer syncs on every query. Instead we
+    sync on write events — startup, /approve, /edit-page — and via the manual
+    POST /memory/reindex. Fire-and-forget so it never delays a response.
+    """
+    async def _run():
+        try:
+            loop = asyncio.get_event_loop()
+            result = await loop.run_in_executor(None, memory_store.sync_index)
+            logger.info(
+                "memory index synced: indexed=%s unchanged=%s removed=%s",
+                result.get("indexed"), result.get("unchanged"), result.get("removed"),
+            )
+        except Exception as e:
+            logger.warning("background memory sync failed: %s", e)
+
+    try:
+        asyncio.get_event_loop().create_task(_run())
+    except RuntimeError:
+        # No running loop (e.g. called from a sync context in tests) — skip.
+        pass
 
 app = FastAPI(title="SakethWiki API", version="1.0.0", lifespan=lifespan)
 
@@ -215,6 +242,7 @@ class PreferenceReviewRequest(BaseModel):
 class InterviewRequest(BaseModel):
     question: str
     user_answer: Optional[str] = None
+    want_verification: bool = False
 
 
 class GapQueueRequest(BaseModel):
@@ -2305,38 +2333,6 @@ def _extract_topic(msg: str, relevant_names: list) -> Optional[str]:
     return scored[0]
 
 
-def _semantic_page_select(message: str, page_summaries: str) -> list[str]:
-    """
-    Stage 1: Ask Haiku which pages are relevant to the user's question.
-    Sends one line per page (name + understanding block excerpt), returns up to 5 slugs.
-    Cheap: ~200 input tokens, no full page content.
-    """
-    prompt = (
-        f"User question: {message}\n\n"
-        "Below are all concept pages in the wiki (name | understanding excerpt).\n"
-        "Return ONLY a JSON array of the 1-5 most relevant page slugs (e.g. [\"kv-cache\",\"attention\"]).\n"
-        "If nothing is relevant, return [].\n\n"
-        f"{page_summaries}"
-    )
-    try:
-        raw = llm_client.complete(
-            task="chat_select_pages",
-            model=None,
-            max_tokens=200,
-            messages=[{"role": "user", "content": prompt}],
-            expect_json=True,
-        ).strip()
-    except Exception as e:
-        logger.warning("chat_select_pages failed; falling back to keyword match: %s", e)
-        return []
-    try:
-        start = raw.find("[")
-        end = raw.rfind("]") + 1
-        return json.loads(raw[start:end]) if start >= 0 else []
-    except (json.JSONDecodeError, ValueError):
-        return []
-
-
 @app.post("/chat")
 async def chat(req: ChatRequest):
     if not req.message or not req.message.strip():
@@ -2347,25 +2343,15 @@ async def chat(req: ChatRequest):
     try:
         memory_hits = await loop.run_in_executor(None, memory_store.search, req.message, RAG_TOP_K)
     except Exception as e:
-        logger.warning("memory search failed; falling back to semantic page selection: %s", e)
+        logger.warning("memory search failed; falling back to keyword match: %s", e)
 
     relevant_names = [hit["page_name"] for hit in memory_hits]
 
-    # Fallback: original page-selection path
+    # Single fallback: keyword scan with synonym expansion. No LLM, no index.
     if not relevant_names:
-        all_pages = vault_reader.list_concept_pages()
-        page_summaries_parts = []
-        for p in all_pages:
-            content = vault_reader.read_page(p["name"]) or ""
-            body = _strip_frontmatter(content)
-            excerpt = body[:200].replace("\n", " ").strip()
-            page_summaries_parts.append(f"{p['name']} | {excerpt}")
-        page_summaries = "\n".join(page_summaries_parts)
         relevant_names = await loop.run_in_executor(
-            None, _semantic_page_select, req.message, page_summaries
+            None, vault_reader.find_relevant_pages, req.message
         )
-    if not relevant_names:
-        relevant_names = vault_reader.find_relevant_pages(req.message)
 
     context_budget = _chat_context_budget()
     context_parts = []
@@ -2626,22 +2612,24 @@ async def interview(req: InterviewRequest):
     if not req.question or not req.question.strip():
         raise HTTPException(400, "question cannot be empty")
 
-    # Stage 1: RAG — same page selection as /chat
-    all_pages = vault_reader.list_concept_pages()
-    page_summaries_parts = []
-    for p in all_pages:
-        content = vault_reader.read_page(p["name"]) or ""
-        body = _strip_frontmatter(content)
-        excerpt = body[:200].replace("\n", " ").strip()
-        page_summaries_parts.append(f"{p['name']} | {excerpt}")
-    page_summaries = "\n".join(page_summaries_parts)
-
     loop = asyncio.get_event_loop()
-    relevant_names = await loop.run_in_executor(
-        None, _semantic_page_select, req.question, page_summaries
-    )
+
+    # Stage 1: RAG — identical retrieval path to /chat (SQLite memory index,
+    # keyword scan as the single fallback). No per-call vault scan, no LLM
+    # page-selection step.
+    memory_hits = []
+    try:
+        memory_hits = await loop.run_in_executor(
+            None, memory_store.search, req.question, RAG_TOP_K
+        )
+    except Exception as e:
+        logger.warning("interview memory search failed; falling back to keyword match: %s", e)
+
+    relevant_names = [hit["page_name"] for hit in memory_hits]
     if not relevant_names:
-        relevant_names = vault_reader.find_relevant_pages(req.question)
+        relevant_names = await loop.run_in_executor(
+            None, vault_reader.find_relevant_pages, req.question
+        )
 
     pages_content = vault_reader.read_pages_content(relevant_names[:RAG_TOP_K])
     context_parts = []
@@ -2680,18 +2668,49 @@ async def interview(req: InterviewRequest):
         messages=[{"role": "user", "content": user_content}],
     )
 
-    # Stage 2: Verify with routed model (default: Ollama/Qwen3:14b via LLM_PROVIDER_INTERVIEW_VERIFY)
+    # Record the practice rep as trace + telemetry so the weekly self-learning
+    # analysis and the system evals can see interview activity. Best-effort —
+    # a logging failure must never block the answer.
+    had_user_answer = bool(req.user_answer and req.user_answer.strip())
     try:
-        verification = await loop.run_in_executor(
-            None, _run_verifier, req.question, wiki_answer
-        )
+        _append_trace({
+            "id": f"interview-{uuid.uuid4().hex[:12]}",
+            "ts": datetime.now().isoformat(),
+            "event_type": "interview",
+            "question": req.question.strip()[:1000],
+            "pages_read": relevant_names[:RAG_TOP_K],
+            "want_verification": req.want_verification,
+            "had_user_answer": had_user_answer,
+            "source_type": "interview",
+        })
     except Exception as e:
-        logger.warning("Interview verifier failed: %s", e)
-        verification = {"score": None, "verdict": "Verification unavailable", "gaps": []}
+        logger.warning("interview trace write failed: %s", e)
+    try:
+        telemetry.log_context_event("interview_context", {
+            "task": "interview",
+            "query": req.question,
+            "memory_hits": len(memory_hits),
+            "pages_read": relevant_names[:RAG_TOP_K],
+            "context_chars_used": len(context),
+            "context_budget": RAG_CONTEXT_BUDGET,
+        })
+    except Exception as e:
+        logger.warning("interview telemetry write failed: %s", e)
+
+    # Stage 2: Verify — opt-in. Runs only when the user asked to be graded.
+    verification = None
+    if req.want_verification:
+        try:
+            verification = await loop.run_in_executor(
+                None, _run_verifier, req.question, wiki_answer
+            )
+        except Exception as e:
+            logger.warning("Interview verifier failed: %s", e)
+            verification = {"score": None, "verdict": "Verification unavailable", "gaps": []}
 
     # Stage 3: Grade user's own answer if provided
     user_grading = None
-    if req.user_answer and req.user_answer.strip():
+    if had_user_answer:
         try:
             user_grading = await loop.run_in_executor(
                 None, _run_grader, req.question, wiki_answer, req.user_answer
@@ -2703,7 +2722,7 @@ async def interview(req: InterviewRequest):
     return {
         "wiki_answer": wiki_answer,
         "pages_read": relevant_names,
-        "verification": verification,
+        **({"verification": verification} if verification is not None else {}),
         **({"user_grading": user_grading} if user_grading is not None else {}),
     }
 
@@ -3556,6 +3575,10 @@ understanding_version: 1
     content = re.sub(r"(entry_count:\s*)(\d+)", bump, content)
 
     _atomic_write_path(page_path, content)
+    try:
+        memory_store.index_page(page_path.stem)
+    except Exception as _e:
+        logger.warning("memory index update failed for quick-note %s: %s", page_path.stem, _e)
 
     # Append trace
     try:
@@ -4691,6 +4714,10 @@ async def add_link(req: AddLinkRequest):
         content = content.rstrip() + f"\n\nSee also: {link}\n"
 
     _atomic_write_path(from_file, content)
+    try:
+        memory_store.index_page(from_page)
+    except Exception as _e:
+        logger.warning("memory index update failed for %s: %s", from_page, _e)
     return {"added": True, "message": f"Added {link} to {from_page}"}
 
 
@@ -4731,6 +4758,10 @@ understanding_version: 1
 > Stub — no entries yet. Add content via Capture.{reason_line}
 """
     _atomic_write_path(file_path, content)
+    try:
+        memory_store.index_page(slug)
+    except Exception as _e:
+        logger.warning("memory index update failed for stub %s: %s", slug, _e)
     return {"created": True, "slug": slug, "message": f"Created stub page '{title}'"}
 
 
@@ -5547,6 +5578,12 @@ def _run_vault_polish(task_id: str) -> None:
     task["status"] = "done"
     task["message"] = f"Polished {bullets_updated} bullet{'s' if bullets_updated != 1 else ''} across {pages_updated} page{'s' if pages_updated != 1 else ''}."
     task["current_page"] = None
+
+    if pages_updated:
+        try:
+            memory_store.sync_index()
+        except Exception as _e:
+            logger.warning("memory sync after vault polish failed: %s", _e)
 
 
 @app.post("/vault/rewrite-pov-notes")

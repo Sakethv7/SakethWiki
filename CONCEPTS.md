@@ -112,9 +112,11 @@ flowchart TD
     REJECT --> TRACE
     TRACE --> PREF
 
-    CHAT --> SYNC[memory_store.sync_index]
-    VAULT --> SYNC
+    WRITE --> SYNC[memory_store.index_page]
+    APPROVE --> SYNC
+    VAULT --> SYNC[startup / reindex: sync_index]
     SYNC --> DB[_wiki/meta/memory.db]
+    CHAT --> DB
     DB --> RETRIEVE[lexical retrieval\noptional embedding rerank]
     ALIAS --> RETRIEVE
     RETRIEVE --> ANSWER[routed chat LLM]
@@ -291,7 +293,7 @@ The understanding block is **rewritten** on each approval (not appended to), so 
 | URL fetch + parse | `httpx + BeautifulSoup` | Zero LLM — deterministic, fast, free |
 | Content extraction (long/image) | Anthropic (`INGEST_EXTRACT`) | Quality-critical; multimodal-heavy |
 | Evolution classification | Ollama/Qwen by default | Contract fallback to Anthropic on invalid output |
-| Chat page selection | Ollama/Qwen by default | Cheap + low latency |
+| Chat / Interview page selection | Deterministic (SQLite FTS + optional vectors) | No LLM — the `chat_select_pages` task was removed in the lean refactor |
 | Chat Q&A | Ollama/Qwen by default | Can be overridden per task |
 | Lint / consolidate / knowledge gaps | Anthropic by default | Integrity-critical tasks |
 | All routing/parsing | Pure Python + `llm_client` | Task-based provider routing + contract guardrails |

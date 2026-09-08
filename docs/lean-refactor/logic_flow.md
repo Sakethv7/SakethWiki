@@ -84,14 +84,35 @@ evidence, not a mutation — it never edits a concept page.
 
 ## 3. `memory_store` index sync
 
-### When `sync_index()` runs after the change
+### How the index stays fresh after the change
 
-| Trigger | How it is invoked |
+Two mechanisms, chosen per situation:
+
+**Targeted single-page updates** (`memory_store.index_page` / `remove_page`) —
+already the pattern in the codebase for most write endpoints; this change fills
+the gaps:
+
+| Endpoint | Call |
 |---|---|
-| Backend startup | In the `lifespan` handler, before serving (already calls `memory_store.initialize()`; add a sync). |
-| After `POST /approve` | `asyncio.create_task(run_in_executor(None, memory_store.sync_index))` — fire and forget, does not delay the approve response. |
-| After `POST /edit-page` | Same fire-and-forget pattern. |
-| `POST /memory/reindex` | Existing endpoint, calls `sync_index()` directly and returns its result. Manual escape hatch for out-of-band edits. |
+| `POST /approve` | `index_page(page_name)` (pre-existing) |
+| `POST /edit-page` | `index_page(page_name)` (pre-existing) |
+| `POST /consolidate` | `remove_page(source)` + `index_page(target)` (pre-existing) |
+| `DELETE /page/{name}` | `remove_page(name)` (pre-existing) |
+| `POST /fix-page` | `index_page(name)` (pre-existing) |
+| `POST /add-link` | `index_page(from_page)` **(added)** |
+| `POST /create-stub` | `index_page(slug)` **(added)** |
+| `POST /quick-note` | `index_page(page.stem)` **(added)** |
+
+**Full `sync_index()`** — for the cases a single slug cannot cover:
+
+| Trigger | How |
+|---|---|
+| Backend startup | `_schedule_memory_sync()` in the `lifespan` handler — fire-and-forget task, off the request path. |
+| After a vault-wide POV rewrite | `sync_index()` at the end of `_run_vault_polish` (already a background thread). |
+| `POST /memory/reindex` | Existing endpoint, calls `sync_index()` directly. The escape hatch for edits made outside the app (git pull, Obsidian). |
+
+`_schedule_memory_sync()` swallows its own errors and no-ops if there is no
+running event loop (e.g. called from a sync test context).
 
 ### What a sync does (unchanged internally)
 
