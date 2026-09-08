@@ -5325,8 +5325,21 @@ export default function App() {
   const [tab, setTab] = useState("ingest");
   const [browseTarget, setBrowseTarget] = useState(null);
   const [tagGroups, setTagGroups] = useState({});
+  const [opsEnabled, setOpsEnabled] = useState(false);
 
   useEffect(() => { fetchTagGroups().then(setTagGroups); }, []);
+
+  useEffect(() => {
+    fetch(`${API}/health`)
+      .then(r => r.json())
+      .then(d => setOpsEnabled(!!d.ops_enabled))
+      .catch(() => setOpsEnabled(false));
+  }, []);
+
+  const visibleTabs = opsEnabled ? TABS : TABS.filter(t => t.id !== "operations");
+  useEffect(() => {
+    if (tab === "operations" && !opsEnabled) setTab("ingest");
+  }, [tab, opsEnabled]);
 
   function refreshTagGroups() {
     fetchTagGroups().then(setTagGroups);
@@ -5357,7 +5370,7 @@ export default function App() {
       {/* Tab bar */}
       <div className="bg-white border-b border-stone-200 px-4">
         <div className="flex max-w-2xl mx-auto w-full">
-          {TABS.map((t) => (
+          {visibleTabs.map((t) => (
             <button key={t.id} onClick={() => setTab(t.id)}
               className={`flex items-center gap-2 px-4 py-3 text-sm font-medium border-b-2 transition-colors ${
                 tab === t.id
@@ -5387,7 +5400,7 @@ export default function App() {
             </div>
           )}
           {tab === "dashboard" && <DashboardTab onNavigateToConcept={() => setTab("browse")} />}
-          {tab === "operations" && <OperationsTab />}
+          {tab === "operations" && opsEnabled && <OperationsTab />}
         </div>
       </main>
     </div>

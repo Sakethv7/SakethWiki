@@ -538,6 +538,13 @@ Capture responses include latency metadata. `/ingest` logs stage timings for fet
 
 Image asset captioning is optional metadata. Large pasted images skip the separate caption LLM call and fall back to deterministic filenames so full-resolution screenshots do not create expensive or noisy `IMAGE_CAPTION` contract failures. The main `/ingest` vision path still receives the images for knowledge extraction and diagram recovery.
 
+> **Operations is paused by default.** The subsystem below (system loop, eval
+> harness, trace critic, action candidates, the Operations tab and its routes)
+> only loads when `ENABLE_OPS=true`. It is being held while LLM observability
+> moves to Langfuse; a smaller recommendation loop will be rebuilt from real
+> data later. The knowledge feedback loop — `/analyze-traces`, the weekly
+> analysis, and `system-insights.md` — runs regardless of the flag.
+
 Operations → Usage summarizes LLM token and cost telemetry by task, route, and recent expensive call. Provider-reported token usage is used when available; otherwise SakethWiki estimates tokens from character counts. Costs use built-in per-million-token defaults for common configured models and can be overridden with environment variables such as `LLM_PRICE_ANTHROPIC_CLAUDE_SONNET_4_6_INPUT_PER_1M` and `LLM_PRICE_ANTHROPIC_CLAUDE_SONNET_4_6_OUTPUT_PER_1M`. The UI displays cost per 1M tokens instead of raw dollars per token because raw per-token values are too small to read safely.
 
 Operations → Queue renders staged actions as approval cards: proposed change, reason, evidence, eval gate explanation, and the concrete mutation behind Approve. Raw JSON remains available behind a disclosure for debugging, but approval should not require reading raw machine payloads.

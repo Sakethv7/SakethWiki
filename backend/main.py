@@ -38,7 +38,7 @@ if _env_path.exists():
 
 import httpx
 from bs4 import BeautifulSoup
-from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi import APIRouter, FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -118,6 +118,12 @@ WEEKLY_ANALYSIS_INTERVAL_SECONDS = 3600  # scheduler checks every hour
 SOURCE_VERDICTS = {"ingest", "source_only", "reject"}
 KNOWLEDGE_SHAPES = {"taxonomy", "mechanism", "architecture", "argument", "case_study", "none"}
 CHAT_NOTE_TYPES = {"correction", "contradiction", "example", "nuance"}
+
+# Operations subsystem (system loop, eval harness, trace critic, action
+# candidates, the Operations tab). Paused by default — set ENABLE_OPS=true to
+# register its routes and show the tab. The knowledge feedback loop
+# (/analyze-traces, weekly scheduler, system-insights) runs regardless.
+ENABLE_OPS = os.environ.get("ENABLE_OPS", "false").strip().lower() in {"1", "true", "yes", "on"}
 
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -2753,7 +2759,7 @@ async def queue_gap(req: GapQueueRequest):
 @app.get("/health")
 async def health():
     """Lightweight liveness probe — no DB, no LLM, just confirms the process is up."""
-    return {"status": "ok"}
+    return {"status": "ok", "ops_enabled": ENABLE_OPS}
 
 
 @app.get("/pages")
@@ -3197,7 +3203,9 @@ traces_analyzed: {len(traces)}
     insights_path = vault_path / "_wiki" / "meta" / "system-insights.md"
     insights_path.parent.mkdir(parents=True, exist_ok=True)
     _atomic_write_path(insights_path, content)
-    routed = system_loop.run_system_loop(auto_apply=True)
+    # Trace analysis (above) is the knowledge loop and always runs. Routing the
+    # findings into bounded system actions is Operations — gated.
+    routed = system_loop.run_system_loop(auto_apply=True) if ENABLE_OPS else None
 
     return {
         "success": True,
@@ -3246,13 +3254,18 @@ async def get_system_insights():
     }
 
 
-@app.post("/inference-report")
+# ── Operations subsystem ─────────────────────────────────────────────────────
+# These routes register only when ENABLE_OPS is true (see include_router below).
+ops_router = APIRouter()
+
+
+@ops_router.post("/inference-report")
 async def generate_inference_report():
     """Generate a Markdown inference report from runtime LLM/context telemetry."""
     return telemetry.generate_inference_report()
 
 
-@app.post("/system-loop/run")
+@ops_router.post("/system-loop/run")
 async def run_system_loop(auto_apply: bool = True):
     """
     Generate inference + system-loop reports and route bounded system improvements.
@@ -3263,26 +3276,26 @@ async def run_system_loop(auto_apply: bool = True):
     return system_loop.run_system_loop(auto_apply=auto_apply)
 
 
-@app.get("/system-loop/actions")
+@ops_router.get("/system-loop/actions")
 async def get_system_loop_actions(limit: int = 100):
     """Return recent system-loop routed actions."""
     return {"actions": telemetry.read_system_actions(limit=limit)}
 
 
-@app.get("/system-actions")
+@ops_router.get("/system-actions")
 async def get_system_actions(status: Optional[str] = None):
     """Return staged/applied/rejected system action candidates."""
     return {"candidates": system_loop.list_action_candidates(status=status)}
 
 
-@app.post("/trace-critic/run")
+@ops_router.post("/trace-critic/run")
 async def run_trace_critic():
     """Run the bounded LLM trace critic and stage only supported action candidates."""
     actions: list[dict] = []
     return system_loop.run_trace_critic(actions)
 
 
-@app.post("/system-actions/{candidate_id}/approve")
+@ops_router.post("/system-actions/{candidate_id}/approve")
 async def approve_system_action(candidate_id: str):
     try:
         return {"candidate": system_loop.approve_action_candidate(candidate_id)}
@@ -3290,7 +3303,7 @@ async def approve_system_action(candidate_id: str):
         raise HTTPException(404, str(e))
 
 
-@app.post("/system-actions/{candidate_id}/reject")
+@ops_router.post("/system-actions/{candidate_id}/reject")
 async def reject_system_action(candidate_id: str, req: RejectSystemActionRequest):
     try:
         return {"candidate": system_loop.reject_action_candidate(candidate_id, req.reason)}
@@ -3298,7 +3311,7 @@ async def reject_system_action(candidate_id: str, req: RejectSystemActionRequest
         raise HTTPException(404, str(e))
 
 
-@app.post("/system-actions/{candidate_id}/eval")
+@ops_router.post("/system-actions/{candidate_id}/eval")
 async def eval_system_action(candidate_id: str):
     try:
         return system_loop.run_candidate_eval(candidate_id)
@@ -3306,7 +3319,7 @@ async def eval_system_action(candidate_id: str):
         raise HTTPException(404, str(e))
 
 
-@app.post("/evals/run")
+@ops_router.post("/evals/run")
 async def run_evals(include_judge: bool = True):
     """Run the current replay eval suite and write an eval report."""
     report = eval_harness.run_eval(include_judge=include_judge)
@@ -3314,7 +3327,7 @@ async def run_evals(include_judge: bool = True):
     return {"eval": report, "actions": actions}
 
 
-@app.post("/reports/read")
+@ops_router.post("/reports/read")
 async def read_report(req: ReportPathRequest):
     report_dir = telemetry.reports_dir().resolve()
     try:
@@ -3331,7 +3344,7 @@ async def read_report(req: ReportPathRequest):
     }
 
 
-@app.get("/operations-overview")
+@ops_router.get("/operations-overview")
 async def operations_overview():
     llm_summary = telemetry.summarize_llm_calls()
     context_summary = telemetry.summarize_context_events()
@@ -3365,6 +3378,10 @@ async def operations_overview():
         "runtime_overrides": overrides,
         "reports": reports,
     }
+
+
+if ENABLE_OPS:
+    app.include_router(ops_router)
 
 
 # ── /follow-up/{page_name} ───────────────────────────────────────────────────
