@@ -146,13 +146,17 @@ def _trace_eval_cases(limit: int = 50) -> list[dict[str, Any]]:
     traces = _read_jsonl(_traces_path())
     excluded = set((load_eval_exclusions().get("excluded_cases") or {}).keys())
     cases: list[dict[str, Any]] = []
+    # Ids are the trace's position among approved traces with a final_page,
+    # so an excluded id keeps pointing at the same trace.
+    position = 0
     for trace in traces:
         if not trace.get("approved"):
             continue
         final_page = str(trace.get("final_page") or "").strip()
         if not final_page:
             continue
-        case_id = f"trace-{len(cases) + 1}"
+        position += 1
+        case_id = f"trace-{position}"
         if case_id in excluded:
             continue
         cases.append(
