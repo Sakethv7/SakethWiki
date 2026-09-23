@@ -1,14 +1,42 @@
 """
-SakethWiki E2E test suite — hits the live backend at localhost:8001.
+SakethWiki E2E test suite — runs the app in-process against a temporary vault.
+LLM calls are real. Nothing is written to the real vault.
 Run: arch -arm64 venv/bin/python3 -m pytest tests/test_e2e.py -v
 """
 import json
 import time
-import httpx
-import pytest
+from pathlib import Path
 
-BASE = "http://localhost:8001"
-client = httpx.Client(base_url=BASE, timeout=60.0)
+import pytest
+from fastapi.testclient import TestClient
+
+import main
+
+# No `with` block: skips lifespan, so the image watcher and scheduler don't start.
+client = TestClient(main.app)
+
+
+@pytest.fixture(autouse=True, scope="module")
+def temp_vault(tmp_path_factory):
+    vault = tmp_path_factory.mktemp("vault")
+    wiki = vault / "_wiki"
+    for folder in ("cs", "sources", "insights", "open-threads", "meta"):
+        (wiki / folder).mkdir(parents=True)
+    (wiki / "index.md").write_text("# Index\n", encoding="utf-8")
+    (wiki / "cs" / "attention.md").write_text(
+        "---\ntitle: \"Attention\"\ndate: 2026-01-01\ntags: [LLM]\nsources: []\n---\n\n"
+        "# Attention\n\nAttention lets each token weigh every other token. See [[transformer]].\n",
+        encoding="utf-8",
+    )
+    (wiki / "sources" / "2026-01-01-attention-paper.md").write_text(
+        "---\ntitle: \"Attention Is All You Need\"\nurl: \"https://arxiv.org/abs/1706.03762\"\n---\n\n"
+        "# Attention Is All You Need\n",
+        encoding="utf-8",
+    )
+    mp = pytest.MonkeyPatch()
+    mp.setenv("VAULT_PATH", str(vault))
+    yield vault
+    mp.undo()
 
 # ── helpers ───────────────────────────────────────────────────────────────────
 
@@ -37,12 +65,12 @@ class TestHealth:
         assert r.status_code == 200
         assert "pages" in r.json()
 
-    def test_pages_concepts_folder(self):
-        r = client.get("/pages?folder=concepts")
+    def test_pages_cs_folder(self):
+        r = client.get("/pages?folder=cs")
         assert r.status_code == 200
         pages = r.json()["pages"]
         assert isinstance(pages, list)
-        print(f"  → {len(pages)} concept pages")
+        print(f"  → {len(pages)} cs pages")
 
     def test_pages_sources_folder(self):
         r = client.get("/pages?folder=sources")
@@ -212,12 +240,10 @@ class TestQueueApprove:
         assert r.json()["action"] == "rejected"
         assert item_id not in queue_ids(), "Rejected item should be removed from queue"
 
-    def test_approve_writes_to_vault(self):
+    def test_approve_writes_to_vault(self, temp_vault):
         """Approving an item should write a file and remove from queue."""
         data = self._stage_item()
         item_id = data["id"]
-        slug = data["diff_preview"]["suggested_page"]
-        before_pages = {p["name"] for p in client.get("/pages?folder=concepts").json()["pages"]}
 
         r = client.post(f"/approve/{item_id}", json={"approved": True})
         assert r.status_code == 200, r.text
@@ -227,10 +253,8 @@ class TestQueueApprove:
         assert item_id not in queue_ids(), "Approved item should be removed from queue"
         print(f"  → written to: {result['file_written']}")
 
-        # Verify the page is now browsable
-        after_pages = {p["name"] for p in client.get("/pages?folder=concepts").json()["pages"]}
-        # Either a new page was created or an existing one was updated
-        assert slug in after_pages or before_pages, "Page should exist in vault after approval"
+        written = temp_vault / result["file_written"]
+        assert written.is_file(), f"Approved page missing from vault: {written}"
 
     def test_approve_with_edits(self):
         """Edits passed at approval time should override extracted values."""
@@ -259,7 +283,7 @@ class TestQueueApprove:
 
 class TestPages:
     def test_get_existing_page(self):
-        pages = client.get("/pages?folder=concepts").json()["pages"]
+        pages = client.get("/pages?folder=cs").json()["pages"]
         if not pages:
             pytest.skip("No concept pages in vault")
         name = pages[0]["name"]
@@ -274,7 +298,7 @@ class TestPages:
         assert r.status_code == 404
 
     def test_fix_page(self):
-        pages = client.get("/pages?folder=concepts").json()["pages"]
+        pages = client.get("/pages?folder=cs").json()["pages"]
         if not pages:
             pytest.skip("No concept pages to fix")
         name = pages[0]["name"]
@@ -318,7 +342,7 @@ class TestChat:
 
     def test_save_answer(self):
         """save-answer should write to insights/ folder."""
-        c = httpx.Client(base_url=BASE, timeout=30.0)  # fresh connection
+        c = client
         before = len(c.get("/pages?folder=insights").json()["pages"])
         r = c.post("/save-answer", json={
             "question": "TEST: what is quantization?",
@@ -356,10 +380,9 @@ class TestLint:
 
 class TestEdgeCases:
     def test_malformed_json_422(self):
-        r = httpx.post(f"{BASE}/ingest",
+        r = client.post("/ingest",
             content=b"not json at all",
             headers={"Content-Type": "application/json"},
-            timeout=10.0
         )
         assert r.status_code == 422
 
