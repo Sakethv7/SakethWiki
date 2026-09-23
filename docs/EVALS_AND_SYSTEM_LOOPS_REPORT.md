@@ -174,6 +174,16 @@ create_consolidation_candidate
 
 The LLM trace critic is deliberately bounded. It can classify good/noisy traces and propose action candidates, but it cannot directly change routing, aliases, budgets, or pages. The deterministic router validates the proposed schema and risk bucket first.
 
+Measured retrieval result (2026-09-23, `run_retrieval_eval()` with the default `limit=30`):
+
+```text
+cases: 30 (newest 30 of 229 approved traces with a final_page; no curated cases)
+retrieval_top1: 16/30 (0.53)
+retrieval_top3: 27/30 (0.90)
+```
+
+All three top-3 misses are OS-process pages (`trace-202`, `trace-204`, `trace-206`). In each, the top 3 is filled by sibling OS-process pages and the expected page is absent. Before this run, a case-id bug meant the eval scored only 1 case. Trace case ids are now the trace's position among approved traces with a final_page, so an exclusion keeps pointing at the same trace.
+
 The next serious layer is higher-quality curated eval cases and deeper A/B replay for prompts/routes, not more autonomy.
 
 ## FactoryMind Transfer
