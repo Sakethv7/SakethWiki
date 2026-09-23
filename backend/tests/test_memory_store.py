@@ -918,6 +918,26 @@ def test_curated_eval_cases_are_loaded(monkeypatch, tmp_path):
     assert cases[0]["expected_page"] == "rag"
 
 
+def test_trace_eval_case_ids_survive_exclusions(monkeypatch, tmp_path):
+    vault = tmp_path / "vault"
+    (vault / "_wiki" / "meta").mkdir(parents=True)
+    monkeypatch.setenv("VAULT_PATH", str(vault))
+    traces = [
+        {"approved": True, "final_page": "rag", "title": "one"},
+        {"approved": False, "final_page": "skipped", "title": "unapproved"},
+        {"approved": True, "final_page": "agents", "title": "two"},
+        {"approved": True, "final_page": "inference", "title": "three"},
+    ]
+    (vault / "_wiki" / "meta" / "traces.jsonl").write_text(
+        "\n".join(json.dumps(t) for t in traces) + "\n", encoding="utf-8"
+    )
+    eval_harness.exclude_eval_case("trace-2", "noisy")
+
+    cases = eval_harness._trace_eval_cases()
+
+    assert [(c["id"], c["title"]) for c in cases] == [("trace-1", "one"), ("trace-3", "three")]
+
+
 def test_ingest_budget_candidate_applies_after_replay_gate(monkeypatch, tmp_path):
     vault = tmp_path / "vault"
     (vault / "_wiki" / "meta").mkdir(parents=True)
