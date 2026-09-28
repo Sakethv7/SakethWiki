@@ -3770,18 +3770,12 @@ function ReviewDueSection({ onNavigate }) {
 
 function DashboardTab({ onNavigateToConcept }) {
   const [stats, setStats] = useState(null);
-  const [ops, setOps] = useState(null);
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
     async function loadStats() {
       try {
-        const [dashboardData, operationsData] = await Promise.all([
-          api("/dashboard-stats"),
-          api("/operations-overview").catch(() => null),
-        ]);
-        setStats(dashboardData);
-        setOps(operationsData);
+        setStats(await api("/dashboard-stats"));
       } catch (err) {
         console.error("Failed to load dashboard stats:", err);
       } finally {
@@ -3833,34 +3827,12 @@ function DashboardTab({ onNavigateToConcept }) {
   const approvalRate = stats.approval_rate == null ? null : Math.round(stats.approval_rate * 100);
   const periodDays = stats.period_days || 30;
   const heatmapLabel = `${stats.heatmap_days || heatmapWeeks * 7} days`;
-  const llm = ops?.llm_summary || {};
-  const context = ops?.context_summary || {};
-  const opErrors = ops?.errors || [];
-  const opCandidates = ops?.candidates || [];
-  const pendingOps = opCandidates.filter(c => ["candidate", "needs_approval", "eval_ready", "eval_failed", "apply_failed"].includes(c.status || "candidate"));
-  const taskRows = Object.entries(llm.by_task || {});
-  const worstContractTask = taskRows
-    .filter(([, row]) => (row.contract_failure_rate || row.error_rate || 0) > 0)
-    .sort((a, b) => ((b[1].contract_failure_rate || 0) + (b[1].error_rate || 0)) - ((a[1].contract_failure_rate || 0) + (a[1].error_rate || 0)))[0];
-  const slowStage = (context.ingest_slow_stages || [])[0];
-  const opsCost = Number(llm.total_cost_usd || 0);
-  const opsTokens = Number(llm.total_tokens || 0);
-  const opsEstimatedRate = Number(llm.estimated_cost_rate || 0);
-  const ingestP95 = Number(context.ingest_latency_p95_ms || 0);
-  const opsRange = llm.time_range || context.time_range || {};
-  const opsRangeLabel = opsRange.first_ts && opsRange.last_ts
-    ? `${opsRange.first_ts.slice(0, 10)} to ${opsRange.last_ts.slice(0, 10)}`
-    : "no log rows";
-  const contractFailureLabel = worstContractTask
-    ? `${worstContractTask[0]} ${Math.round((worstContractTask[1].contract_failure_rate || 0) * 100)}% · ${worstContractTask[1].calls || 0} calls`
-    : "none";
-  const contractFailureRange = worstContractTask?.[1]?.time_range;
-  const contractFailureDetail = contractFailureRange?.first_ts && contractFailureRange?.last_ts
-    ? `${contractFailureRange.first_ts.slice(0, 10)} to ${contractFailureRange.last_ts.slice(0, 10)}`
-    : "";
 
   return (
     <div className="space-y-5 pb-8">
+      {/* Review Due — the one actionable section, so it leads */}
+      <ReviewDueSection onNavigate={onNavigateToConcept} />
+
       {/* Stats row */}
       <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
         <div className="bg-white border border-stone-200 rounded-xl p-3 text-center">
@@ -3882,59 +3854,6 @@ function DashboardTab({ onNavigateToConcept }) {
           <div className="text-[10px] text-stone-500 mt-0.5 leading-tight">approval rate<br/>{periodDays}d</div>
         </div>
       </div>
-      <div className="grid grid-cols-2 gap-3">
-        <div className="bg-stone-50 border border-stone-200 rounded-xl px-3 py-2">
-          <p className="text-[10px] uppercase tracking-wide text-stone-400">Velocity</p>
-          <p className="text-sm font-semibold text-stone-800 mt-0.5">{stats.learning_velocity.entries_per_week} approved entries/week</p>
-        </div>
-        <div className="bg-stone-50 border border-stone-200 rounded-xl px-3 py-2">
-          <p className="text-[10px] uppercase tracking-wide text-stone-400">Rejected</p>
-          <p className="text-sm font-semibold text-stone-800 mt-0.5">{stats.total_rejected || 0} rejected / skipped in {periodDays}d</p>
-        </div>
-      </div>
-      <p className="text-[11px] text-stone-400 px-1">
-        Approval rate = approved ingest decisions divided by approved plus rejected decisions in the last {periodDays} days.
-      </p>
-
-      {/* Recently Read */}
-      <RecentlyRead />
-
-      {/* System health */}
-      {ops && (
-        <div className="bg-white border border-stone-200 rounded-xl p-4">
-          <div className="flex items-center justify-between gap-3 mb-3">
-            <h3 className="text-sm font-semibold text-stone-900">System health</h3>
-            <span className="text-[10px] text-stone-400">runtime log · {opsRangeLabel}</span>
-          </div>
-          <div className="grid grid-cols-2 md:grid-cols-4 gap-2">
-            <StatTile label={opsEstimatedRate > 0 ? "Est. LLM spend" : "LLM spend"} value={`$${opsCost.toFixed(4)}`} tone={opsCost > 1 ? "amber" : "stone"} />
-            <StatTile label="Tokens" value={opsTokens.toLocaleString()} />
-            <StatTile label="Ingest p95" value={`${ingestP95 || 0}ms`} tone={ingestP95 > 45000 ? "red" : ingestP95 > 20000 ? "amber" : "stone"} />
-            <StatTile label="Ops errors" value={opErrors.length} tone={opErrors.length ? "red" : "stone"} />
-          </div>
-          <div className="mt-3 grid md:grid-cols-3 gap-2">
-            <div className="rounded-lg border border-stone-200 bg-stone-50 px-3 py-2 min-w-0">
-              <p className="text-[10px] uppercase tracking-wide text-stone-400">Contract risk</p>
-              <p className={`text-sm font-semibold mt-0.5 truncate ${worstContractTask ? "text-red-700" : "text-emerald-700"}`}>{contractFailureLabel}</p>
-              {contractFailureDetail && <p className="text-[10px] text-stone-400 mt-0.5">{contractFailureDetail}</p>}
-            </div>
-            <div className="rounded-lg border border-stone-200 bg-stone-50 px-3 py-2 min-w-0">
-              <p className="text-[10px] uppercase tracking-wide text-stone-400">Slowest ingest stage</p>
-              <p className="text-sm font-semibold text-stone-800 mt-0.5 truncate">
-                {slowStage ? `${slowStage.stage} ${slowStage.avg_ms}ms` : "no samples"}
-              </p>
-            </div>
-            <div className="rounded-lg border border-stone-200 bg-stone-50 px-3 py-2 min-w-0">
-              <p className="text-[10px] uppercase tracking-wide text-stone-400">Pending ops actions</p>
-              <p className={`text-sm font-semibold mt-0.5 ${pendingOps.length ? "text-amber-700" : "text-stone-800"}`}>{pendingOps.length}</p>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* Review Due */}
-      <ReviewDueSection onNavigate={onNavigateToConcept} />
-
       {/* Contribution heatmap */}
       <div className="bg-white border border-stone-200 rounded-xl p-4">
         <div className="flex items-center justify-between gap-3 mb-3">
@@ -3972,6 +3891,9 @@ function DashboardTab({ onNavigateToConcept }) {
         </div>
       </div>
 
+      {/* Recently Read */}
+      <RecentlyRead />
+
       {/* Top Tags */}
       {stats.top_tags.length > 0 && (
         <div className="bg-white border border-stone-200 rounded-xl p-4">
@@ -3992,28 +3914,6 @@ function DashboardTab({ onNavigateToConcept }) {
                 <span className="text-xs text-stone-400 w-4 text-right shrink-0">{item.count}</span>
               </div>
             ))}
-          </div>
-        </div>
-      )}
-
-      {/* Sources */}
-      {stats.top_sources.length > 0 && (
-        <div className="bg-white border border-stone-200 rounded-xl p-4">
-          <div className="flex items-center justify-between gap-3 mb-3">
-            <h3 className="text-sm font-semibold text-stone-900">Sources</h3>
-            <span className="text-[10px] text-stone-400">approved {periodDays}d</span>
-          </div>
-          <div className="flex flex-wrap gap-2">
-            {stats.top_sources.map((item) => {
-              const sourceEmoji = { tweet: "𝕏", article: "📄", video: "📺", blog: "✍️", paper: "📜", clip: "🔗", link: "🔗", lecture: "▣", text: "T", unknown: "❓" };
-              return (
-                <div key={item.source} className="flex items-center gap-1.5 bg-stone-50 border border-stone-200 rounded-lg px-3 py-1.5">
-                  <span className="text-sm">{sourceEmoji[item.source] || "🔗"}</span>
-                  <span className="text-xs text-stone-600 capitalize">{item.source}</span>
-                  <span className="text-xs font-semibold text-stone-800">{item.count}</span>
-                </div>
-              );
-            })}
           </div>
         </div>
       )}
