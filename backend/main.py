@@ -115,6 +115,7 @@ RAG_CONTEXT_BUDGET      = int(os.environ.get("RAG_CONTEXT_BUDGET", 4000))  # cha
 SELF_LEARN_TRACE_WINDOW = 100    # last N traces sent to Sonnet for weekly analysis
 LINT_CACHE_TTL_SECONDS  = 86400  # 24 h — lint report cache validity
 WEEKLY_ANALYSIS_INTERVAL_SECONDS = 3600  # scheduler checks every hour
+ANALYSIS_RETRY_BACKOFF_SECONDS = 86400   # after an attempt (pass or fail), wait a day before retrying
 SOURCE_VERDICTS = {"ingest", "source_only", "reject"}
 KNOWLEDGE_SHAPES = {"taxonomy", "mechanism", "architecture", "argument", "case_study", "none"}
 CHAT_NOTE_TYPES = {"correction", "contradiction", "example", "nuance"}
@@ -3295,6 +3296,20 @@ async def get_dashboard_stats():
 
 # ── /analyze-traces ──────────────────────────────────────────────────────────
 
+# Only the fields the analysis prompt describes. Full traces carry summaries,
+# diagrams and curation text that the prompt never uses and that made each
+# call ~84K input tokens.
+_ANALYSIS_TRACE_FIELDS = (
+    "approved", "event_type", "note_type", "note", "target_pages", "title",
+    "suggested_page", "final_page", "page_corrected", "evolution_type",
+    "was_duplicate", "tags_suggested", "tags_final", "tags_corrected", "source_type",
+)
+
+
+def _compact_trace(trace: dict) -> dict:
+    return {k: trace[k] for k in _ANALYSIS_TRACE_FIELDS if k in trace}
+
+
 @app.post("/analyze-traces")
 async def analyze_traces():
     """
@@ -3321,7 +3336,9 @@ async def analyze_traces():
         raise HTTPException(400, f"Need at least 3 traces to analyze (have {len(traces)})")
 
     # Build compact trace summary for the prompt
-    trace_summary = json.dumps(traces[-SELF_LEARN_TRACE_WINDOW:], indent=2)
+    trace_summary = "\n".join(
+        json.dumps(_compact_trace(t)) for t in traces[-SELF_LEARN_TRACE_WINDOW:]
+    )
 
     # Static instructions go in `system` (auto prompt-cached). The trace dump
     # — by far the largest and most repeated part of this call, since
@@ -3374,6 +3391,8 @@ Respond with a JSON object (no markdown fences):
   "summary": "2-3 sentence overall summary of system health"
 }
 
+Keep every list to at most 5 items, each item under 30 words.
+
 prompt_hints must be actionable, specific, and short — they will be directly injected into the extraction system prompt. E.g.:
 - "Twitter content about agent tooling maps to existing pages more often than it needs a new page — prefer existing slugs"
 - "The tag Agentic is frequently corrected to Agents — use Agents for tool-use and orchestration content"
@@ -3394,7 +3413,7 @@ prompt_hints must be actionable, specific, and short — they will be directly i
     raw = llm_client.complete(
         task="analyze_traces",
         model=None,
-        max_tokens=2000,
+        max_tokens=4000,
         system=system_prompt,
         messages=[{"role": "user", "content": user_content}],
         expect_json=True,
@@ -5037,40 +5056,43 @@ understanding_version: 1
 
 # ── utilities ─────────────────────────────────────────────────────────────────
 
+def _analysis_due(insights_path: Path, traces_path: Path,
+                  last_attempt: Optional[datetime], now: datetime) -> bool:
+    """True when a week has passed since the last successful analysis and no
+    attempt was made in the last day. The attempt check stops a failing
+    analysis from being retried (and billed) every hour."""
+    if last_attempt and (now - last_attempt).total_seconds() < ANALYSIS_RETRY_BACKOFF_SECONDS:
+        return False
+    if insights_path.exists():
+        from vault_reader import _parse_frontmatter
+        last = _parse_frontmatter(insights_path.read_text(encoding="utf-8")).get("last_analyzed", "")
+        if not last:
+            return False
+        return (now.date() - datetime.fromisoformat(str(last)).date()).days >= 7
+    if traces_path.exists():
+        # Never run before — run if we have at least 5 traces
+        return sum(1 for l in traces_path.read_text().splitlines() if l.strip()) >= 5
+    return False
+
+
 async def _weekly_analysis_scheduler():
     """
     Background task: runs trace analysis automatically once a week.
     Checks every hour if a week has passed since last analysis.
     """
+    last_attempt: Optional[datetime] = None
     while True:
         try:
             vault_path = Path(os.environ.get("VAULT_PATH", "/Users/sakethv7/SakethVault"))
             insights_path = vault_path / "_wiki" / "meta" / "system-insights.md"
             traces_path = vault_path / "_wiki" / "meta" / "traces.jsonl"
 
-            should_run = False
-            if insights_path.exists():
-                from vault_reader import _parse_frontmatter
-                meta = _parse_frontmatter(insights_path.read_text(encoding="utf-8"))
-                last = meta.get("last_analyzed", "")
-                if last:
-                    from datetime import date
-                    last_date = date.fromisoformat(last)
-                    if (date.today() - last_date).days >= 7:
-                        should_run = True
-            elif traces_path.exists():
-                # Never run before — run if we have at least 5 traces
-                count = sum(1 for l in traces_path.read_text().splitlines() if l.strip())
-                if count >= 5:
-                    should_run = True
-
-            if should_run:
+            if _analysis_due(insights_path, traces_path, last_attempt, datetime.now()):
+                last_attempt = datetime.now()
                 try:
-                    # Import httpx to call our own endpoint internally
-                    import httpx as _httpx
-                    _httpx.post("http://localhost:8001/analyze-traces", timeout=60)
+                    await analyze_traces()
                 except Exception as _e:
-                    logger.warning("weekly analysis scheduler HTTP call failed: %s", _e)
+                    logger.warning("weekly trace analysis failed; next attempt in 24h: %s", _e)
 
         except Exception as _e:
             logger.warning("weekly analysis scheduler outer loop error: %s", _e)
