@@ -3268,6 +3268,42 @@ def _dashboard_stats_from_traces(
     }
 
 
+_QUESTION_EVENTS = {"chat_context": "chat_questions", "interview_context": "interview_questions"}
+
+
+def _recall_stats(
+    reads: list[dict],
+    context_events: list[dict],
+    now: Optional[datetime] = None,
+    period_days: int = 30,
+) -> dict:
+    """Recall side of the loop: page reads and questions asked in the period."""
+    now = now or datetime.now()
+    cutoff = now - timedelta(days=period_days)
+
+    read_pages = []
+    for entry in reads:
+        # /log-read writes concept/ts; older rows may use page/timestamp.
+        ts = _parse_iso_datetime(entry.get("ts") or entry.get("timestamp"))
+        page = str(entry.get("concept") or entry.get("page") or "").strip()
+        if ts and ts > cutoff and page:
+            read_pages.append(page)
+
+    counts = {field: 0 for field in _QUESTION_EVENTS.values()}
+    for event in context_events:
+        field = _QUESTION_EVENTS.get(event.get("event_type"))
+        ts = _parse_iso_datetime(event.get("ts"))
+        if field and ts and ts > cutoff:
+            counts[field] += 1
+
+    return {
+        "pages_read": len(read_pages),
+        "unique_pages_read": len(set(read_pages)),
+        "questions_asked": sum(counts.values()),
+        **counts,
+    }
+
+
 @app.get("/dashboard-stats")
 async def get_dashboard_stats():
     """
@@ -3291,7 +3327,19 @@ async def get_dashboard_stats():
                 except Exception:
                     continue
 
-    return _dashboard_stats_from_traces(traces)
+    reads = []
+    reads_path = vault_path / "_wiki" / "meta" / "reads.jsonl"
+    if reads_path.exists():
+        for line in reads_path.read_text(encoding="utf-8").splitlines():
+            if line.strip():
+                try:
+                    reads.append(json.loads(line))
+                except Exception:
+                    continue
+
+    stats = _dashboard_stats_from_traces(traces)
+    stats["recall"] = _recall_stats(reads, telemetry.read_context_events(), period_days=stats["period_days"])
+    return stats
 
 
 # ── /analyze-traces ──────────────────────────────────────────────────────────
@@ -3780,8 +3828,11 @@ async def get_backlinks(page_name: str):
 # ── /review-queue ─────────────────────────────────────────────────────────────
 
 @app.get("/review-queue")
-async def review_queue(limit: int = 50, min_priority: str = "low"):
-    """Return active review queue ranked by maturity, staleness, backlinks, and conflicts."""
+def review_queue(limit: int = 50, min_priority: str = "low"):
+    """Return active review queue ranked by maturity, staleness, backlinks, and conflicts.
+
+    Plain def: build_queue reads every page (~1s), so FastAPI runs it in a
+    worker thread instead of blocking the event loop for other requests."""
     pages = active_review.build_queue(limit=limit, min_priority=min_priority)
     return {"pages": pages, "total": len(pages)}
 
@@ -5468,65 +5519,6 @@ async def random_concept():
         raise HTTPException(400, "No concept pages found")
     page = random.choice(pages)
     return {"name": page["name"]}
-
-
-# ── /review-due ───────────────────────────────────────────────────────────────
-
-@app.get("/review-due")
-async def review_due():
-    """
-    Return concept pages that are overdue for review.
-    Criteria: not read in 30+ days AND maturity < 70.
-    Reads meta/reads.jsonl for last-read timestamps.
-    """
-    vault_path = Path(os.environ.get("VAULT_PATH", "/Users/sakethv7/SakethVault"))
-    reads_path = vault_path / "_wiki" / "meta" / "reads.jsonl"
-
-    # Build last-read map: page → most recent read date
-    last_read: dict[str, datetime] = {}
-    if reads_path.exists():
-        with open(reads_path) as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    entry = json.loads(line)
-                    page = entry.get("page", "")
-                    ts = datetime.fromisoformat(entry.get("timestamp", ""))
-                    if page and (page not in last_read or ts > last_read[page]):
-                        last_read[page] = ts
-                except (json.JSONDecodeError, ValueError, KeyError):
-                    continue
-
-    now = datetime.now()
-    cutoff = now - timedelta(days=30)
-    due = []
-    for p in vault_reader.list_concept_pages():
-        name = p["name"]
-        content = vault_reader.read_page(name) or ""
-        fm = vault_reader._parse_frontmatter(content)
-        raw_maturity = fm.get("understanding_maturity")
-        try:
-            maturity = int(raw_maturity) if raw_maturity not in {None, ""} else None
-        except (TypeError, ValueError):
-            maturity = None
-        if maturity is not None and maturity >= 70:
-            continue  # solid, skip
-        last = last_read.get(name)
-        if last and last > cutoff:
-            continue  # recently read, skip
-        days_since = (now - last).days if last else None
-        due.append({
-            "name": name,
-            "maturity": maturity,
-            "days_since_read": days_since,
-            "last_read": last.isoformat() if last else None,
-        })
-
-    # Sort: never-read first, then longest overdue
-    due.sort(key=lambda x: (x["days_since_read"] is not None, -(x["days_since_read"] or 9999)))
-    return {"due": due, "total": len(due)}
 
 
 # ── /rewrite-notes ────────────────────────────────────────────────────────────

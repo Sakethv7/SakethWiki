@@ -3226,7 +3226,9 @@ function BrowseTab({ openTarget }) {
   }
 
   useEffect(() => {
-    if (!openTarget?.name) return;
+    if (!openTarget) return;
+    // A folder-only target (e.g. Dashboard's "open threads" link) shows that folder's list.
+    if (!openTarget.name) { if (openTarget.folder) switchFolder(openTarget.folder); return; }
     if (openTarget.folder && folder !== openTarget.folder) setFolder(openTarget.folder);
     openPage(openTarget.name);
   }, [openTarget?.name, openTarget?.folder]);
@@ -3687,80 +3689,40 @@ function BrowseTab({ openTarget }) {
 
 // ── DASHBOARD TAB ─────────────────────────────────────────────────────────────
 
-function RecentlyRead() {
-  const [reads, setReads] = useState([]);
-
-  useEffect(() => {
-    api("/recent-reads?limit=5&max_age_days=30").then(d => setReads(d.reads || [])).catch(() => {});
-  }, []);
-
-  if (reads.length === 0) {
-    return (
-      <div className="bg-white border border-stone-200 rounded-lg p-4">
-        <h3 className="text-sm font-semibold text-stone-900">Recently Read</h3>
-        <p className="text-xs text-stone-400 mt-2">No pages read in the last 30 days.</p>
-      </div>
-    );
-  }
-
-  function fmtAge(ts) {
-    const diffMs = Date.now() - new Date(ts + "Z").getTime();
-    const diffMin = Math.floor(diffMs / 60000);
-    if (diffMin < 1) return "just now";
-    if (diffMin < 60) return `${diffMin}m ago`;
-    const diffHr = Math.floor(diffMin / 60);
-    if (diffHr < 24) return `${diffHr}h ago`;
-    return `${Math.floor(diffHr / 24)}d ago`;
-  }
-
+function WaitingChips({ queueCount, threadCount, onGoCapture, onGoThreads }) {
+  if (!queueCount && !threadCount) return null;
+  const chip = "text-xs font-medium px-3 py-1.5 rounded-lg border transition-colors";
   return (
-    <div className="bg-white border border-stone-200 rounded-lg p-4">
-      <h3 className="text-sm font-semibold text-stone-900 mb-3">Recently Read</h3>
-      <div className="space-y-2">
-        {reads.map((r, i) => (
-          <div key={i} className="flex items-center justify-between">
-            <span className="text-sm text-stone-700 truncate flex-1">{r.concept}</span>
-            <div className="flex items-center gap-2 shrink-0 ml-2">
-              {r.duration_seconds > 0 && (
-                <span className="text-[10px] text-stone-400">{r.duration_seconds}s</span>
-              )}
-              <span className="text-xs text-stone-400">{fmtAge(r.ts)}</span>
-            </div>
-          </div>
-        ))}
-      </div>
+    <div className="flex flex-wrap items-center gap-2">
+      <span className="text-xs text-stone-400">Waiting:</span>
+      {queueCount > 0 && (
+        <button onClick={onGoCapture} className={`${chip} bg-orange-50 border-orange-200 text-orange-700 hover:bg-orange-100`}>
+          {queueCount} in queue →
+        </button>
+      )}
+      {threadCount > 0 && (
+        <button onClick={onGoThreads} className={`${chip} bg-stone-50 border-stone-200 text-stone-700 hover:bg-stone-100`}>
+          {threadCount} open thread{threadCount === 1 ? "" : "s"} →
+        </button>
+      )}
     </div>
   );
 }
 
-function ReviewDueSection({ onNavigate }) {
-  const [due, setDue] = useState(null);
-
-  useEffect(() => {
-    api("/review-due").then(d => setDue(d.due)).catch(() => setDue([]));
-  }, []);
-
-  if (!due || due.length === 0) return null;
-
+function NextUpSection({ pages, onOpen }) {
+  if (!pages || pages.length === 0) return null;
   return (
     <div className="bg-white border border-amber-200 rounded-xl p-4">
       <div className="flex items-center justify-between mb-3">
-        <h3 className="text-sm font-semibold text-stone-900">Due for review</h3>
-        <span className="text-xs text-amber-600 bg-amber-50 border border-amber-100 px-2 py-0.5 rounded-lg">{due.length} pages</span>
+        <h3 className="text-sm font-semibold text-stone-900">Next up</h3>
+        <span className="text-xs text-amber-600 bg-amber-50 border border-amber-100 px-2 py-0.5 rounded-lg">{pages.length} high priority</span>
       </div>
-      <div className="space-y-2">
-        {due.slice(0, 6).map(item => (
-          <button key={item.name} onClick={() => onNavigate?.(item.name)}
-            className="w-full flex items-center justify-between gap-3 text-left hover:bg-stone-50 rounded-lg px-2 py-1.5 transition-colors group">
-            <span className="text-sm text-stone-700 group-hover:text-orange-600 truncate">{item.name}</span>
-            <div className="flex items-center gap-2 shrink-0">
-              {item.maturity != null && (
-                <span className="text-xs text-stone-400">{item.maturity}/100</span>
-              )}
-              <span className="text-xs text-amber-500">
-                {item.days_since_read == null ? "never read" : `${item.days_since_read}d ago`}
-              </span>
-            </div>
+      <div className="space-y-1">
+        {pages.slice(0, 5).map(page => (
+          <button key={page.name} onClick={() => onOpen(page.name, page.folder)}
+            className="w-full text-left hover:bg-stone-50 rounded-lg px-2 py-1.5 transition-colors group">
+            <div className="text-sm text-stone-700 group-hover:text-orange-600 truncate">{page.name}</div>
+            <div className="text-xs text-stone-400 truncate">{page.suggested_action}</div>
           </button>
         ))}
       </div>
@@ -3768,14 +3730,28 @@ function ReviewDueSection({ onNavigate }) {
   );
 }
 
-function DashboardTab({ onNavigateToConcept }) {
+function DashboardTab({ onOpenPage, onGoCapture }) {
   const [stats, setStats] = useState(null);
+  const [nextUp, setNextUp] = useState(null);
+  const [queueCount, setQueueCount] = useState(0);
+  const [threadCount, setThreadCount] = useState(0);
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
+    // Review ranking reads every page (~1s), so it fills in after the rest.
+    api("/review-queue?min_priority=high&limit=100")
+      .then(d => setNextUp(d.pages || []))
+      .catch(() => setNextUp([]));
     async function loadStats() {
       try {
-        setStats(await api("/dashboard-stats"));
+        const [dashboardData, queueData, threadData] = await Promise.all([
+          api("/dashboard-stats"),
+          api("/queue").catch(() => null),
+          api("/pages?folder=open-threads").catch(() => null),
+        ]);
+        setStats(dashboardData);
+        setQueueCount(queueData?.items?.length || 0);
+        setThreadCount(threadData?.pages?.length || 0);
       } catch (err) {
         console.error("Failed to load dashboard stats:", err);
       } finally {
@@ -3823,15 +3799,18 @@ function DashboardTab({ onNavigateToConcept }) {
     return "bg-orange-500";
   }
 
-  const maxTagCount = stats.top_tags.length > 0 ? stats.top_tags[0].count : 1;
   const approvalRate = stats.approval_rate == null ? null : Math.round(stats.approval_rate * 100);
   const periodDays = stats.period_days || 30;
   const heatmapLabel = `${stats.heatmap_days || heatmapWeeks * 7} days`;
+  const recall = stats.recall || {};
 
   return (
     <div className="space-y-5 pb-8">
-      {/* Review Due — the one actionable section, so it leads */}
-      <ReviewDueSection onNavigate={onNavigateToConcept} />
+      <WaitingChips queueCount={queueCount} threadCount={threadCount}
+        onGoCapture={onGoCapture} onGoThreads={() => onOpenPage(undefined, "open-threads")} />
+
+      {/* Next up — the actionable section, so it leads */}
+      <NextUpSection pages={nextUp} onOpen={onOpenPage} />
 
       {/* Stats row */}
       <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
@@ -3840,12 +3819,12 @@ function DashboardTab({ onNavigateToConcept }) {
           <div className="text-[10px] text-stone-500 mt-0.5 leading-tight">approved<br/>{periodDays}d</div>
         </div>
         <div className="bg-white border border-stone-200 rounded-xl p-3 text-center">
-          <div className="text-2xl font-bold text-blue-500">{stats.unique_concepts}</div>
-          <div className="text-[10px] text-stone-500 mt-0.5 leading-tight">concepts touched<br/>{periodDays}d</div>
+          <div className="text-2xl font-bold text-blue-500">{recall.pages_read ?? 0}</div>
+          <div className="text-[10px] text-stone-500 mt-0.5 leading-tight">pages read<br/>{periodDays}d</div>
         </div>
         <div className="bg-white border border-stone-200 rounded-xl p-3 text-center">
-          <div className="text-2xl font-bold text-purple-500">{stats.new_concepts_this_week}</div>
-          <div className="text-[10px] text-stone-500 mt-0.5 leading-tight">new concepts<br/>7d</div>
+          <div className="text-2xl font-bold text-purple-500">{recall.questions_asked ?? 0}</div>
+          <div className="text-[10px] text-stone-500 mt-0.5 leading-tight">questions asked<br/>{periodDays}d</div>
         </div>
         <div className="bg-white border border-stone-200 rounded-xl p-3 text-center">
           <div className={`text-2xl font-bold ${approvalRate != null && approvalRate < 60 ? "text-amber-500" : "text-emerald-500"}`}>
@@ -3890,33 +3869,6 @@ function DashboardTab({ onNavigateToConcept }) {
           <span className="text-[9px] text-stone-400">more</span>
         </div>
       </div>
-
-      {/* Recently Read */}
-      <RecentlyRead />
-
-      {/* Top Tags */}
-      {stats.top_tags.length > 0 && (
-        <div className="bg-white border border-stone-200 rounded-xl p-4">
-          <div className="flex items-center justify-between gap-3 mb-3">
-            <h3 className="text-sm font-semibold text-stone-900">Top tags</h3>
-            <span className="text-[10px] text-stone-400">approved {periodDays}d</span>
-          </div>
-          <div className="space-y-2">
-            {stats.top_tags.slice(0, 8).map((item) => (
-              <div key={item.tag} className="flex items-center gap-2">
-                <span className="text-xs text-stone-600 w-20 shrink-0 truncate">{item.tag}</span>
-                <div className="flex-1 h-2 bg-stone-100 rounded-full overflow-hidden">
-                  <div
-                    className="h-full bg-orange-400 rounded-full transition-all"
-                    style={{ width: `${(item.count / maxTagCount) * 100}%` }}
-                  />
-                </div>
-                <span className="text-xs text-stone-400 w-4 text-right shrink-0">{item.count}</span>
-              </div>
-            ))}
-          </div>
-        </div>
-      )}
     </div>
   );
 }
@@ -5366,7 +5318,7 @@ export default function App() {
               <BrowseTab openTarget={browseTarget} />
             </div>
           )}
-          {tab === "dashboard" && <DashboardTab onNavigateToConcept={() => setTab("browse")} />}
+          {tab === "dashboard" && <DashboardTab onOpenPage={openSavedPage} onGoCapture={() => setTab("ingest")} />}
           {tab === "operations" && opsEnabled && <OperationsTab />}
         </div>
       </main>

@@ -438,10 +438,11 @@ No request body needed. Displays in the **Dashboard** tab:
 - **Top sources:** Source type breakdown (tweets, articles, etc.)
 - **Weekly badges:** True new concepts this week and concepts touched this week
 - **Summary metrics:** 30-day approved/rejected aggregates and unique concepts
+- **Recall (`recall` block):** page reads, unique pages read, and chat/interview questions asked in the same 30-day period
 
 **Frontend visualization:**
-- Dashboard tab with learning-health cards, compact Operations health, recent reads, review-due items, activity heatmap, tag breakdown, and source list
-- Learning data is derived from `_wiki/meta/traces.jsonl`; Operations health is derived from runtime telemetry logs and displays the log date range. Historical usage rows without provider token data are estimated from character counts and labeled as estimated.
+- Dashboard tab: "waiting" links (queue items, open threads), a Next up list (top 5 high-priority pages from `/review-queue`, each with a suggested action), four 30-day tiles (approved, pages read, questions asked, approval rate), and the activity heatmap
+- Capture metrics come from `_wiki/meta/traces.jsonl`. The `recall` block of `/dashboard-stats` counts page reads from `_wiki/meta/reads.jsonl` and chat/interview questions from `context_budget_logs.jsonl`. System health lives in the Operations tab.
 
 ---
 

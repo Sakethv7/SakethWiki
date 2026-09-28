@@ -22,7 +22,7 @@ sequenceDiagram
 
 Step by step:
 
-1. On mount, `DashboardTab` starts all four requests together.
+1. On mount, `DashboardTab` starts `/review-queue` on its own, and the other three together with `Promise.all`. Next up fills in when the slower ranking returns, so it never delays the tiles.
 2. `/dashboard-stats` is **required**. If it fails, the tab shows the existing
    "Failed to load dashboard stats." message, as today.
 3. The other three are **optional**. Each is wrapped in `.catch(() => null)`. A

@@ -87,19 +87,23 @@ before applying the limit, so the larger limit costs nothing extra to compute.
 ## Frontend component contract
 
 ```
-DashboardTab({ onNavigateToConcept, onGoCapture })
+DashboardTab({ onOpenPage, onGoCapture })
 ```
 
 | Prop | Type | Use |
 |---|---|---|
-| `onNavigateToConcept` | `(name?: string) => void` | Existing. Opens Browse, and the page if `name` is given. |
-| `onGoCapture` | `() => void` | **New.** Switches to the Capture tab. `App` passes `() => setTab("ingest")`. |
+| `onOpenPage` | `(name?: string, folder?: string) => void` | `App`'s existing `openSavedPage`. Opens Browse at a page, or at a folder's list when `name` is omitted. |
+| `onGoCapture` | `() => void` | Switches to the Capture tab. `App` passes `() => setTab("ingest")`. |
+
+`BrowseTab` now accepts a folder-only `openTarget` (`{ folder }`). It calls its
+existing `switchFolder`, which clears any open page and resets the filters.
 
 Removed components: `ReviewDueSection` and `RecentlyRead`.
 
-## Open questions
+## `GET /review-queue` (changed: runs in a worker thread)
 
-- `onNavigateToConcept` is currently passed as `() => setTab("browse")` and
-  ignores the page name. For Next up rows to open a specific page, `App` should
-  pass its existing `openSavedPage(name)` handler instead. I have not yet
-  checked that `openSavedPage` behaves correctly for pages in every folder.
+The handler changed from `async def` to plain `def`. `build_queue` reads every
+page (about 1.3 s on 202 pages) with blocking file I/O. As `async def` it held
+the event loop, so the 10 ms `/dashboard-stats` call waited behind it. As plain
+`def`, FastAPI runs it in its threadpool. The request and response are
+unchanged. Measured: the tiles now render in about 70 ms instead of about 1350 ms.
