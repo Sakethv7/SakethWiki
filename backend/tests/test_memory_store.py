@@ -460,7 +460,7 @@ def test_store_image_skips_large_optional_caption(monkeypatch, tmp_path):
     monkeypatch.setattr(llm_client, "complete", fail_if_called)
     image_data = base64.b64encode(b"large-enough-image-bytes").decode("ascii")
 
-    result = asyncio.run(main.store_image(main.IngestRequest(images=[{"data": image_data, "mediaType": "image/png"}])))
+    result = main.store_image(main.IngestRequest(images=[{"data": image_data, "mediaType": "image/png"}]))
     context = telemetry.summarize_context_events()
 
     assert result["saved"][0]["filename"].endswith("image-1.png")

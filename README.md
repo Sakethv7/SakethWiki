@@ -219,7 +219,6 @@ cd frontend && npm run build
 | POST | `/analyze-traces` | Run weekly self-learning analysis on approval traces |
 | GET | `/system-insights` | Return current system insights and prompt hints |
 | **POST** | **`/log-read`** | **Log a page read with duration to `meta/reads.jsonl`** |
-| **GET** | **`/recent-reads`** | **Return last N unique recently-read pages** |
 | **POST** | **`/edit-page/{name}`** | **Edit concept page body (preserves frontmatter, git commits)** |
 | **POST** | **`/normalize-tags`** | **Map tag synonyms to canonical tags via tag-ontology.json** |
 | **GET** | **`/tag-ontology`** | **Return the canonical tag ontology** |
@@ -513,10 +512,6 @@ Response:
 ```
 
 Appends to `_wiki/meta/reads.jsonl`. Used by the frontend to log read duration when navigating away.
-
-### GET /recent-reads
-
-Returns last N unique recently-read pages (default N=10).
 
 ### POST /normalize-tags
 

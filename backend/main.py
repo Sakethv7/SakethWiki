@@ -4248,8 +4248,9 @@ def _apply_safe_link_fixes_to_content(content: str, valid_pages: set[str]) -> tu
 
 
 
+# Plain def: reads the vault; FastAPI runs it in a worker thread.
 @app.get("/lint")
-async def get_lint_cache():
+def get_lint_cache():
     """
     Return the last cached lint report if it exists, or 204 if no cache.
     Use POST /lint to generate or refresh the health check report.
@@ -4267,8 +4268,10 @@ async def get_lint_cache():
     return cached_clean
 
 
+# Plain def: blocking LLM call; FastAPI runs it in a worker thread so
+# other requests aren't frozen while it waits.
 @app.post("/lint")
-async def lint_wiki(req: LintRequest):
+def lint_wiki(req: LintRequest):
     """
     Scan the entire wiki with Sonnet and return a structured health report:
     - inconsistencies across pages
@@ -4642,8 +4645,10 @@ async def delete_page(page_name: str):
 
 # ── POST /consolidate ─────────────────────────────────────────────────────────
 
+# Plain def: blocking LLM call; FastAPI runs it in a worker thread so
+# other requests aren't frozen while it waits.
 @app.post("/consolidate")
-async def consolidate(req: ConsolidateRequest):
+def consolidate(req: ConsolidateRequest):
     """
     Merge `source` page into `target` using Sonnet:
     - Deduplicates entries from the same URL
@@ -5373,33 +5378,6 @@ async def log_read(req: LogReadRequest):
     return {"ok": True}
 
 
-@app.get("/recent-reads")
-async def recent_reads(limit: int = 10, max_age_days: int = 30):
-    vault_path = Path(os.environ.get("VAULT_PATH", "/Users/sakethv7/SakethVault"))
-    reads_path = vault_path / "_wiki" / "meta" / "reads.jsonl"
-    if not reads_path.exists():
-        return {"reads": []}
-    lines = reads_path.read_text(encoding="utf-8").splitlines()
-    cutoff = datetime.utcnow() - timedelta(days=max(1, min(max_age_days, 365)))
-    # Parse last 200 lines, deduplicate keeping most recent occurrence
-    seen = {}
-    for line in reversed(lines[-200:]):
-        if not line.strip():
-            continue
-        try:
-            entry = json.loads(line)
-            concept = entry.get("concept", "")
-            ts = _parse_iso_datetime(entry.get("ts"))
-            if not ts or ts < cutoff:
-                continue
-            if concept and concept not in seen:
-                seen[concept] = entry
-        except Exception:
-            continue
-    ordered = sorted(seen.values(), key=lambda e: e.get("ts", ""), reverse=True)
-    return {"reads": ordered[:limit]}
-
-
 # ── /edit-page/{page} ────────────────────────────────────────────────────────
 
 class EditPageRequest(BaseModel):
@@ -5529,8 +5507,10 @@ class RewriteNotesRequest(BaseModel):
     context: str = ""
 
 
+# Plain def: blocking LLM call; FastAPI runs it in a worker thread so
+# other requests aren't frozen while it waits.
 @app.post("/store-image")
-async def store_image(req: IngestRequest):
+def store_image(req: IngestRequest):
     """
     Save a pasted image directly to _wiki/assets/ without LLM extraction.
     Returns the Obsidian-compatible embed path so the frontend can insert it.
@@ -5651,8 +5631,10 @@ class ExpandNotesRequest(BaseModel):
     count: int = 2       # how many new bullets to add
 
 
+# Plain def: blocking LLM call; FastAPI runs it in a worker thread so
+# other requests aren't frozen while it waits.
 @app.post("/expand-notes")
-async def expand_notes(req: ExpandNotesRequest):
+def expand_notes(req: ExpandNotesRequest):
     """
     Add new insight bullets in a given direction, appended to the existing set.
     """
@@ -5734,8 +5716,10 @@ def _parse_bullet_array(raw: str) -> list[str]:
     return lines[:4]
 
 
+# Plain def: blocking LLM call; FastAPI runs it in a worker thread so
+# other requests aren't frozen while it waits.
 @app.post("/rewrite-notes")
-async def rewrite_notes(req: RewriteNotesRequest):
+def rewrite_notes(req: RewriteNotesRequest):
     """
     Rewrite POV/first-person summary bullets as neutral, precise technical notes
     in the style of Lilian Weng's blog — factual, dense, no 'I learned' openers.
@@ -5896,8 +5880,10 @@ async def vault_rewrite_pov_notes_status(task_id: str):
 
 # ── /knowledge-gaps/{page_name} ───────────────────────────────────────────────
 
+# Plain def: blocking LLM call; FastAPI runs it in a worker thread so
+# other requests aren't frozen while it waits.
 @app.post("/knowledge-gaps/{page_name}")
-async def knowledge_gaps(page_name: str):
+def knowledge_gaps(page_name: str):
     """
     Generate 5 questions Saketh probably can't answer yet from his own notes.
     Also returns prerequisites and a concept diagram.

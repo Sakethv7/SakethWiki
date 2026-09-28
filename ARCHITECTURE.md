@@ -194,6 +194,7 @@ Calculate metrics:
   - Tag frequency (top 10)
   - Source type frequency
   - New concepts this week
+Read reads.jsonl + context_budget_logs.jsonl → recall block
     ↓
 Return: {
   period_days: 30,
@@ -203,34 +204,34 @@ Return: {
   learning_velocity: {entries_per_week, concepts_per_week},
   top_tags: [{tag, count}, ...],
   top_sources: [{source, count}, ...],
-  new_concepts_this_week: number
+  new_concepts_this_week: number,
+  recall: {pages_read, unique_pages_read, questions_asked, chat_questions, interview_questions}
 }
 ```
 
 **Frontend Rendering:**
-- Compact 3-stat row: total approved · unique concepts · new this week
+- Waiting links: queue items (→ Capture) and open threads (→ Browse), shown only when non-zero
+- Next up: top 5 high-priority pages from `GET /review-queue`, each with its suggested action (loads after the tiles)
+- Four 30-day tiles: approved · pages read · questions asked · approval rate
 - Activity heatmap: GitHub-style 16-week × 7-day grid (orange intensity scale)
-- Tag breakdown: Horizontal bars with orange fill, sorted by frequency
-- Source breakdown: Pill chips with emoji indicators
-- "Recently Read" section: last N unique reads (hidden when empty)
+- Design and decisions: `docs/dashboard/`
 
 **Cost:** $0 (file I/O only; no LLM calls)
 
-### 7. Recently Read
+### 7. Read Tracking
 
-**Entry points:** `POST /log-read`, `GET /recent-reads`
+**Entry points:** `POST /log-read`
 
 **Flow:**
 ```
-User navigates away from concept page (Back button or page switch)
+User navigates away from concept page (Back, page switch, leaving Browse, or page unload)
     ↓
 Frontend fires POST /log-read { page, duration_seconds }
     ↓
 Backend appends {ts, concept, duration_seconds} to _wiki/meta/reads.jsonl
     ↓
-GET /recent-reads → deduplicates by concept, returns last N (default 10)
-    ↓
-Dashboard "Recently Read" section renders the list (hidden when empty)
+Read by /dashboard-stats (recall tiles), /review-queue (staleness),
+and /calculate-maturity (activity score)
 ```
 
 **Cost:** $0 (file append + sequential scan)
@@ -519,7 +520,6 @@ Runtime changes such as context-budget increases, routing overrides, eval-case e
 | `/analyze-traces` (weekly) | $0.10-0.30 | 30-60s | Weekly Sonnet analysis |
 | Trace logging | $0 | <1ms | File append only |
 | `/log-read` (read tracking) | $0 | <1ms | File append only |
-| `/recent-reads` (recent pages) | $0 | <5ms | Sequential scan of reads.jsonl |
 | `/normalize-tags` (tag map) | $0 | <5ms | Dict lookup against ontology |
 | `/ingest` (iOS fast path) | $0.02-0.05 | ~20ms (sync) | Background extraction fires async |
 

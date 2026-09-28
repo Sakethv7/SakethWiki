@@ -3198,6 +3198,23 @@ function BrowseTab({ openTarget }) {
 
   const _readStartRef = useRef({});
 
+  // Log any page still open when Browse unmounts (tab switch) or the page is
+  // unloaded; otherwise only page-to-page and Back navigation logged reads.
+  // Sub-2s opens are skipped: they aren't reads, and StrictMode's dev-only
+  // mount/unmount/mount would otherwise log a 0s read for every opened page.
+  useEffect(() => {
+    function flushReads() {
+      for (const [page, start] of Object.entries(_readStartRef.current)) {
+        const dur = Math.round((Date.now() - start) / 1000);
+        if (dur < 2) continue;
+        api("/log-read", { method: "POST", keepalive: true, body: JSON.stringify({ page, duration_seconds: dur }) }).catch(() => {});
+      }
+      _readStartRef.current = {};
+    }
+    window.addEventListener("pagehide", flushReads);
+    return () => { window.removeEventListener("pagehide", flushReads); flushReads(); };
+  }, []);
+
   async function openPage(name) {
     setPageLoading(true);
     // Track reading history in localStorage (last 8 pages)
