@@ -50,6 +50,19 @@ async function ensureMermaid() {
   return _mermaidLib;
 }
 
+async function validateMermaidRender(chart) {
+  if (!chart) return;
+  const mermaid = await ensureMermaid();
+  const tmp = document.createElement("div");
+  tmp.style.position = "absolute"; tmp.style.visibility = "hidden";
+  document.body.appendChild(tmp);
+  try {
+    await mermaid.render(`diagram-validation-${Math.random().toString(36).slice(2)}`, sanitizeMermaid(chart), tmp);
+  } finally {
+    try { document.body.removeChild(tmp); } catch {}
+  }
+}
+
 function MermaidDiagram({ chart }) {
   const uid = useRef(`md-${Math.random().toString(36).slice(2)}`);
   const [svg, setSvg] = useState("");
@@ -637,6 +650,8 @@ function IngestTab({ onApproved, onSwitchToChat, onOpenPage }) {
   const [savingImage, setSavingImage] = useState(false);
   const [savedImages, setSavedImages] = useState(null);
   const [regeneratingMode, setRegeneratingMode] = useState(null);
+  const [diagramCandidate, setDiagramCandidate] = useState(null);
+  const [diagramIntent, setDiagramIntent] = useState("faithful_source");
   const [polishing, setPolishing] = useState(false);
   const [expanding, setExpanding] = useState(false);
   const [expandOpen, setExpandOpen] = useState(false);
@@ -948,6 +963,22 @@ function IngestTab({ onApproved, onSwitchToChat, onOpenPage }) {
     setRegeneratingMode(mode);
     setError("");
     try {
+      if (mode === "diagram") {
+        const display = preview.diff_preview || preview;
+        const data = await api(`/queue/${preview.id}/diagram-regenerations`, {
+          method: "POST",
+          body: JSON.stringify({
+            expected_revision: display.revision || 0,
+            idempotency_key: crypto.randomUUID(),
+            intent: diagramIntent,
+          }),
+        });
+        setDiagramCandidate(data.candidate);
+        setPreview({ ...preview, diff_preview: { ...display, revision: data.revision } });
+        setDone("Validated diagram candidate created — select it to use it");
+        setQueueKey(k => k + 1);
+        return;
+      }
       const data = await api(`/queue/regenerate/${preview.id}`, {
         method: "POST",
         body: JSON.stringify({ mode }),
@@ -961,6 +992,24 @@ function IngestTab({ onApproved, onSwitchToChat, onOpenPage }) {
     } finally {
       setRegeneratingMode(null);
     }
+  }
+
+  async function handleSelectDiagramCandidate() {
+    if (!preview?.id || !diagramCandidate) return;
+    setRegeneratingMode("select-diagram"); setError("");
+    try {
+      await validateMermaidRender(diagramCandidate.diagram);
+      const display = preview.diff_preview || preview;
+      const data = await api(`/queue/${preview.id}/diagram-selection`, {
+        method: "POST",
+        body: JSON.stringify({ expected_revision: display.revision || 0, candidate_id: diagramCandidate.id }),
+      });
+      setPreview({ ...preview, diff_preview: { ...display, ...data.diff_preview, revision: data.revision } });
+      setDiagramCandidate(null);
+      setDone("Diagram candidate selected — review before saving to wiki");
+      setQueueKey(k => k + 1);
+    } catch (e) { setError(e.message); }
+    finally { setRegeneratingMode(null); }
   }
 
   return (
@@ -1468,11 +1517,23 @@ function IngestTab({ onApproved, onSwitchToChat, onOpenPage }) {
                 </div>
               </div>
             )}
+            {diagramCandidate && (
+              <div className="space-y-2 rounded-xl border border-emerald-200 bg-emerald-50/40 p-3">
+                <div className="flex items-center justify-between gap-3">
+                  <p className="text-xs font-semibold text-emerald-800">Validated diagram candidate · {diagramCandidate.diagram_plan?.type || "structure"}</p>
+                  <button onClick={handleSelectDiagramCandidate} disabled={!!regeneratingMode || approving}
+                    className="text-xs px-3 py-1.5 rounded-lg bg-emerald-700 text-white hover:bg-emerald-800 disabled:opacity-40">
+                    {regeneratingMode === "select-diagram" ? "Selecting…" : "Use this diagram"}
+                  </button>
+                </div>
+                {diagramCandidate.diagram ? <MermaidDiagram chart={diagramCandidate.diagram} /> : <p className="text-xs text-emerald-800">This source does not need a diagram. Select to remove the current one.</p>}
+              </div>
+            )}
           </div>
 
           {/* Actions */}
           <div className="px-5 py-4 border-t border-stone-100 bg-stone-50/40 space-y-3">
-            <div className="flex gap-2">
+            <div className="flex flex-wrap gap-2 items-center">
               <button
                 onClick={() => handleRegenerate("full")}
                 disabled={!!regeneratingMode || approving}
@@ -1487,6 +1548,12 @@ function IngestTab({ onApproved, onSwitchToChat, onOpenPage }) {
               >
                 {regeneratingMode === "diagram" ? "Regenerating diagram…" : "Regenerate diagram"}
               </button>
+              <select value={diagramIntent} onChange={e => setDiagramIntent(e.target.value)} disabled={!!regeneratingMode || approving}
+                className="text-xs rounded-lg border border-stone-200 bg-white px-2 py-1.5 text-stone-600">
+                <option value="faithful_source">Faithful source</option>
+                <option value="explain_mechanism">Explain mechanism</option>
+                <option value="compare_alternatives">Compare alternatives</option>
+              </select>
             </div>
             <label className="flex items-center gap-2.5 cursor-pointer select-none group">
               <div className={`w-8 h-4 rounded-full transition-colors ${openThread ? "bg-orange-500" : "bg-stone-200"}`}

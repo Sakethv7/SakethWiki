@@ -265,6 +265,14 @@ def _fallback_enabled(task: str) -> bool:
     return key in CRITICAL_TASKS
 
 
+def _contract_repair_enabled(task: str) -> bool:
+    """Allow an immediate operational rollback of structured-output repair."""
+    key = _task_key(task)
+    setting = "LLM_INGEST_CONTRACT_REPAIR" if key == "INGEST_EXTRACT" else "LLM_SLICE_CONTRACT_REPAIR"
+    value = os.environ.get(setting, "true").strip().lower()
+    return value not in {"0", "false", "no", "off"}
+
+
 def _strip_fences(text: str) -> str:
     t = text.strip()
     if t.startswith("```"):
@@ -592,6 +600,7 @@ def complete(
     primary_usage: dict[str, Any] = {}
     primary_attempts = 0
     fallback_attempts = 0
+    contract_repair_attempts = 0
     input_chars = telemetry.estimate_chars({"system": system, "messages": messages})
 
     def _log(*, text: str = "", usage: Optional[dict[str, Any]] = None, fallback_used: bool = False, fallback_model: str = "", contract_ok: bool = False, error: str = "") -> None:
@@ -619,6 +628,7 @@ def complete(
                 "fallback_used": fallback_used,
                 "primary_attempts": primary_attempts,
                 "fallback_attempts": fallback_attempts,
+                "contract_repair_attempts": contract_repair_attempts,
                 "error": error,
             }
         )
@@ -643,6 +653,7 @@ def complete(
                 "duration_ms": round((time.perf_counter() - started) * 1000, 1),
                 "primary_attempts": primary_attempts,
                 "fallback_attempts": fallback_attempts,
+                "contract_repair_attempts": contract_repair_attempts,
                 **{k: v for k, v in cost.items() if "cost" in k or "token" in k},
             },
             error=error or None,
@@ -683,6 +694,64 @@ def complete(
     if primary_text and _valid_contract(primary_text, expect_json, required_json_keys):
         _log(text=primary_text, usage=primary_usage, contract_ok=True)
         return primary_text
+
+    # A structured response that exhausts its output budget is usually an
+    # incomplete JSON object, not a provider outage. Give only these
+    # non-mutating planning/extraction tasks one compact repair attempt. The original
+    # capture remains in the caller's queue until this function returns a
+    # valid draft, so this cannot duplicate a vault write.
+    if key in {"INGEST_EXTRACT", "SLICE_CONTENT"} and _contract_repair_enabled(task) and primary_text and expect_json:
+        repair_messages = [
+            *messages,
+            {
+                "role": "user",
+                "content": (
+                    "Your previous response failed the required JSON contract. "
+                    "Return a replacement now: JSON only, no markdown fences, "
+                    "include every required field, keep every array concise. "
+                    + ("For a topic split, return an array of chapter objects with paragraph indices only. " if key == "SLICE_CONTENT" else "Set diagram to an empty string unless a diagram is essential. ")
+                    + "Previous invalid response follows:\n"
+                    f"{primary_text}"
+                ),
+            },
+        ]
+        repair_floor = 1000 if key == "SLICE_CONTENT" else 1600
+        repair_max_tokens = min(max(max_tokens, repair_floor), 2200)
+        try:
+            if provider == "anthropic":
+                repair_result, contract_repair_attempts = _call_with_retry(
+                    lambda: _anthropic_complete(
+                        model=resolved_model,
+                        max_tokens=repair_max_tokens,
+                        messages=repair_messages,
+                        system=system,
+                        api_key=api_key,
+                    ),
+                    provider=provider,
+                    model=resolved_model,
+                )
+            else:
+                repair_result, contract_repair_attempts = _call_with_retry(
+                    lambda: _openai_compat_complete(
+                        provider=provider,
+                        model=resolved_model,
+                        max_tokens=repair_max_tokens,
+                        messages=repair_messages,
+                        system=system,
+                        api_key=api_key,
+                    ),
+                    provider=provider,
+                    model=resolved_model,
+                )
+            if _valid_contract(repair_result.text, expect_json, required_json_keys):
+                _log(text=repair_result.text, usage=repair_result.usage, contract_ok=True)
+                return repair_result.text
+            primary_text = repair_result.text
+            primary_usage = repair_result.usage
+        except Exception as repair_err:
+            # Keep the original contract failure surface. Transport failures
+            # during repair are already bounded by _call_with_retry.
+            logger.warning("ingest contract repair failed: %s", repair_err)
 
     if provider == "anthropic" or not _fallback_enabled(task):
         if primary_err:

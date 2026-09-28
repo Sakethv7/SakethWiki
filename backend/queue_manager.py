@@ -84,3 +84,22 @@ def update(item_id: str, updated: dict) -> bool:
                 _write(items)
                 return True
     return False
+
+
+def update_if_revision(item_id: str, expected_revision: int, updated: dict) -> tuple[bool, Optional[dict]]:
+    """Atomically replace an item only when its review revision still matches.
+
+    Returns ``(True, updated)`` on success.  On a stale/missing item it returns
+    ``(False, current_item)`` so API callers can distinguish 404 from 409.
+    """
+    with _queue_lock():
+        items = _read()
+        for i, item in enumerate(items):
+            if item.get("id") != item_id:
+                continue
+            if int(item.get("revision", 0)) != expected_revision:
+                return False, item
+            items[i] = updated
+            _write(items)
+            return True, updated
+    return False, None

@@ -132,3 +132,109 @@ def test_complete_logs_primary_attempt_count(monkeypatch):
     assert events[-1]["primary_attempts"] == 2
     assert events[-1]["fallback_attempts"] == 0
 
+
+def test_ingest_contract_failure_gets_one_compact_repair(monkeypatch):
+    _configure_fast_retry(monkeypatch, attempts="1")
+    monkeypatch.setenv("LLM_PROVIDER", "anthropic")
+    calls = []
+    events = []
+    required = ["title", "summary"]
+
+    def provider_call(**kwargs):
+        calls.append(kwargs)
+        if len(calls) == 1:
+            return llm_client.CompletionResult('{"title":"truncated"')
+        return llm_client.CompletionResult('{"title":"fixed","summary":["one"]}')
+
+    monkeypatch.setattr(llm_client, "_anthropic_complete", provider_call)
+    monkeypatch.setattr(llm_client.telemetry, "log_llm_call", events.append)
+
+    result = llm_client.complete(
+        task="ingest_extract",
+        model=None,
+        max_tokens=1200,
+        messages=[{"role": "user", "content": "source text"}],
+        expect_json=True,
+        required_json_keys=required,
+    )
+
+    assert result == '{"title":"fixed","summary":["one"]}'
+    assert len(calls) == 2
+    assert calls[1]["max_tokens"] == 1600
+    assert "previous response failed" in calls[1]["messages"][-1]["content"]
+    assert events[-1]["contract_repair_attempts"] == 1
+
+
+def test_non_ingest_contract_failure_does_not_add_repair_attempt(monkeypatch):
+    _configure_fast_retry(monkeypatch, attempts="1")
+    monkeypatch.setenv("LLM_PROVIDER", "anthropic")
+    calls = []
+
+    def provider_call(**_kwargs):
+        calls.append(1)
+        return llm_client.CompletionResult("not json")
+
+    monkeypatch.setattr(llm_client, "_anthropic_complete", provider_call)
+
+    with pytest.raises(RuntimeError, match="LLM contract failed"):
+        llm_client.complete(
+            task="knowledge_gaps",
+            model=None,
+            max_tokens=100,
+            messages=[{"role": "user", "content": "source text"}],
+            expect_json=True,
+            required_json_keys=["title"],
+        )
+
+    assert len(calls) == 1
+
+
+def test_ingest_contract_repair_can_be_disabled(monkeypatch):
+    _configure_fast_retry(monkeypatch, attempts="1")
+    monkeypatch.setenv("LLM_PROVIDER", "anthropic")
+    monkeypatch.setenv("LLM_INGEST_CONTRACT_REPAIR", "false")
+    calls = []
+
+    def provider_call(**_kwargs):
+        calls.append(1)
+        return llm_client.CompletionResult("not json")
+
+    monkeypatch.setattr(llm_client, "_anthropic_complete", provider_call)
+
+    with pytest.raises(RuntimeError, match="LLM contract failed"):
+        llm_client.complete(
+            task="ingest_extract",
+            model=None,
+            max_tokens=100,
+            messages=[{"role": "user", "content": "source text"}],
+            expect_json=True,
+            required_json_keys=["title"],
+        )
+
+    assert len(calls) == 1
+
+
+def test_slice_contract_failure_gets_one_compact_repair(monkeypatch):
+    _configure_fast_retry(monkeypatch, attempts="1")
+    monkeypatch.setenv("LLM_PROVIDER", "anthropic")
+    calls = []
+
+    def provider_call(**kwargs):
+        calls.append(kwargs)
+        if len(calls) == 1:
+            return llm_client.CompletionResult("[truncated")
+        return llm_client.CompletionResult('[{"title":"one","paragraphs":[0],"concept_hint":""}]')
+
+    monkeypatch.setattr(llm_client, "_anthropic_complete", provider_call)
+
+    result = llm_client.complete(
+        task="slice_content",
+        model=None,
+        max_tokens=700,
+        messages=[{"role": "user", "content": "paragraphs"}],
+        expect_json=True,
+    )
+
+    assert result.startswith("[")
+    assert len(calls) == 2
+    assert calls[1]["max_tokens"] == 1000

@@ -205,6 +205,18 @@ class RegenerateRequest(BaseModel):
     mode: str = "full"  # full | diagram
 
 
+class DiagramRegenerationRequest(BaseModel):
+    expected_revision: int
+    idempotency_key: str
+    intent: str = "faithful_source"
+    feedback: str = ""
+
+
+class DiagramSelectionRequest(BaseModel):
+    expected_revision: int
+    candidate_id: str
+
+
 class ApproveRequest(BaseModel):
     approved: bool
     redirect_note: Optional[str] = None
@@ -465,6 +477,9 @@ def _stage_markdown_clip(markdown: str, source_url: str = "", clip_title: str = 
         "source_type": "clip_markdown",
         "clip_signature": sig,
         "raw_markdown": text,
+        "source_evidence": {"text": text, "images": []},
+        "revision": 0,
+        "diagram_revisions": [],
         "inbox_file": inbox_file,
         "staged_at": datetime.now().isoformat(),
         "status": "pending",
@@ -473,25 +488,103 @@ def _stage_markdown_clip(markdown: str, source_url: str = "", clip_title: str = 
     return item
 
 
+DIAGRAM_INTENTS = {"faithful_source", "explain_mechanism", "compare_alternatives"}
+
+
+def _diagram_evidence(item: dict) -> tuple[str, list]:
+    """Return only capture-time evidence; never re-fetch a drifting URL."""
+    evidence = item.get("source_evidence") if isinstance(item.get("source_evidence"), dict) else {}
+    text = str(evidence.get("text") or item.get("raw_markdown") or "").strip()
+    images = evidence.get("images") if isinstance(evidence.get("images"), list) else []
+    return text, images
+
+
+def _regeneration_plan(item: dict, evidence: str, intent: str) -> dict:
+    """Reuse the curation decision, allowing an explicit no-diagram outcome."""
+    current = _normalize_diagram_plan(item.get("diagram_plan"))
+    if not current.get("needed"):
+        return {"needed": False, "type": "none", "reason": "Source has no approved visual structure."}
+    shape = str(item.get("knowledge_shape") or "none").lower()
+    types = {
+        "taxonomy": "hierarchy", "mechanism": "flowchart", "architecture": "architecture",
+        "argument": "comparison", "case_study": "flowchart",
+    }
+    plan_type = types.get(shape, current.get("type", "flowchart"))
+    if intent == "compare_alternatives" and shape in {"argument", "taxonomy"}:
+        plan_type = "comparison"
+    return {
+        "needed": True,
+        "type": plan_type,
+        "reason": f"Regenerated from captured {shape if shape != 'none' else 'source'} structure.",
+    }
+
+
+def _diagram_node_labels(diagram: str) -> list[str]:
+    return [label.strip() for label in _re.findall(r"\[([^\]]+)\]", diagram or "") if label.strip()]
+
+
+def _validate_diagram_candidate(diagram: str, plan: dict, evidence: str, key_concepts: list) -> dict:
+    """Cheap deterministic gate; browser Mermaid remains the final renderer."""
+    if not plan.get("needed"):
+        return {"syntax_valid": True, "shape_match": True, "grounded_labels": True, "selectable": True}
+    clean = _normalize_mermaid(diagram or "").strip()
+    if not _re.match(r"^(?:flowchart|graph)\s+(?:TB|TD|BT|RL|LR)\b", clean, flags=_re.I):
+        return {"syntax_valid": False, "shape_match": False, "grounded_labels": False, "selectable": False,
+                "reason": "Diagram must start with a Mermaid flowchart direction."}
+    if len(_re.findall(r"(?:-->|---|==>)", clean)) < 2 or len(_diagram_node_labels(clean)) < 3:
+        return {"syntax_valid": False, "shape_match": False, "grounded_labels": False, "selectable": False,
+                "reason": "Diagram needs at least three labeled nodes and two relationships."}
+    if plan.get("type") == "hierarchy" and not _re.search(r"flowchart\s+(?:TB|TD)\b", clean, flags=_re.I):
+        return {"syntax_valid": True, "shape_match": False, "grounded_labels": False, "selectable": False,
+                "reason": "A hierarchy must use a top-down layout."}
+    evidence_tokens = set(_re.findall(r"[a-z0-9]+", (evidence + " " + " ".join(map(str, key_concepts or []))).lower()))
+    unsupported = []
+    for label in _diagram_node_labels(clean):
+        tokens = [t for t in _re.findall(r"[a-z0-9]+", label.lower()) if len(t) > 2]
+        if tokens and not any(t in evidence_tokens for t in tokens):
+            unsupported.append(label)
+    if unsupported:
+        return {"syntax_valid": True, "shape_match": True, "grounded_labels": False, "selectable": False,
+                "reason": f"Unsupported labels: {', '.join(unsupported[:3])}."}
+    return {"syntax_valid": True, "shape_match": True, "grounded_labels": True, "selectable": True}
+
+
+def _generate_evidence_diagram(item: dict, evidence: str, images: list, plan: dict, intent: str, feedback: str) -> str:
+    if not plan.get("needed"):
+        return ""
+    if images:
+        # Vision generation uses the original labels and directions where available.
+        return _vision_diagram(images, item.get("title", "Concept"), item.get("summary", []))
+    prompt = f"""Generate a Mermaid diagram strictly from the captured source below.
+
+Title: {item.get('title', 'Concept')}
+Required structure: {plan.get('type')}
+Reviewer intent: {intent}
+Reviewer feedback (non-authoritative): {feedback or 'None'}
+
+Rules:
+- Return NONE if the source does not support this structure.
+- Use only component names, concepts, and relationships supported by the source.
+- Use flowchart TD for hierarchy; flowchart LR otherwise.
+- 3-10 nodes, short labels, at least two arrows.
+- Return raw Mermaid only: no fences or explanation.
+
+Captured source:
+{evidence[:10000]}"""
+    raw = llm_client.complete(task="diagram", model=None, max_tokens=600,
+                              messages=[{"role": "user", "content": prompt}]).strip()
+    raw = _re.sub(r"^```(?:mermaid)?\s*", "", raw)
+    raw = _re.sub(r"\s*```$", "", raw).strip()
+    return "" if raw == "NONE" else _normalize_mermaid(raw)
+
+
 def _regen_item(item: dict, mode: str = "full") -> dict:
     """Regenerate queue item extraction from raw markdown or source URL."""
     updated = dict(item)
     existing_pages = [p["name"] for p in vault_reader.list_concept_pages()]
 
     if mode == "diagram":
-        updated["diagram"] = _llm_diagram(
-            title=updated.get("title", "Concept"),
-            summary=updated.get("summary", []),
-            key_concepts=updated.get("key_concepts", []),
-        )
-        updated["diagram_plan"] = {
-            "needed": bool(updated.get("diagram")),
-            "type": "regenerated",
-            "reason": "Diagram was explicitly regenerated from the review queue.",
-        }
-        updated["regenerated_at"] = datetime.now().isoformat()
-        updated["regenerated_mode"] = "diagram"
-        return updated
+        raise HTTPException(410, "Diagram-only regeneration moved to versioned candidates.")
 
     raw_md = updated.get("raw_markdown", "")
     src_url = updated.get("url", "")
@@ -669,6 +762,9 @@ async def ingest(req: IngestRequest, request: Request):
             "references": extraction.get("references", []),
             "diagram": extraction.get("diagram", ""),
             **_curation_fields(extraction),
+            "source_evidence": {"text": raw_text, "images": all_images},
+            "revision": 0,
+            "diagram_revisions": [],
             "staged_at": datetime.now().isoformat(),
             "status": "pending",
         }
@@ -1304,7 +1400,7 @@ def _extract_with_sonnet(text: str, images: Optional[list], source_url: str,
             "If the image has no structural diagram (e.g. pure text slide, photo), return \"\"."
         )
         content_budget = 10000
-        max_out = 1500
+        max_out = 1800
     elif content_len > 8000:
         depth = "long-form"
         model = "claude-haiku-4-5-20251001"   # Haiku handles long text fine; Sonnet only needed for images
@@ -1317,7 +1413,7 @@ def _extract_with_sonnet(text: str, images: Optional[list], source_url: str,
             "Add 'classDef accent fill:#c4573a,color:#fff,font-weight:bold' and apply :::accent to 1-2 key nodes (entry or critical output)."
         )
         content_budget = 10000
-        max_out = 1500
+        max_out = 1800
     elif content_len > 1500:
         depth = "medium"
         model = "claude-haiku-4-5-20251001"  # structured extraction, no deep reasoning
@@ -1329,14 +1425,14 @@ def _extract_with_sonnet(text: str, images: Optional[list], source_url: str,
             "Add 'classDef accent fill:#c4573a,color:#fff,font-weight:bold' and apply :::accent to 1-2 key nodes."
         )
         content_budget = 6000
-        max_out = 1200
+        max_out = 1600
     else:
         depth = "short"
         model = "claude-haiku-4-5-20251001"  # short structured extraction
         bullet_rule = "2-3 bullets — each a sharp, distinct insight. Neutral, precise technical prose (no first-person, no 'I learned')."
         diagram_rule = 'Return "" — short content rarely benefits from a diagram.'
         content_budget = 3000
-        max_out = 1200  # 800 truncated the 13-key JSON contract mid-response
+        max_out = 1400  # Structured JSON needs headroom even for short captures.
 
     content_budget = _ingest_source_budget(content_budget)
     source_chars_total = len(text or "")
@@ -1399,16 +1495,16 @@ Rules:
   * ingest = source contains durable educational signal for the wiki.
   * source_only = source is mainly event/news/social context; keep links or provenance but write only the transferable educational core.
   * reject = no durable educational value for this wiki. Use reject for recipes, shopping, celebrity gossip, announcements without transferable concepts, or pure hype.
-- educational_core: extract only reusable concepts, mechanisms, distinctions, failure modes, or implementation lessons. Do not include conference chronology, who-posted-what timelines, sponsor copy, social proof, or namedropping unless it defines the concept.
-- discarded_context: list 1-5 specific details intentionally excluded from durable notes, especially event chronology, hype context, or non-educational background.
+- educational_core: 1-3 reusable concepts, mechanisms, distinctions, failure modes, or implementation lessons. Do not include conference chronology, who-posted-what timelines, sponsor copy, social proof, or namedropping unless it defines the concept.
+- discarded_context: 0-2 specific details intentionally excluded from durable notes, especially event chronology, hype context, or non-educational background.
 - knowledge_shape: choose the dominant structure before writing bullets. Use taxonomy for categories, mechanism for cause/effect or procedure, architecture for components/layers, argument for claims/tradeoffs, case_study for one concrete example, none for weak structure.
 - summary: {bullet_rule}
 - suggested_page: use an existing slug if one fits; otherwise create a lowercase-hyphenated slug
-- suggested_wikilinks: 3-6 related concepts as kebab-case slugs — prefer existing page slugs listed above
-- tags: pick 1-4 from this exact list only: {tags_list}
-- key_concepts: 4-8 specific terms or ideas from the content
-- references: pick the most valuable external links mentioned in the content (YouTube videos, GitHub repos, papers, key articles). Empty list [] if none. Max 5 links.
-- diagram_plan: decide whether a diagram is actually useful before drawing. Prefer no diagram over a generic hub-and-spoke summary. If source contains an existing diagram, reproduce its structure. If source has clean conceptual structure but no diagram, create a new useful visual from that structure.
+- suggested_wikilinks: 0-3 related concepts as kebab-case slugs — prefer existing page slugs listed above
+- tags: pick 1-3 from this exact list only: {tags_list}
+- key_concepts: 3-5 specific terms or ideas from the content
+- references: pick the most valuable external links mentioned in the content (YouTube videos, GitHub repos, papers, key articles). Empty list [] if none. Max 3 links.
+- diagram_plan: decide whether a diagram is actually useful before drawing. Prefer no diagram over a generic hub-and-spoke summary. Keep `reason` under 12 words.
 - diagram: {diagram_rule} Escape all newlines as \\n in the JSON string. No special chars in node labels.""",
     })
 
@@ -1544,11 +1640,54 @@ def _slice_content(text: str, source_url: str, existing_pages: list) -> list[dic
     3. Reconstruct chapter texts from the paragraph groups.
     """
     paragraphs = [p.strip() for p in _re.split(r"\n\n+", text) if p.strip()]
-    no_split = [{"title": "", "text": text, "concept_hint": ""}]
+    no_split = [{"title": "", "text": text, "concept_hint": "", "split_mode": "none"}]
 
     # Don't slice short content or content with fewer than 4 paragraphs
     if len(text) < 2500 or len(paragraphs) < 4:
         return no_split
+
+    def _structural_fallback(mode: str) -> list[dict]:
+        """Split only at explicit headings or conservative paragraph size bounds."""
+        heading_matches = list(_re.finditer(r"(?m)^#{1,6}\s+(.+?)\s*$", text))
+        sections = []
+        if len(heading_matches) >= 2:
+            for i, match in enumerate(heading_matches):
+                start = match.end()
+                end = heading_matches[i + 1].start() if i + 1 < len(heading_matches) else len(text)
+                body = text[start:end].strip()
+                if body:
+                    sections.append({"title": match.group(1).strip(), "text": body, "concept_hint": ""})
+        if len(sections) < 2:
+            sections = []
+            current, current_len = [], 0
+            for paragraph in paragraphs:
+                if current and current_len + len(paragraph) > 4500:
+                    sections.append({"title": "", "text": "\n\n".join(current), "concept_hint": ""})
+                    current, current_len = [], 0
+                current.append(paragraph)
+                current_len += len(paragraph)
+            if current:
+                sections.append({"title": "", "text": "\n\n".join(current), "concept_hint": ""})
+        if len(sections) < 2:
+            telemetry.log_context_event("topic_split", {"mode": "none", "reason": "no_reliable_structure"})
+            return no_split
+        if len(sections) > 5:
+            overflow = sections[4:]
+            sections = sections[:4] + [{
+                "title": sections[4].get("title", ""),
+                "text": "\n\n".join(item["text"] for item in overflow),
+                "concept_hint": "",
+            }]
+        for section in sections:
+            section["split_mode"] = mode
+        telemetry.log_context_event("topic_split", {"mode": mode, "count": len(sections)})
+        return sections[:5]
+
+    # Explicit headings are stronger evidence than an LLM guess and avoid an
+    # unnecessary planner call for well-structured Markdown/HTML captures.
+    heading_fallback = _structural_fallback("headings") if _re.search(r"(?m)^#{1,6}\s+", text) else None
+    if heading_fallback and len(heading_fallback) > 1:
+        return heading_fallback
 
     # Cap what we send to the LLM — beyond ~8000 chars the paragraph list itself
     # gives enough signal for boundary detection without sending the full body.
@@ -1582,7 +1721,7 @@ Paragraphs:
         raw = llm_client.complete(
             task="slice_content",
             model=None,
-            max_tokens=700,
+            max_tokens=1000,
             messages=[{"role": "user", "content": prompt}],
             expect_json=True,
         ).strip()
@@ -1590,10 +1729,28 @@ Paragraphs:
         end   = raw.rfind("]") + 1
         chapters = json.loads(raw[start:end]) if start >= 0 else None
     except Exception:
-        return no_split
+        return _structural_fallback("paragraph_chunks")
 
     if not chapters or len(chapters) <= 1:
+        telemetry.log_context_event("topic_split", {"mode": "none", "reason": "unified_or_no_plan"})
         return no_split
+
+    # A syntactically valid array is not enough: coverage must be exact so no
+    # source paragraph disappears or is duplicated across child wikis.
+    if not isinstance(chapters, list) or len(chapters) > 5:
+        return _structural_fallback("paragraph_chunks")
+    seen = []
+    for chapter in chapters:
+        if not isinstance(chapter, dict):
+            return _structural_fallback("paragraph_chunks")
+        indices = chapter.get("paragraphs")
+        if not isinstance(indices, list) or not indices:
+            return _structural_fallback("paragraph_chunks")
+        if any(not isinstance(index, int) or index < 0 or index >= len(paragraphs) for index in indices):
+            return _structural_fallback("paragraph_chunks")
+        seen.extend(indices)
+    if sorted(seen) != list(range(len(paragraphs))) or len(set(seen)) != len(seen):
+        return _structural_fallback("paragraph_chunks")
 
     # Reconstruct full chapter texts (use original paragraphs, not the truncated preview)
     result = []
@@ -1607,9 +1764,21 @@ Paragraphs:
                 "title": (ch.get("title") or "").strip(),
                 "text":  chapter_text,
                 "concept_hint": (ch.get("concept_hint") or "").strip(),
+                "split_mode": "llm",
             })
 
-    return result if len(result) > 1 else no_split
+    if len(result) > 5:
+        overflow = result[4:]
+        result = result[:4] + [{
+            "title": overflow[0].get("title", ""),
+            "text": "\n\n".join(item["text"] for item in overflow),
+            "concept_hint": "",
+            "split_mode": "llm",
+        }]
+    if len(result) > 1:
+        telemetry.log_context_event("topic_split", {"mode": "llm", "count": len(result)})
+        return result
+    return _structural_fallback("paragraph_chunks")
 
 
 def _safe_node_label(text: str, max_words: int = 6, max_chars: int = 44) -> str:
@@ -2084,6 +2253,90 @@ async def queue_regenerate(item_id: str, req: RegenerateRequest):
             **_curation_fields(updated),
         },
     }
+
+
+@app.post("/queue/{item_id}/diagram-regenerations")
+async def create_diagram_regeneration(item_id: str, req: DiagramRegenerationRequest):
+    """Create a validated candidate without changing the selected queue draft."""
+    if req.intent not in DIAGRAM_INTENTS:
+        raise HTTPException(422, "intent must be faithful_source, explain_mechanism, or compare_alternatives")
+    if not req.idempotency_key.strip():
+        raise HTTPException(422, "idempotency_key is required")
+    if len(req.feedback) > 500:
+        raise HTTPException(422, "feedback must be at most 500 characters")
+    item = queue_manager.get_by_id(item_id)
+    if not item:
+        raise HTTPException(404, f"Item {item_id} not found in queue")
+    if int(item.get("revision", 0)) != req.expected_revision:
+        raise HTTPException(409, detail={"message": "Queue item changed; refresh before regenerating.", "item": item})
+    for candidate in item.get("diagram_revisions", []):
+        if candidate.get("idempotency_key") == req.idempotency_key:
+            return {"id": item_id, "revision": item.get("revision", 0), "candidate": candidate,
+                    "selected_candidate_id": item.get("selected_diagram_candidate_id")}
+
+    evidence, images = _diagram_evidence(item)
+    if not evidence and not images:
+        raise HTTPException(422, "This queued item has no retained source evidence; use full regeneration or edit manually.")
+    plan = _regeneration_plan(item, evidence, req.intent)
+    try:
+        diagram = _generate_evidence_diagram(item, evidence, images, plan, req.intent, req.feedback.strip())
+    except Exception as exc:
+        logger.warning("diagram regeneration failed for %s: %s", item_id, exc)
+        raise HTTPException(503, "Diagram generation is unavailable; the current draft was unchanged.")
+    validation = _validate_diagram_candidate(diagram, plan, evidence, item.get("key_concepts", []))
+    if not validation.get("selectable"):
+        raise HTTPException(422, detail={"message": "Candidate failed validation; the current draft was unchanged.",
+                                         "validation": validation})
+    candidate = {
+        "id": str(uuid.uuid4()), "idempotency_key": req.idempotency_key,
+        "parent_revision": req.expected_revision, "created_at": datetime.now().isoformat(),
+        "intent": req.intent, "feedback": req.feedback.strip(),
+        "evidence_hash": hashlib.sha256((evidence + str(len(images))).encode()).hexdigest(),
+        "diagram_plan": plan, "diagram": diagram, "validation": validation,
+        "generator": {"prompt_version": "evidence-diagram-v1"},
+    }
+    updated = dict(item)
+    updated["diagram_revisions"] = [*item.get("diagram_revisions", []), candidate]
+    updated["revision"] = req.expected_revision + 1
+    ok, current = queue_manager.update_if_revision(item_id, req.expected_revision, updated)
+    if not ok:
+        if current is None:
+            raise HTTPException(404, f"Item {item_id} not found in queue")
+        raise HTTPException(409, detail={"message": "Queue item changed; refresh before regenerating.", "item": current})
+    telemetry.log_context_event("diagram_regeneration", {
+        "item_id": item_id, "intent": req.intent, "plan_type": plan.get("type"),
+        "evidence_hash": candidate["evidence_hash"], "validation": validation,
+    })
+    return {"id": item_id, "revision": updated["revision"], "candidate": candidate,
+            "selected_candidate_id": updated.get("selected_diagram_candidate_id")}
+
+
+@app.post("/queue/{item_id}/diagram-selection")
+async def select_diagram_candidate(item_id: str, req: DiagramSelectionRequest):
+    item = queue_manager.get_by_id(item_id)
+    if not item:
+        raise HTTPException(404, f"Item {item_id} not found in queue")
+    if int(item.get("revision", 0)) != req.expected_revision:
+        raise HTTPException(409, detail={"message": "Queue item changed; refresh before selecting.", "item": item})
+    candidate = next((c for c in item.get("diagram_revisions", []) if c.get("id") == req.candidate_id), None)
+    if not candidate:
+        raise HTTPException(404, "Diagram candidate not found")
+    if not candidate.get("validation", {}).get("selectable"):
+        raise HTTPException(422, "Only validated diagram candidates can be selected")
+    updated = dict(item)
+    updated["diagram"] = candidate.get("diagram", "")
+    updated["diagram_plan"] = candidate.get("diagram_plan", {})
+    updated["selected_diagram_candidate_id"] = candidate["id"]
+    updated["revision"] = req.expected_revision + 1
+    ok, current = queue_manager.update_if_revision(item_id, req.expected_revision, updated)
+    if not ok:
+        if current is None:
+            raise HTTPException(404, f"Item {item_id} not found in queue")
+        raise HTTPException(409, detail={"message": "Queue item changed; refresh before selecting.", "item": current})
+    return {"id": item_id, "revision": updated["revision"], "diff_preview": {
+        "diagram": updated["diagram"], "diagram_plan": updated["diagram_plan"],
+        "selected_diagram_candidate_id": updated["selected_diagram_candidate_id"],
+    }}
 
 
 # ── queue decisions ───────────────────────────────────────────────────────────

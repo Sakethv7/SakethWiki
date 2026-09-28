@@ -8,7 +8,9 @@ SakethWiki currently makes one provider request per LLM completion. A transient 
 
 Add bounded retries inside `backend/llm_client.py`, immediately around each provider request. This covers all callers of `llm_client.complete`, including foreground capture and background URL extraction, without retrying queue writes, vault writes, approval traces, or other persistent mutations.
 
-The change does not add an infinite worker, silently switch models, retry invalid JSON, retry authentication/configuration errors, or automatically approve captured material.
+The change does not add an infinite worker, silently switch models, retry authentication/configuration errors, or automatically approve captured material.
+
+For `INGEST_EXTRACT` only, an invalid non-empty structured response gets one compact JSON repair request. This is separate from transient transport retry: it has a larger bounded output budget, reuses the original source context, and cannot write to the queue or vault.
 
 ## Components
 
@@ -28,6 +30,7 @@ Environment settings provide an operational escape hatch while defaults remain s
 - `LLM_MAX_ATTEMPTS` (default `3`)
 - `LLM_RETRY_BASE_SECONDS` (default `1`)
 - `LLM_RETRY_MAX_SECONDS` (default `8`)
+- `LLM_INGEST_CONTRACT_REPAIR` (default `true`; set `false` to disable the one repair request)
 
 ### Provider calls
 
@@ -43,7 +46,7 @@ The final LLM call telemetry record gains attempt counts for the primary and fal
 - A successful provider response is returned once and processed once by the caller.
 - Permanent client errors fail immediately.
 - Retry count and delay are bounded even with invalid environment values or provider headers.
-- Existing provider routing and contract validation behavior remains unchanged.
+- Existing provider routing remains unchanged. `INGEST_EXTRACT` adds one bounded contract-repair request after a non-empty invalid response.
 - The user's failed queue item remains recoverable through the existing manual retry control if all attempts fail.
 
 ## Failure modes
@@ -51,7 +54,7 @@ The final LLM call telemetry record gains attempt counts for the primary and fal
 - A provider may finish a request while the client loses the response. A retry can therefore incur duplicate model cost, but it cannot duplicate local queue/vault writes because those occur after `complete` returns.
 - Sustained overload still fails after the bounded retry budget; the UI must continue to show the retry action.
 - Excessive retry delays can make foreground capture feel stalled, so delays are capped and attempts remain configurable.
-- Retrying invalid model output could multiply cost without fixing transport health; contract failures are deliberately excluded.
+- A malformed ingest response may still fail after the one repair attempt; the existing queue/manual retry path remains the recovery route.
 
 ## Verification plan
 
@@ -59,7 +62,7 @@ The final LLM call telemetry record gains attempt counts for the primary and fal
 - Unit-test exhaustion after exactly three attempts.
 - Unit-test permanent 401 failure with one attempt.
 - Unit-test connection/timeout retry.
+- Unit-test truncated ingest JSON followed by one valid repair and prove other tasks do not get repair retries.
 - Unit-test capped delay and `Retry-After` handling.
 - Verify telemetry attempt counts on success and failure.
 - Run focused backend tests, then the full backend suite.
-

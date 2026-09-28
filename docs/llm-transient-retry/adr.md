@@ -2,11 +2,13 @@
 
 ## Status
 
-Accepted — approved by the user on 2026-09-02.
+Accepted — updated with user-approved ingest contract repair on 2026-09-10.
 
 ## Decision
 
 Retry only transient provider and network failures inside `llm_client.complete`, with three total attempts, exponential bounded jitter, optional `Retry-After`, and environment-configurable limits.
+
+For `INGEST_EXTRACT`, permit exactly one additional repair request after a non-empty response fails the JSON contract. Raise the extraction output budgets and constrain optional output fields so a valid response normally fits before repair is needed.
 
 ## Why
 
@@ -28,7 +30,7 @@ Rejected. The observed 529 reached the application, so the currently installed/c
 
 ### Retry every exception
 
-Rejected. Authentication, malformed requests, and contract failures do not become healthy with delay and would waste latency and cost.
+Rejected. Authentication and malformed requests do not become healthy with delay and would waste latency and cost. Ingest contract repair is the narrowly approved exception because the observed failures are output truncations at the configured cap.
 
 ## Consequences
 
@@ -36,7 +38,8 @@ Rejected. Authentication, malformed requests, and contract failures do not becom
 - A single logical completion may incur more than one provider charge if a response is lost.
 - Terminal failures arrive later because the app waits through bounded backoff.
 - Retry behavior becomes consistent and observable across supported providers.
+- A malformed ingest response can incur one additional provider completion, bounded to 1,600–2,200 output tokens.
 
 ## Rollback
 
-Set `LLM_MAX_ATTEMPTS=1` for immediate operational rollback. Code rollback removes the retry helper and attempt telemetry fields; no data migration or queue repair is required.
+Set `LLM_MAX_ATTEMPTS=1` to disable transport retries and `LLM_INGEST_CONTRACT_REPAIR=false` to disable JSON repair immediately. Code rollback removes the retry helper and attempt telemetry fields; no data migration or queue repair is required.

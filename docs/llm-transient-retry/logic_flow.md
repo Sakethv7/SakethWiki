@@ -17,9 +17,11 @@ Capture or background extraction
  contract          |                              |
       |       +----+-------------------+          |
       |       |                        |          |
-      |   permanent                 transient     |
+      | INGEST_EXTRACT?            transient     |
       |       |                        |          |
-      |    fail now        attempts remaining?    |
+      | one JSON repair       attempts remaining? |
+      |       |                        |          |
+      |  valid? return        terminal/backoff    |
       |                                |          |
       |                         +------+-----+     |
       |                         |            |     |
@@ -58,4 +60,4 @@ pending_extraction=true
 4. On an exception, retry only if it is classified transient and attempts remain.
 5. Compute a bounded exponential delay with jitter; a valid `Retry-After` may increase the delay only up to the configured cap.
 6. After exhaustion, raise the last provider exception through the existing extraction error handling.
-
+7. A non-empty invalid `INGEST_EXTRACT` response gets at most one compact JSON repair request; invalid output for all other tasks fails normally.
