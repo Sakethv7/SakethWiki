@@ -296,3 +296,19 @@ can be changed later without code changes.
    `alias_map()` is now cached until a concept page or `aliases.json` changes
    (checked by file mtimes). Lookups dropped from ~36 ms to ~0.7 ms, and the
    duplicate scan from ~6 s to ~1.8 s.
+
+## Round 3 (2026-09-29): side-by-side compare
+
+| | Before | Change | Fixes |
+|---|---|---|---|
+| Deciding a pair | The card showed two truncated names and a score. Deciding meant leaving the dashboard. | Each row has one **Compare** button. It opens both pages side by side: full title, slug, summary (or first notes when there's no summary), section titles, tags, size, how many pages link in, maturity, and whether each already links to the other. | You can decide each pair in seconds without leaving the dashboard. |
+| Related pages | "Not a duplicate" hid the pair but left both pages unconnected. | **Link them** adds `See also: [[other]]` to both pages via the existing `/add-link` (no LLM), then hides the pair. | The "related but distinct" case gets a real fix, and orphan pages gain links. |
+| Oversized merges | Merging two big pages produced a cut-off draft. | `/consolidate` refuses to draft when both pages together exceed `CONSOLIDATE_MAX_INPUT_CHARS` (12,000, matching `max_tokens=3000`). The compare view disables Merge and says why. | Pages that can't be merged cleanly aren't offered for merging. |
+
+The compare view loads each page through the existing `GET /page/{name}`, so
+no new endpoint was needed. `/consolidation-candidates` now also returns
+`merge_max_chars`, so the UI and the server share one limit.
+
+Known limit, not caused by this change: at phone width the app's tab bar makes
+the page 565 px wide, so full-screen overlays (this one included) extend past a
+375 px screen. The Mac app and desktop are unaffected.

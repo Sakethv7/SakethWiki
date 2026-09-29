@@ -3790,20 +3790,23 @@ function NextUpSection({ pages, onOpen }) {
 
 // Deterministic duplicate finder (no LLM): similar slugs + shared concept text.
 // Weak pairs are included on purpose; real duplicates score ~0.45-0.57, so the
-// human decides each one. Merge previews an LLM draft via /consolidate before writing.
-function TidyUpSection({ onMerge, refreshKey }) {
+// human decides each one in the side-by-side compare view.
+function TidyUpSection({ onMerge, onOpenPage, refreshKey }) {
   const [pairs, setPairs] = useState(null);
+  const [mergeMax, setMergeMax] = useState(null);
+  const [comparing, setComparing] = useState(null);
 
   useEffect(() => {
     setPairs(null);
     api("/consolidation-candidates?limit=8&include_weak=true")
-      .then(d => setPairs(d.candidates || []))
+      .then(d => { setPairs(d.candidates || []); setMergeMax(d.merge_max_chars || null); })
       .catch(() => setPairs([]));
   }, [refreshKey]);
 
   function dismiss(pair) {
     // Hide it right away; the backend remembers it so it stays hidden.
     setPairs(prev => prev.filter(p => p !== pair));
+    setComparing(null);
     api("/consolidation-candidates/dismiss", { method: "POST", body: JSON.stringify({ source: pair.source, target: pair.target }) }).catch(() => {});
   }
 
@@ -3812,30 +3815,151 @@ function TidyUpSection({ onMerge, refreshKey }) {
     <div className="bg-white border border-stone-200 rounded-xl p-4">
       <div className="flex items-center justify-between mb-3">
         <h3 className="text-sm font-semibold text-stone-900">Tidy up · possible duplicates</h3>
-        <span className="text-[10px] text-stone-400">you decide each</span>
+        <span className="text-[10px] text-stone-400">compare, then decide</span>
       </div>
       {pairs === null ? (
         <p className="text-xs text-stone-400">Scanning for duplicates…</p>
       ) : (
         <div className="space-y-1">
           {pairs.map(pair => (
-            <div key={`${pair.source}->${pair.target}`} className="flex items-center gap-3 px-2 py-1.5 rounded-lg hover:bg-stone-50">
+            <button key={`${pair.source}->${pair.target}`} onClick={() => setComparing(pair)}
+              className="w-full flex items-center gap-3 px-2 py-1.5 rounded-lg hover:bg-stone-50 text-left group">
               <div className="flex-1 min-w-0">
-                <div className="text-sm text-stone-700 truncate">{pair.source} <span className="text-stone-400">→</span> {pair.target}</div>
+                <div className="text-sm text-stone-700 truncate group-hover:text-orange-600">{pair.source} <span className="text-stone-400">·</span> {pair.target}</div>
                 <div className="text-xs text-stone-400 truncate">{pair.reasons?.[0] === "weak overlap only" ? "similar names or wording" : pair.reasons?.join(" · ")} · {pair.score}</div>
               </div>
-              <button onClick={() => dismiss(pair)}
-                className="shrink-0 text-xs px-2 py-1.5 rounded-lg text-stone-400 hover:text-stone-700 hover:bg-stone-100">
-                Not a duplicate
-              </button>
-              <button onClick={() => onMerge(pair)}
-                className="shrink-0 text-xs font-medium px-3 py-1.5 rounded-lg border border-stone-200 text-stone-700 hover:bg-stone-100">
-                Merge…
-              </button>
-            </div>
+              <span className="shrink-0 text-xs font-medium px-3 py-1.5 rounded-lg border border-stone-200 text-stone-700 group-hover:bg-stone-100">Compare</span>
+            </button>
           ))}
         </div>
       )}
+      {comparing && (
+        <ComparePairModal pair={comparing} mergeMax={mergeMax}
+          onClose={() => setComparing(null)}
+          onOpenPage={name => { setComparing(null); onOpenPage(name); }}
+          onMerge={pair => { setComparing(null); onMerge(pair); }}
+          onDecided={dismiss} />
+      )}
+    </div>
+  );
+}
+
+const _plainLinks = text => (text || "").replace(/\[\[([^\]|]+)(\|[^\]]+)?\]\]/g, "$1");
+
+function ComparePane({ page, other }) {
+  if (!page) return <div className="text-xs text-stone-400 p-3">Loading…</div>;
+  if (page.error) return <div className="text-xs text-red-500 p-3">{page.error}</div>;
+  const p = page.parsed || {};
+  const firstBullets = (p.sections || []).flatMap(sec => sec.bullets || []).slice(0, 3);
+  const summary = p.current_understanding || firstBullets.join(" ");
+  const sectionTitles = (p.sections || []).map(sec => sec.title).filter(Boolean);
+  const untitled = (p.sections || []).length - sectionTitles.length;
+  const linksToOther = (page.content || "").includes(`[[${other}]]`);
+  return (
+    <div className="border border-stone-200 rounded-xl p-3 space-y-2 min-w-0">
+      <div>
+        <div className="text-sm font-semibold text-stone-900">{p.title || page.name}</div>
+        <div className="text-[11px] text-stone-400 break-all">{page.name}</div>
+      </div>
+      <div className="flex flex-wrap gap-x-3 gap-y-1 text-[11px] text-stone-500">
+        <span>{(page.content || "").length.toLocaleString()} chars</span>
+        <span>{(page.backlinks || []).length} pages link here</span>
+        <span>{(p.sections || []).length} section{(p.sections || []).length === 1 ? "" : "s"}</span>
+        {p.understanding_maturity != null && <span>maturity {p.understanding_maturity}</span>}
+        <span className={linksToOther ? "text-emerald-600" : ""}>{linksToOther ? "links to the other" : "doesn't link to the other"}</span>
+      </div>
+      <div>
+        <div className="text-[10px] uppercase tracking-wide text-stone-400">{p.current_understanding ? "Summary" : "First notes (no summary)"}</div>
+        <p className="text-xs text-stone-700 mt-0.5">{_plainLinks(summary) || "—"}</p>
+      </div>
+      <div>
+        <div className="text-[10px] uppercase tracking-wide text-stone-400">Sections</div>
+        <ul className="text-xs text-stone-700 mt-0.5 list-disc pl-4">
+          {sectionTitles.map((t, i) => <li key={i}>{t}</li>)}
+          {untitled > 0 && <li className="text-stone-400">{untitled} untitled</li>}
+        </ul>
+      </div>
+      {(p.tags || []).length > 0 && (
+        <div className="flex flex-wrap gap-1">{p.tags.map(t => <TagPill key={t} tag={t} />)}</div>
+      )}
+    </div>
+  );
+}
+
+function ComparePairModal({ pair, mergeMax, onClose, onOpenPage, onMerge, onDecided }) {
+  const [pages, setPages] = useState({});
+  const [linking, setLinking] = useState(false);
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    for (const name of [pair.source, pair.target]) {
+      api(`/page/${name}`)
+        .then(d => setPages(prev => ({ ...prev, [name]: d })))
+        .catch(e => setPages(prev => ({ ...prev, [name]: { name, error: e.message || "Failed to load" } })));
+    }
+  }, [pair.source, pair.target]);
+
+  const a = pages[pair.source], b = pages[pair.target];
+  const loaded = a && b && !a.error && !b.error;
+  const combined = loaded ? (a.content || "").length + (b.content || "").length : 0;
+  const tooBig = loaded && mergeMax && combined > mergeMax;
+
+  async function linkThem() {
+    // Related but distinct: connect both ways (no LLM), then stop suggesting the pair.
+    setLinking(true); setError("");
+    try {
+      for (const [from, to] of [[pair.source, pair.target], [pair.target, pair.source]]) {
+        await api("/add-link", { method: "POST", body: JSON.stringify({ from_page: from, to_page: to }) });
+      }
+      onDecided(pair);
+    } catch (e) { setError(e.message || "Linking failed"); setLinking(false); }
+  }
+
+  return (
+    <div className="fixed inset-0 bg-black/30 backdrop-blur-sm flex items-center justify-center z-50 p-4">
+      <div className="bg-white rounded-2xl shadow-xl border border-stone-200 p-5 w-full max-w-4xl max-h-[90vh] overflow-y-auto space-y-4">
+        <div className="flex items-center justify-between">
+          <h3 className="font-semibold text-stone-900">Same concept, related, or unrelated?</h3>
+          <button onClick={onClose} className="w-6 h-6 flex items-center justify-center text-stone-400 hover:text-stone-600 rounded-lg hover:bg-stone-100 text-xs">✕</button>
+        </div>
+
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+          {[[pair.source, pair.target], [pair.target, pair.source]].map(([name, other]) => (
+            <div key={name} className="space-y-1.5 min-w-0">
+              <ComparePane page={pages[name]} other={other} />
+              <button onClick={() => onOpenPage(name)} className="text-xs text-orange-600 hover:underline">Open full page →</button>
+            </div>
+          ))}
+        </div>
+
+        <div className="text-xs text-stone-500 space-y-0.5">
+          <p><span className="font-medium text-stone-700">Same concept</span>: you'd give them the same heading → Merge.</p>
+          <p><span className="font-medium text-stone-700">Related</span>: one is part of the other, or a neighbour → Link them.</p>
+          <p><span className="font-medium text-stone-700">Unrelated</span>: they only share words → Not a duplicate.</p>
+        </div>
+
+        {tooBig && (
+          <p className="text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2">
+            Too big to merge safely: {combined.toLocaleString()} characters together, limit {mergeMax.toLocaleString()}. The merged draft would be cut off. Link them instead, or trim one page first.
+          </p>
+        )}
+        {error && <p className="text-xs text-red-500">{error}</p>}
+
+        <div className="flex flex-wrap gap-2 justify-end">
+          <button onClick={() => onDecided(pair)} disabled={linking}
+            className="px-4 py-2 border border-stone-200 rounded-xl text-sm text-stone-600 hover:bg-stone-50">
+            Not a duplicate
+          </button>
+          <button onClick={linkThem} disabled={!loaded || linking}
+            className="px-4 py-2 border border-stone-300 rounded-xl text-sm text-stone-800 hover:bg-stone-100 disabled:opacity-40">
+            {linking ? "Linking…" : "Link them"}
+          </button>
+          <button onClick={() => onMerge(pair)} disabled={!loaded || tooBig || linking}
+            className="px-4 py-2 bg-orange-500 text-white rounded-xl text-sm font-medium hover:bg-orange-600 disabled:opacity-40">
+            Merge…
+          </button>
+        </div>
+      </div>
     </div>
   );
 }
@@ -3937,7 +4061,7 @@ function DashboardTab({ onOpenPage, onGoCapture }) {
       {/* Next up — the actionable section, so it leads */}
       <NextUpSection pages={nextUp} onOpen={onOpenPage} />
 
-      <TidyUpSection onMerge={setMergePair} refreshKey={tidyKey} />
+      <TidyUpSection onMerge={setMergePair} onOpenPage={onOpenPage} refreshKey={tidyKey} />
       {mergePair && (
         <ConsolidateModal force
           pages={[{ name: mergePair.source, title: mergePair.source }, { name: mergePair.target, title: mergePair.target }]}
