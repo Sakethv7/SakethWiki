@@ -4,8 +4,9 @@
 // (~/App Job Tracker/macapp/main.swift). All behaviour lives in the app
 // served from 127.0.0.1:5173 (Vite) with its API on 127.0.0.1:8001; this
 // bundle exists to give that page a Dock icon, an app identity, and a
-// window of its own instead of a browser tab among forty others. It holds
-// no application logic and stores no data.
+// window of its own instead of a browser tab among forty others. Its only
+// logic is the morning revision notification (see extension at the end);
+// the only thing it stores is the date it last sent one.
 //
 // It does NOT own the server. launch.sh starts and restarts the backend and
 // frontend directly (no launchd agent for this project). The one thing this
@@ -13,10 +14,17 @@
 // click is never a dead end.
 
 import Cocoa
+import UserNotifications
 import WebKit
 
 let dashboardURL = URL(string: "http://127.0.0.1:5173")!
 let healthURL = URL(string: "http://127.0.0.1:5173")!
+// Morning revision notification (see the extension at the end). Declared up
+// here on purpose: main.swift top-level constants initialize in file order,
+// and anything after the run loop starts would never be set (it crashed).
+let revisionNotifyMinute = 8 * 60 + 30
+let revisionSummaryURL = URL(string: "http://127.0.0.1:8001/revision/today?summary=1")!
+let lastNotifyKey = "lastRevisionNotify"
 
 // Baked in at build time so the installed bundle can find launch.sh
 // wherever the project lives. See build_macos_app.sh.
@@ -30,12 +38,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
     private var overlay: NSVisualEffectView!
     private var retryButton: NSButton!
     private var hasLoaded = false
+    private var revisionTimer: Timer?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         buildMenu()
         buildWindow()
         NSApp.activate(ignoringOtherApps: true)
         start()
+        startRevisionNotifications()
     }
 
     private func buildMenu() {
@@ -276,3 +286,88 @@ let delegate = AppDelegate()
 application.delegate = delegate
 application.setActivationPolicy(.regular)
 application.run()
+
+
+// MARK: - Morning revision notification
+//
+// Every 15 minutes: if it's past 08:30 local and nothing was sent today, ask
+// the backend for today's summary and post one notification. A coarse timer
+// (not an exact alarm) means a Mac asleep at 08:30 still notifies after
+// waking, and an app opened later that day notifies on launch.
+// See docs/daily-revision/.
+
+extension AppDelegate: UNUserNotificationCenterDelegate {
+    func startRevisionNotifications() {
+        let center = UNUserNotificationCenter.current()
+        center.delegate = self
+        center.requestAuthorization(options: [.alert, .sound]) { granted, error in
+            if let error = error { NSLog("SakethWiki notification permission error: \(error)") }
+            NSLog("SakethWiki notifications granted: \(granted)")
+        }
+        revisionTimer = Timer.scheduledTimer(withTimeInterval: 15 * 60, repeats: true) { [weak self] _ in
+            self?.maybeNotifyRevision()
+        }
+        // First check shortly after launch, once the backend has had a moment.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 20) { [weak self] in self?.maybeNotifyRevision() }
+    }
+
+    private func todayString() -> String {
+        let f = DateFormatter()
+        f.dateFormat = "yyyy-MM-dd"
+        return f.string(from: Date())
+    }
+
+    func maybeNotifyRevision() {
+        let now = Calendar.current.dateComponents([.hour, .minute], from: Date())
+        let minuteOfDay = (now.hour ?? 0) * 60 + (now.minute ?? 0)
+        let today = todayString()
+        guard minuteOfDay >= revisionNotifyMinute,
+              UserDefaults.standard.string(forKey: lastNotifyKey) != today else { return }
+
+        var request = URLRequest(url: revisionSummaryURL)
+        request.timeoutInterval = 30
+        URLSession.shared.dataTask(with: request) { data, response, _ in
+            // Never notify with empty content; the next tick retries.
+            guard let data = data,
+                  (response as? HTTPURLResponse)?.statusCode == 200,
+                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return }
+            let count = json["item_count"] as? Int ?? 0
+            let topic = (json["topic"] as? [String: Any])?["title"] as? String
+
+            let content = UNMutableNotificationContent()
+            content.title = topic.map { "Topic of the day: \($0)" } ?? "SakethWiki revision"
+            content.body = count > 0 ? "\(count) revision questions ready" : "Open today's revision"
+            content.sound = .default
+            let note = UNNotificationRequest(identifier: "revision-\(today)", content: content, trigger: nil)
+            UNUserNotificationCenter.current().add(note) { error in
+                if let error = error {
+                    NSLog("SakethWiki notification failed: \(error)")
+                } else {
+                    DispatchQueue.main.async { UserDefaults.standard.set(today, forKey: lastNotifyKey) }
+                }
+            }
+        }.resume()
+    }
+
+    // Show the banner even when SakethWiki is the frontmost app.
+    func userNotificationCenter(_ center: UNUserNotificationCenter,
+                                willPresent notification: UNNotification,
+                                withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void) {
+        completionHandler([.banner, .sound])
+    }
+
+    // Clicking the notification opens the Revise tab.
+    func userNotificationCenter(_ center: UNUserNotificationCenter,
+                                didReceive response: UNNotificationResponse,
+                                withCompletionHandler completionHandler: @escaping () -> Void) {
+        window.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+        if hasLoaded {
+            // Keep the page's state; the frontend listens for hashchange.
+            webView.evaluateJavaScript("window.location.hash = 'revise'", completionHandler: nil)
+        } else {
+            webView.load(URLRequest(url: URL(string: "http://127.0.0.1:5173/#revise")!))
+        }
+        completionHandler()
+    }
+}

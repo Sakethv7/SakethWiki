@@ -1,3 +1,4 @@
+import os
 import asyncio
 import json
 import sys
@@ -98,3 +99,15 @@ def test_writes_score_into_frontmatter(wiki):
     assert second > first
     assert text.count("understanding_maturity:") == 1
     assert f"understanding_maturity: {second}" in text
+
+
+def test_keeps_file_mtime_so_updated_sort_is_not_disturbed(wiki):
+    path = wiki / "cs" / "thin.md"
+    path.write_text(page(1, 1))
+    old = 1_700_000_000
+    os.utime(path, (old, old))
+
+    maturity("thin")
+
+    assert "understanding_maturity:" in path.read_text()
+    assert int(path.stat().st_mtime) == old

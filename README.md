@@ -67,7 +67,7 @@ OLLAMA_MODEL_VISION=qwen2.5vl:7b
 ```
 
 Task keys currently used in code include:
-`INGEST_EXTRACT`, `CHAT_ANSWER`, `INTERVIEW_VERIFY`, `INTERVIEW_GRADE`,
+`INGEST_EXTRACT`, `CHAT_ANSWER`, `REVISION_QUESTIONS`,
 `EVOLUTION_CLASSIFY`, `TAG_CLASSIFY`, `ANALYZE_TRACES`, `LINT_SCAN`,
 `LINT_JSON_FIX`, `CONSOLIDATE_PAGES`, `KNOWLEDGE_GAPS`.
 
@@ -217,6 +217,9 @@ cd frontend && npm run build
 | POST | `/consolidate` | Merge two concept pages into one. `dry_run: true` returns the draft; applying sends it back with page hashes and backs up both originals |
 | GET | `/consolidation-candidates` | Likely duplicate page pairs (no LLM). `include_weak=true` for the dashboard's Tidy up list |
 | POST | `/consolidation-candidates/dismiss` | Mark a pair as not a duplicate |
+| GET | `/attention` | Dashboard "Needs attention": contradictions, likely duplicates, and unlinked pages with their closest page (no LLM) |
+| GET | `/revision/today` | Today's revision set (seeded by date) and topic of the day. `summary=1` for the Mac notification |
+| POST | `/revision/rate` | Rate a revision card: forgot / shaky / knew; returns the next due date |
 | POST | `/ingest-text` | Ingest plain text directly (no URL fetch) |
 | POST | `/analyze-traces` | Run weekly self-learning analysis on approval traces |
 | GET | `/system-insights` | Return current system insights and prompt hints |
@@ -442,7 +445,7 @@ No request body needed. Displays in the **Dashboard** tab:
 - **Recall (`recall` block):** page reads, unique pages read, and chat/interview questions asked in the same 30-day period
 
 **Frontend visualization:**
-- Dashboard tab: "waiting" links (queue items, open threads), a Next up list (top 5 high-priority pages from `/review-queue`, each with a suggested action), four 30-day tiles (approved, pages read, questions asked, approval rate), and the activity heatmap
+- Dashboard tab: "waiting" links (queue items, open threads), a Needs attention card from `/attention` (contradictions, possible duplicates, unlinked pages, each opened in a side-by-side compare view), four 30-day tiles with trends vs the previous 30 days, and the activity heatmap
 - Capture metrics come from `_wiki/meta/traces.jsonl`. The `recall` block of `/dashboard-stats` counts page reads from `_wiki/meta/reads.jsonl` and chat/interview questions from `context_budget_logs.jsonl`. System health lives in the Operations tab.
 
 ---

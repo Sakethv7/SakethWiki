@@ -5,7 +5,7 @@ POST /ingest      — fetch URL / accept text/image, extract via routed LLM, sta
 GET  /queue       — list pending HITL items
 POST /approve/{id} — approve or reject a queued item
 POST /chat        — RAG chat over the SQLite memory index (keyword-scan fallback)
-POST /interview   — same retrieval as /chat; opt-in verifier + answer grader
+GET  /revision/today, POST /revision/rate — daily recall practice
 GET  /pages       — list all concept pages with metadata
 GET  /page/{name} — full content of a concept page
 """
@@ -19,7 +19,7 @@ import re as _re
 import shutil
 import time
 import uuid
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Optional
 
@@ -43,6 +43,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 import active_review
+import revision
 import consolidation
 import identity
 import llm_client
@@ -110,8 +111,8 @@ app.add_middleware(
 
 URL_SCRAPE_CHAR_LIMIT   = 5000   # max chars kept from fetched URL body
 URL_SCRAPE_LINK_LIMIT   = 20     # max external links scraped per page
-RAG_TOP_K               = int(os.environ.get("RAG_TOP_K", 5))          # top-k pages for chat/interview context
-RAG_CONTEXT_BUDGET      = int(os.environ.get("RAG_CONTEXT_BUDGET", 4000))  # chars of vault context injected into chat/interview
+RAG_TOP_K               = int(os.environ.get("RAG_TOP_K", 5))          # top-k pages for chat context
+RAG_CONTEXT_BUDGET      = int(os.environ.get("RAG_CONTEXT_BUDGET", 4000))  # chars of vault context injected into chat
 SELF_LEARN_TRACE_WINDOW = 100    # last N traces sent to Sonnet for weekly analysis
 LINT_CACHE_TTL_SECONDS  = 86400  # 24 h — lint report cache validity
 WEEKLY_ANALYSIS_INTERVAL_SECONDS = 3600  # scheduler checks every hour
@@ -259,20 +260,6 @@ class PreferenceReviewRequest(BaseModel):
     key: str
     value: str = ""
     status: str
-
-
-class InterviewRequest(BaseModel):
-    question: str
-    user_answer: Optional[str] = None
-    want_verification: bool = False
-
-
-class GapQueueRequest(BaseModel):
-    concept: str
-    gap: str
-    what_to_add: str
-    target_page: str
-    tags: list = []
 
 
 class SaveAnswerRequest(BaseModel):
@@ -2815,210 +2802,28 @@ async def add_chat_note(req: ChatNoteRequest):
     return {"success": True, "id": trace_id, "note_type": note_type, "target_pages": pages_read}
 
 
-# ── /interview ───────────────────────────────────────────────────────────────
+# ── /revision ────────────────────────────────────────────────────────────────
+# Daily recall practice (replaces /interview). See docs/daily-revision/.
 
-def _strip_code_fence(text: str) -> str:
-    text = text.strip()
-    if text.startswith("```"):
-        text = text[text.find("\n") + 1:]
-    if text.endswith("```"):
-        text = text[:text.rfind("```")]
-    return text.strip()
+class RateRequest(BaseModel):
+    slug: str
+    rating: str   # forgot | shaky | knew
 
 
-def _run_verifier(question: str, wiki_answer: str) -> dict:
-    prompt = (
-        f"Interview question: {question}\n\n"
-        f"Knowledge base answer:\n{wiki_answer}\n\n"
-        "Evaluate this answer for interview-readiness. "
-        "Return ONLY valid JSON with no markdown fences:\n"
-        '{\n'
-        '  "score": <integer 1-10>,\n'
-        '  "verdict": "<one sentence>",\n'
-        '  "gaps": [\n'
-        '    {\n'
-        '      "concept": "<short concept name>",\n'
-        '      "gap": "<what is missing>",\n'
-        '      "what_to_add": "<the actual knowledge to add, 1-2 sentences>",\n'
-        '      "target_page": "<wiki page slug, e.g. kv-cache>"\n'
-        '    }\n'
-        '  ]\n'
-        '}'
-    )
-    raw = llm_client.complete(
-        task="interview_verify",
-        model=None,
-        max_tokens=1000,
-        messages=[{"role": "user", "content": prompt}],
-        expect_json=True,
-        required_json_keys=["score", "verdict", "gaps"],
-    )
-    return json.loads(_strip_code_fence(raw))
+# Plain def: reads every page to pick the set; runs in the threadpool.
+@app.get("/revision/today")
+def revision_today(summary: bool = False):
+    return revision.today_view(date.today(), summary=summary)
 
 
-def _run_grader(question: str, wiki_answer: str, user_answer: str) -> dict:
-    prompt = (
-        f"Interview question: {question}\n\n"
-        f"Reference answer:\n{wiki_answer}\n\n"
-        f"Candidate's answer:\n{user_answer}\n\n"
-        "Grade the candidate's answer. "
-        "Return ONLY valid JSON with no markdown fences:\n"
-        '{\n'
-        '  "score": <integer 1-10>,\n'
-        '  "what_you_got_right": ["<point>"],\n'
-        '  "what_you_missed": ["<point>"],\n'
-        '  "feedback": "<2-3 sentence assessment>"\n'
-        '}'
-    )
-    raw = llm_client.complete(
-        task="interview_grade",
-        model=None,
-        max_tokens=800,
-        messages=[{"role": "user", "content": prompt}],
-        expect_json=True,
-        required_json_keys=["score", "what_you_got_right", "what_you_missed", "feedback"],
-    )
-    return json.loads(_strip_code_fence(raw))
-
-
-@app.post("/interview")
-async def interview(req: InterviewRequest):
-    if not req.question or not req.question.strip():
-        raise HTTPException(400, "question cannot be empty")
-
-    loop = asyncio.get_event_loop()
-
-    # Stage 1: RAG — identical retrieval path to /chat (SQLite memory index,
-    # keyword scan as the single fallback). No per-call vault scan, no LLM
-    # page-selection step.
-    memory_hits = []
-    try:
-        memory_hits = await loop.run_in_executor(
-            None, memory_store.search, req.question, RAG_TOP_K
-        )
-    except Exception as e:
-        logger.warning("interview memory search failed; falling back to keyword match: %s", e)
-
-    relevant_names = [hit["page_name"] for hit in memory_hits]
-    if not relevant_names:
-        relevant_names = await loop.run_in_executor(
-            None, vault_reader.find_relevant_pages, req.question
-        )
-
-    pages_content = vault_reader.read_pages_content(relevant_names[:RAG_TOP_K])
-    context_parts = []
-    n_pages = len(pages_content)
-    per_page = RAG_CONTEXT_BUDGET // n_pages if n_pages else RAG_CONTEXT_BUDGET
-    for name, content in pages_content.items():
-        body = _strip_frontmatter(content)
-        context_parts.append(f"=== [[{name}]] ===\n{body[:per_page]}")
-    context = "\n\n".join(context_parts) if context_parts else "No matching pages found yet."
-
-    index_content = vault_reader.read_index()
-    system_block = [
-        {
-            "type": "text",
-            "text": (
-                "You are Saketh's personal AI knowledge assistant for interview preparation.\n\n"
-                "Answer the interview question using the wiki pages below. "
-                "Be structured and thorough — cover key concepts, mechanisms, and tradeoffs. "
-                "Content may span CS, DSA, system design, AI/ML, humanities, or science. "
-                "If the wiki is missing something important, note it at the end.\n\n"
-                f"Wiki index:\n{index_content[:800]}"
-            ),
-            "cache_control": {"type": "ephemeral"},
-        }
-    ]
-    user_content = [
-        {"type": "text", "text": f"Relevant wiki pages:\n{context}", "cache_control": {"type": "ephemeral"}},
-        {"type": "text", "text": f"Interview question: {req.question}"},
-    ]
-
-    wiki_answer = llm_client.complete(
-        task="chat_answer",
-        model=None,
-        max_tokens=1500,
-        system=system_block,
-        messages=[{"role": "user", "content": user_content}],
-    )
-
-    # Record the practice rep as trace + telemetry so the weekly self-learning
-    # analysis and the system evals can see interview activity. Best-effort —
-    # a logging failure must never block the answer.
-    had_user_answer = bool(req.user_answer and req.user_answer.strip())
-    try:
-        _append_trace({
-            "id": f"interview-{uuid.uuid4().hex[:12]}",
-            "ts": datetime.now().isoformat(),
-            "event_type": "interview",
-            "question": req.question.strip()[:1000],
-            "pages_read": relevant_names[:RAG_TOP_K],
-            "want_verification": req.want_verification,
-            "had_user_answer": had_user_answer,
-            "source_type": "interview",
-        })
-    except Exception as e:
-        logger.warning("interview trace write failed: %s", e)
-    try:
-        telemetry.log_context_event("interview_context", {
-            "task": "interview",
-            "query": req.question,
-            "memory_hits": len(memory_hits),
-            "pages_read": relevant_names[:RAG_TOP_K],
-            "context_chars_used": len(context),
-            "context_budget": RAG_CONTEXT_BUDGET,
-        })
-    except Exception as e:
-        logger.warning("interview telemetry write failed: %s", e)
-
-    # Stage 2: Verify — opt-in. Runs only when the user asked to be graded.
-    verification = None
-    if req.want_verification:
-        try:
-            verification = await loop.run_in_executor(
-                None, _run_verifier, req.question, wiki_answer
-            )
-        except Exception as e:
-            logger.warning("Interview verifier failed: %s", e)
-            verification = {"score": None, "verdict": "Verification unavailable", "gaps": []}
-
-    # Stage 3: Grade user's own answer if provided
-    user_grading = None
-    if had_user_answer:
-        try:
-            user_grading = await loop.run_in_executor(
-                None, _run_grader, req.question, wiki_answer, req.user_answer
-            )
-        except Exception as e:
-            logger.warning("Interview grader failed: %s", e)
-            user_grading = {"score": None, "feedback": "Grading unavailable", "what_you_got_right": [], "what_you_missed": []}
-
-    return {
-        "wiki_answer": wiki_answer,
-        "pages_read": relevant_names,
-        **({"verification": verification} if verification is not None else {}),
-        **({"user_grading": user_grading} if user_grading is not None else {}),
-    }
-
-
-@app.post("/queue-gap")
-async def queue_gap(req: GapQueueRequest):
-    """Stage a single knowledge gap from interview mode to the HITL queue."""
-    item = {
-        "id": str(uuid.uuid4()),
-        "source_type": "gap_fill",
-        "title": f"Gap: {req.concept}",
-        "suggested_page": req.target_page or _slug_text(req.concept),
-        "key_concepts": [req.concept],
-        "summary": [req.what_to_add],
-        "tags": req.tags,
-        "url": None,
-        "raw_text": f"Gap from interview practice:\n\n{req.gap}\n\nTo add:\n{req.what_to_add}",
-        "timestamp": datetime.utcnow().isoformat(),
-        "pending_extraction": False,
-    }
-    queue_manager.enqueue(item)
-    return {"id": item["id"], "status": "queued"}
+@app.post("/revision/rate")
+def revision_rate(req: RateRequest):
+    if req.rating not in revision.RATINGS:
+        raise HTTPException(422, f"rating must be one of {', '.join(revision.RATINGS)}")
+    if not vault_reader.read_page(req.slug):
+        raise HTTPException(404, f"Page '{req.slug}' not found")
+    due = revision.append_rating(req.slug, req.rating, date.today())
+    return {"success": True, "next_due": due.isoformat()}
 
 
 # ── /pages ───────────────────────────────────────────────────────────────────
@@ -3294,6 +3099,7 @@ def _recall_stats(
     now: Optional[datetime] = None,
     period_days: int = 30,
     until: Optional[datetime] = None,
+    revision_log: Optional[list[dict]] = None,
 ) -> dict:
     """Recall side of the loop: page reads and questions asked in the period."""
     now = now or datetime.now()
@@ -3317,11 +3123,13 @@ def _recall_stats(
         if field and in_window(ts):
             counts[field] += 1
 
+    revisions = sum(1 for row in (revision_log or []) if in_window(_parse_iso_datetime(row.get("ts"))))
     return {
         "pages_read": len(read_pages),
         "unique_pages_read": len(set(read_pages)),
         "questions_asked": sum(counts.values()),
         **counts,
+        "revisions": revisions,
     }
 
 
@@ -3362,17 +3170,20 @@ async def get_dashboard_stats():
     now = datetime.now()
     stats = _dashboard_stats_from_traces(traces, now=now)
     period = stats["period_days"]
-    stats["recall"] = _recall_stats(reads, context_events, now=now, period_days=period)
+    revision_log = revision.read_log()
+    stats["recall"] = _recall_stats(reads, context_events, now=now, period_days=period, revision_log=revision_log)
 
     # Same-length window just before the current one, for trend arrows.
     prev_end = now - timedelta(days=period)
     prev = _dashboard_stats_from_traces(traces, now=prev_end, period_days=period, until=prev_end)
-    prev_recall = _recall_stats(reads, context_events, now=prev_end, period_days=period, until=prev_end)
+    prev_recall = _recall_stats(reads, context_events, now=prev_end, period_days=period, until=prev_end,
+                                revision_log=revision_log)
     stats["previous"] = {
         "total_approved": prev["total_approved"],
         "approval_rate": prev["approval_rate"],
         "pages_read": prev_recall["pages_read"],
         "questions_asked": prev_recall["questions_asked"],
+        "revisions": prev_recall["revisions"],
     }
     return stats
 
@@ -3879,6 +3690,43 @@ def consolidation_candidates(limit: int = 50, include_weak: bool = False):
     """Return conservative duplicate/merge candidates without mutating the vault."""
     candidates = consolidation.find_candidates(limit=limit, include_weak=include_weak)
     return {"candidates": candidates, "total": len(candidates), "merge_max_chars": CONSOLIDATE_MAX_INPUT_CHARS}
+
+
+# Plain def: runs the pair scorer (~2s); FastAPI runs it in a worker thread.
+@app.get("/attention")
+def attention(pairs_limit: int = 8, orphans_limit: int = 8):
+    """Dashboard "Needs attention": contradictions, likely duplicate pairs, and
+    unlinked pages each paired with their closest page. No LLM."""
+    review = active_review.build_queue(limit=200, min_priority="low")
+    contradictions = [
+        {"name": p["name"], "folder": p.get("folder"), "reasons": p["reasons"]}
+        for p in review if any("conflict marker" in r for r in p["reasons"])
+    ]
+    pairs = consolidation.find_candidates(limit=pairs_limit, include_weak=True)
+    in_pairs = {slug for c in pairs for slug in (c["source"], c["target"])}
+    unlinked = [
+        p for p in review
+        if p["priority"] == "high" and "no backlinks" in p["reasons"] and p["name"] not in in_pairs
+    ]
+    partners = consolidation.best_partners(
+        [p["name"] for p in unlinked[:orphans_limit]],
+        exclude_pairs={consolidation._pair_key(c["source"], c["target"]) for c in pairs},
+    )
+    orphans = [
+        {**partners[p["name"]], "source": p["name"], "folder": p.get("folder")}
+        for p in unlinked[:orphans_limit] if p["name"] in partners
+    ]
+    return {
+        "contradictions": contradictions,
+        "pairs": pairs,
+        "orphans": orphans,
+        "counts": {
+            "contradictions": len(contradictions),
+            "pairs": len(pairs),
+            "unlinked_total": len(unlinked),
+        },
+        "merge_max_chars": CONSOLIDATE_MAX_INPUT_CHARS,
+    }
 
 
 @app.post("/consolidation-candidates/dismiss")
@@ -5043,8 +4891,11 @@ async def calculate_maturity(page_name: str):
 
     new_content = content.replace(fm_match.group(0), f"---\n{new_fm}\n---\n")
 
-    # Atomic write
+    # Atomic write. Keep the file's mtime: a score is metadata, not an edit,
+    # and Browse's "Updated" sort and Recent folder order by mtime.
+    original_stat = page_path.stat()
     _atomic_write_path(page_path, new_content)
+    os.utime(page_path, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
 
     return {
         "success": True,

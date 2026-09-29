@@ -312,3 +312,84 @@ no new endpoint was needed. `/consolidation-candidates` now also returns
 Known limit, not caused by this change: at phone width the app's tab bar makes
 the page 565 px wide, so full-screen overlays (this one included) extend past a
 375 px screen. The Mac app and desktop are unaffected.
+
+## Round 4 (2026-09-29): one "Needs attention" card, and tabs that keep their state
+
+### Plain summary
+
+| | Before | Change | Fixes |
+|---|---|---|---|
+| Two lists | "Next up" (113 pages, the same generic advice, no action on the dashboard) and "Tidy up" (duplicate pairs, actionable). Browse's "Review" button shows the same list as Next up, mislabelled "not reviewed in 30+ days". | One **Needs attention** card with three groups, in order: pages with contradictions → possible duplicates → pages with no links, each paired with its closest page. Browse's Review label is corrected. | One list, and every item can be acted on from the dashboard. |
+| Tabs | Leaving a tab removed it from the screen. Chat conversations, compare views and Browse positions were lost on every switch. | All tabs stay mounted; only the visible one is shown. | You can go to Browse and come back to Chat or the Dashboard where you left off. |
+
+### Needs attention: where each group comes from
+
+All three groups come from one new read-only endpoint, `GET /attention`, which
+composes existing deterministic code (no LLM):
+
+1. **Contradictions:** pages from `active_review.build_queue` whose reasons
+   include an unresolved conflict marker. Action: read it in place, then
+   open in Browse to edit.
+2. **Possible duplicates:** `consolidation.find_candidates(include_weak=True)`,
+   top 8. Action: the compare view (Merge / Link them / Not a duplicate).
+3. **Pages with no links:** high-priority pages whose reasons include "no
+   backlinks", excluding pages already in a duplicate pair. Each is paired with
+   its best-scoring other page using the same pair scorer, skipping dismissed
+   pairs. Action: the same compare view, where "Link them" is the usual answer.
+   Linking gives the page a backlink, so it drops off the list. Dismissing
+   moves it to its next-best match.
+
+```mermaid
+flowchart LR
+  AR[active_review.build_queue] --> C[contradictions]
+  AR --> O[pages with no links]
+  FC[consolidation.find_candidates] --> D[duplicate pairs]
+  O --> P[best partner per page\n(_pair_score, cached)]
+  C --> A[GET /attention]
+  D --> A
+  P --> A
+  A --> UI[Needs attention card]
+```
+
+*Caption: one endpoint, three groups, all from code that already existed.
+The pair scorer's per-run caches make scoring each orphan against every page
+cheap.*
+
+The 34 "thin summary / review the understanding block" items are not shown on
+the dashboard. They mean writing work, and Browse's Review filter still lists them.
+
+### Tabs stay mounted: side effects handled
+
+Keeping every tab mounted changes two behaviours that relied on a tab
+unmounting:
+
+- **Read logging.** Browse logged an open page's read when it unmounted. It
+  now receives an `active` prop. Becoming inactive logs the read; becoming
+  active again restarts the timer for the page still open.
+- **Dashboard freshness.** The dashboard loaded once on mount. It now reloads
+  each time it becomes active, so its numbers are never stale.
+
+Background polling in hidden tabs (the queue every 10 s, the Browse page list
+every 10 s) keeps running. Each is a small local request, so this was accepted.
+
+### ADR-9: One card composed server-side, not three client fetches
+
+**Choice:** a single `GET /attention` endpoint instead of the dashboard
+calling `/review-queue` and `/consolidation-candidates` and pairing orphans
+in the browser. Pairing an orphan needs the pair scorer, which lives in Python.
+
+**Given up:** `/attention` takes about as long as the duplicate scan (~2 s),
+so the whole card appears at once rather than in two steps.
+
+### ADR-10: Keep tabs mounted rather than persisting each tab's state
+
+**Options:** (A) persist each tab's state (chat messages, compare pair, Browse
+selection) to storage and restore it; (B) keep all tabs mounted and hide the
+inactive ones.
+
+**Choice: B.** It fixes every tab at once, including state nobody has listed
+yet, with one change in `App`.
+
+**Given up:** memory and background work. All tabs exist from startup and
+their pollers keep running while hidden. State is also not kept across an app
+restart. Option A would survive restarts, but it needs code per tab.

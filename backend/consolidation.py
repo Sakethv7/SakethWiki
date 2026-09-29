@@ -161,6 +161,30 @@ def find_candidates(limit: int = 50, include_weak: bool = False) -> list[dict]:
     return candidates[: max(1, min(limit, 200))]
 
 
+def best_partners(slugs_to_pair: list[str], exclude_pairs: set[tuple[str, str]] = frozenset()) -> dict[str, dict]:
+    """For each slug, the most similar other concept page by the same pair
+    score, skipping dismissed pairs and `exclude_pairs`. Used to turn "this
+    page has no links" into a concrete "link it to X?" decision."""
+    _page_text.cache_clear()
+    _canonical.cache_clear()
+    all_slugs = sorted({p["name"] for p in vault_reader.list_concept_pages()})
+    skip = load_dismissed() | set(exclude_pairs)
+    partners: dict[str, dict] = {}
+    for slug in slugs_to_pair:
+        best = None
+        for other in all_slugs:
+            if other == slug or _pair_key(slug, other) in skip:
+                continue
+            pair = _pair_score(slug, other)
+            if pair["target"] == slug:
+                continue
+            if best is None or pair["score"] > best["score"]:
+                best = pair
+        if best:
+            partners[slug] = best
+    return partners
+
+
 def validate_pair(source: str, target: str) -> dict:
     _page_text.cache_clear()
     _canonical.cache_clear()

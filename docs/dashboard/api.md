@@ -191,3 +191,41 @@ Errors: `409` when a page changed after the preview. `400`, `404` as before.
 - New frontend components: `ComparePairModal({ pair, mergeMax, onClose,
   onOpenPage, onMerge, onDecided })` and `ComparePane({ page, other })`.
   "Link them" calls `POST /add-link` in both directions, then dismisses the pair.
+
+## Round 4 additions
+
+### `GET /attention` (new, read-only, no LLM)
+
+Query: `pairs_limit` (default 8), `orphans_limit` (default 8).
+
+```json
+{
+  "contradictions": [{ "name": "ai-failure-mode-diagnostics", "folder": "cs", "reasons": ["…conflict marker(s)"] }],
+  "pairs":   [{ "source", "target", "score", "confidence", "reasons" }],
+  "orphans": [{ "source", "target", "score", "reasons", "folder" }],
+  "counts":  { "contradictions": 1, "pairs": 8, "unlinked_total": 72 },
+  "merge_max_chars": 12000
+}
+```
+
+Invariants: a page in `pairs` is never also listed in `orphans`, and an
+orphan's partner is never a dismissed pair. Typical latency is about 3 s on
+215 pages, running in a worker thread.
+
+### `consolidation.best_partners(slugs, exclude_pairs) -> {slug: pair}` (new)
+
+Best-scoring other page for each slug, using `_pair_score`, skipping
+dismissed pairs and `exclude_pairs`.
+
+### Frontend
+
+- `NeedsAttentionSection({ onMerge, onOpenPage, refreshKey })` replaces
+  `NextUpSection` and `TidyUpSection`.
+- `ComparePairModal` takes `kind: "duplicate" | "unlinked"`, which changes the
+  heading and turns "Not a duplicate" into "Not related".
+- `PageReaderModal({ name, onClose, onOpenPage })` reads a page in place.
+- `DashboardTab` and `BrowseTab` take `active: boolean`. All tabs stay mounted.
+- `BrowseTab`'s `openTarget` effect depends on the object, so each request
+  re-fires, including reopening the same page.
+- Reads under 2 s are not logged on any path (Back, page switch, leaving the
+  tab, unload).
