@@ -16,13 +16,6 @@ def _vault() -> Path:
     """Read VAULT_PATH fresh every call — never cached at import time."""
     return Path(os.environ.get("VAULT_PATH", _DEFAULT_VAULT))
 
-# Keep these as properties for backwards compat with code that imports them directly
-@property
-def VAULT_PATH(): return _vault()  # noqa — module-level property not supported; use _vault()
-
-WIKI_DIR     = property(lambda: _vault() / "_wiki")   # not usable as module attr
-CONCEPTS_DIR = property(lambda: _vault() / "_wiki" / "concepts")
-INDEX_PATH   = property(lambda: _vault() / "_wiki" / "index.md")
 
 def _dirs():
     wiki = _vault() / "_wiki"
@@ -49,11 +42,6 @@ def _concept_dirs() -> list:
         wiki / "science",
     ]
 
-# Keep VAULT_PATH/WIKI_DIR/CONCEPTS_DIR/INDEX_PATH usable as simple names
-VAULT_PATH   = _vault()
-WIKI_DIR     = VAULT_PATH / "_wiki"
-CONCEPTS_DIR = WIKI_DIR / "cs"
-INDEX_PATH   = WIKI_DIR / "index.md"
 
 
 def list_pages_in_folder(folder: str = "concepts") -> list[dict]:

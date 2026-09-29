@@ -31,12 +31,6 @@ if _env_path.exists():
 import identity
 import llm_client
 
-VAULT_PATH   = Path(os.environ.get("VAULT_PATH", "/Users/sakethv7/SakethVault"))
-CONCEPTS_DIR = VAULT_PATH / "_wiki" / "concepts"
-SOURCES_DIR  = VAULT_PATH / "_wiki" / "sources"
-INDEX_PATH   = VAULT_PATH / "_wiki" / "index.md"
-LOG_PATH     = VAULT_PATH / "_wiki" / "log.md"
-
 EVOLUTION_TYPES = ("extends", "refines", "supersedes", "duplicates", "contradicts")
 
 # Tags that signal a domain — used to route pages to the right subfolder

@@ -3204,8 +3204,10 @@ def _compact_trace(trace: dict) -> dict:
     return {k: trace[k] for k in _ANALYSIS_TRACE_FIELDS if k in trace}
 
 
+# Plain def: one ~30s blocking LLM call. As async def it froze every other
+# request for that long, both on "Run analysis" and on the weekly schedule.
 @app.post("/analyze-traces")
-async def analyze_traces():
+def analyze_traces():
     """
     Read traces.jsonl, send to Sonnet, write findings + prompt hints to
     _wiki/meta/system-insights.md. Returns the written insights.
@@ -5083,7 +5085,7 @@ async def _weekly_analysis_scheduler():
             if _analysis_due(insights_path, traces_path, last_attempt, datetime.now()):
                 last_attempt = datetime.now()
                 try:
-                    await analyze_traces()
+                    await asyncio.to_thread(analyze_traces)
                 except Exception as _e:
                     logger.warning("weekly trace analysis failed; next attempt in 24h: %s", _e)
 
