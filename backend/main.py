@@ -116,6 +116,9 @@ SELF_LEARN_TRACE_WINDOW = 100    # last N traces sent to Sonnet for weekly analy
 LINT_CACHE_TTL_SECONDS  = 86400  # 24 h — lint report cache validity
 WEEKLY_ANALYSIS_INTERVAL_SECONDS = 3600  # scheduler checks every hour
 ANALYSIS_RETRY_BACKOFF_SECONDS = 86400   # after an attempt (pass or fail), wait a day before retrying
+# The merge draft is capped at max_tokens=3000 (~12K chars). Larger combined
+# inputs would come back cut off, so /consolidate refuses to draft them.
+CONSOLIDATE_MAX_INPUT_CHARS = 12000
 SOURCE_VERDICTS = {"ingest", "source_only", "reject"}
 KNOWLEDGE_SHAPES = {"taxonomy", "mechanism", "architecture", "argument", "case_study", "none"}
 CHAT_NOTE_TYPES = {"correction", "contradiction", "example", "nuance"}
@@ -3875,7 +3878,7 @@ def review_queue(limit: int = 50, min_priority: str = "low"):
 def consolidation_candidates(limit: int = 50, include_weak: bool = False):
     """Return conservative duplicate/merge candidates without mutating the vault."""
     candidates = consolidation.find_candidates(limit=limit, include_weak=include_weak)
-    return {"candidates": candidates, "total": len(candidates)}
+    return {"candidates": candidates, "total": len(candidates), "merge_max_chars": CONSOLIDATE_MAX_INPUT_CHARS}
 
 
 @app.post("/consolidation-candidates/dismiss")
@@ -4775,6 +4778,13 @@ def consolidate(req: ConsolidateRequest):
             raise HTTPException(409, "A page changed since the preview. Preview the merge again.")
         merged = req.merged
     else:
+        input_chars = len(source_content) + len(target_content)
+        if input_chars > CONSOLIDATE_MAX_INPUT_CHARS:
+            raise HTTPException(
+                413,
+                f"These pages are too big to merge safely ({input_chars:,} characters; "
+                f"limit {CONSOLIDATE_MAX_INPUT_CHARS:,}). The merged draft would be cut off.",
+            )
         merged = _draft_merge(source, target, source_content, target_content)
 
     if req.dry_run:

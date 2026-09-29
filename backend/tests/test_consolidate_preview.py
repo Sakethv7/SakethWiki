@@ -74,3 +74,12 @@ def test_dismissed_pair_is_hidden_in_either_order(monkeypatch, tmp_path):
     assert consolidation.find_candidates(include_weak=True)
     consolidation.dismiss_pair("data-prep-ml", "data-prep-genai")
     assert consolidation.find_candidates(include_weak=True) == []
+
+
+def test_refuses_to_draft_pages_too_big_to_merge(vault, monkeypatch):
+    root, calls = vault
+    (root / "_wiki" / "cs" / "old-page.md").write_text("x" * (main.CONSOLIDATE_MAX_INPUT_CHARS + 1), encoding="utf-8")
+    with pytest.raises(HTTPException) as exc:
+        main.consolidate(request(dry_run=True))
+    assert exc.value.status_code == 413
+    assert calls == []                                        # no LLM call made

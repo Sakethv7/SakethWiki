@@ -181,3 +181,13 @@ Errors: `409` when a page changed after the preview. `400`, `404` as before.
 - `TidyUpSection` rows have a "Not a duplicate" button.
 - `DashboardTab` tiles render `current − previous` under each value when
   `previous` exists.
+
+## Round 3 additions
+
+- `GET /consolidation-candidates` response adds `merge_max_chars` (int).
+- `POST /consolidate` without `merged` returns **413** when the two pages
+  together exceed `CONSOLIDATE_MAX_INPUT_CHARS` (12,000 characters). No LLM
+  call is made.
+- New frontend components: `ComparePairModal({ pair, mergeMax, onClose,
+  onOpenPage, onMerge, onDecided })` and `ComparePane({ page, other })`.
+  "Link them" calls `POST /add-link` in both directions, then dismisses the pair.
