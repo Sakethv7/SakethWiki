@@ -32,3 +32,26 @@ def test_each_slug_resolved_and_parsed_once_per_run(monkeypatch):
     # A second run clears the caches, so edits between runs are picked up.
     consolidation.find_candidates(include_weak=True)
     assert set(resolved.values()) == {2}
+
+
+def _fake_vault(monkeypatch, tmp_path, texts):
+    monkeypatch.setenv("VAULT_PATH", str(tmp_path))
+    monkeypatch.setattr(consolidation.vault_reader, "list_concept_pages", lambda: [{"name": s} for s in texts])
+    monkeypatch.setattr(consolidation.identity, "duplicate_candidates", lambda _s: [])
+    monkeypatch.setattr(consolidation.identity, "resolve_slug", lambda s: s)
+    monkeypatch.setattr(consolidation.vault_reader, "parse_concept_page",
+                        lambda s: {"title": s, "current_understanding": texts[s], "tags": []})
+
+
+def test_best_partner_picks_closest_and_skips_dismissed(monkeypatch, tmp_path):
+    _fake_vault(monkeypatch, tmp_path, {
+        "memory-agents": "agents with long term memory stores",
+        "memory-augmented-agents": "agents augmented with long term memory",
+        "gpu-kernels": "cuda kernels and warps",
+    })
+    best = consolidation.best_partners(["memory-agents"])
+    assert best["memory-agents"]["target"] == "memory-augmented-agents"
+
+    consolidation.dismiss_pair("memory-agents", "memory-augmented-agents")
+    best = consolidation.best_partners(["memory-agents"])
+    assert best["memory-agents"]["target"] == "gpu-kernels"   # next-best once dismissed

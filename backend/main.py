@@ -3881,6 +3881,43 @@ def consolidation_candidates(limit: int = 50, include_weak: bool = False):
     return {"candidates": candidates, "total": len(candidates), "merge_max_chars": CONSOLIDATE_MAX_INPUT_CHARS}
 
 
+# Plain def: runs the pair scorer (~2s); FastAPI runs it in a worker thread.
+@app.get("/attention")
+def attention(pairs_limit: int = 8, orphans_limit: int = 8):
+    """Dashboard "Needs attention": contradictions, likely duplicate pairs, and
+    unlinked pages each paired with their closest page. No LLM."""
+    review = active_review.build_queue(limit=200, min_priority="low")
+    contradictions = [
+        {"name": p["name"], "folder": p.get("folder"), "reasons": p["reasons"]}
+        for p in review if any("conflict marker" in r for r in p["reasons"])
+    ]
+    pairs = consolidation.find_candidates(limit=pairs_limit, include_weak=True)
+    in_pairs = {slug for c in pairs for slug in (c["source"], c["target"])}
+    unlinked = [
+        p for p in review
+        if p["priority"] == "high" and "no backlinks" in p["reasons"] and p["name"] not in in_pairs
+    ]
+    partners = consolidation.best_partners(
+        [p["name"] for p in unlinked[:orphans_limit]],
+        exclude_pairs={consolidation._pair_key(c["source"], c["target"]) for c in pairs},
+    )
+    orphans = [
+        {**partners[p["name"]], "source": p["name"], "folder": p.get("folder")}
+        for p in unlinked[:orphans_limit] if p["name"] in partners
+    ]
+    return {
+        "contradictions": contradictions,
+        "pairs": pairs,
+        "orphans": orphans,
+        "counts": {
+            "contradictions": len(contradictions),
+            "pairs": len(pairs),
+            "unlinked_total": len(unlinked),
+        },
+        "merge_max_chars": CONSOLIDATE_MAX_INPUT_CHARS,
+    }
+
+
 @app.post("/consolidation-candidates/dismiss")
 def dismiss_consolidation_candidate(req: DismissPairRequest):
     """Remember that two pages are not duplicates so the pair stops appearing."""
@@ -5043,8 +5080,11 @@ async def calculate_maturity(page_name: str):
 
     new_content = content.replace(fm_match.group(0), f"---\n{new_fm}\n---\n")
 
-    # Atomic write
+    # Atomic write. Keep the file's mtime: a score is metadata, not an edit,
+    # and Browse's "Updated" sort and Recent folder order by mtime.
+    original_stat = page_path.stat()
     _atomic_write_path(page_path, new_content)
+    os.utime(page_path, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
 
     return {
         "success": True,

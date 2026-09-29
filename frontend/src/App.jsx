@@ -3135,7 +3135,7 @@ const FOLDERS = [
   { key: "open-threads", label: "🔍 Threads" },
 ];
 
-function BrowseTab({ openTarget }) {
+function BrowseTab({ openTarget, active = true }) {
   const [folder, setFolder] = useState("cs");
   const [pages, setPages] = useState([]);
   const [pagesError, setPagesError] = useState(false);
@@ -3243,18 +3243,30 @@ function BrowseTab({ openTarget }) {
   // unloaded; otherwise only page-to-page and Back navigation logged reads.
   // Sub-2s opens are skipped: they aren't reads, and StrictMode's dev-only
   // mount/unmount/mount would otherwise log a 0s read for every opened page.
-  useEffect(() => {
-    function flushReads() {
-      for (const [page, start] of Object.entries(_readStartRef.current)) {
-        const dur = Math.round((Date.now() - start) / 1000);
-        if (dur < 2) continue;
-        api("/log-read", { method: "POST", keepalive: true, body: JSON.stringify({ page, duration_seconds: dur }) }).catch(() => {});
-      }
-      _readStartRef.current = {};
+  function flushReads() {
+    for (const [page, start] of Object.entries(_readStartRef.current)) {
+      const dur = Math.round((Date.now() - start) / 1000);
+      if (dur < 2) continue;
+      api("/log-read", { method: "POST", keepalive: true, body: JSON.stringify({ page, duration_seconds: dur }) }).catch(() => {});
     }
+    _readStartRef.current = {};
+  }
+
+  useEffect(() => {
     window.addEventListener("pagehide", flushReads);
     return () => { window.removeEventListener("pagehide", flushReads); flushReads(); };
   }, []);
+
+  // Browse stays mounted when another tab is shown: leaving the tab ends the
+  // read; coming back to a still-open page starts a new one.
+  const selectedRef = useRef(null);
+  selectedRef.current = selected;
+  useEffect(() => {
+    if (!active) flushReads();
+    else if (selectedRef.current && !_readStartRef.current[selectedRef.current]) {
+      _readStartRef.current[selectedRef.current] = Date.now();
+    }
+  }, [active]);
 
   async function openPage(name) {
     setPageLoading(true);
@@ -3268,7 +3280,7 @@ function BrowseTab({ openTarget }) {
     const prev = selected;
     if (prev && _readStartRef.current[prev]) {
       const dur = Math.round((Date.now() - _readStartRef.current[prev]) / 1000);
-      api("/log-read", { method: "POST", body: JSON.stringify({ page: prev, duration_seconds: dur }) }).catch(() => {});
+      if (dur >= 2) api("/log-read", { method: "POST", body: JSON.stringify({ page: prev, duration_seconds: dur }) }).catch(() => {});
       delete _readStartRef.current[prev];
     }
     _readStartRef.current[name] = Date.now();
@@ -3289,7 +3301,7 @@ function BrowseTab({ openTarget }) {
     if (!openTarget.name) { if (openTarget.folder) switchFolder(openTarget.folder); return; }
     if (openTarget.folder && folder !== openTarget.folder) setFolder(openTarget.folder);
     openPage(openTarget.name);
-  }, [openTarget?.name, openTarget?.folder]);
+  }, [openTarget]); // a new object per request, so reopening the same page works
 
   async function handleRandom() {
     try {
@@ -3390,7 +3402,7 @@ function BrowseTab({ openTarget }) {
           <button onClick={() => {
             if (selected && _readStartRef.current[selected]) {
               const dur = Math.round((Date.now() - _readStartRef.current[selected]) / 1000);
-              api("/log-read", { method: "POST", body: JSON.stringify({ page: selected, duration_seconds: dur }) }).catch(() => {});
+              if (dur >= 2) api("/log-read", { method: "POST", body: JSON.stringify({ page: selected, duration_seconds: dur }) }).catch(() => {});
               delete _readStartRef.current[selected];
             }
             setSelected(null); setParsedPage(null);
@@ -3479,7 +3491,7 @@ function BrowseTab({ openTarget }) {
       <div className="flex items-center justify-between mb-4">
         <div>
           <h2 className="text-base font-semibold text-stone-900">Knowledge Base</h2>
-          <p className="text-xs text-stone-400 mt-0.5">{filtered.length} page{filtered.length !== 1 ? "s" : ""}{deepDiveFilter ? " flagged for deeper research" : reviewFilter ? " not reviewed in 30+ days" : ` in ${folder}`}</p>
+          <p className="text-xs text-stone-400 mt-0.5">{filtered.length} page{filtered.length !== 1 ? "s" : ""}{deepDiveFilter ? " flagged for deeper research" : reviewFilter ? " in the review queue (conflicts, no links, low maturity, stale)" : ` in ${folder}`}</p>
         </div>
         <div className="flex gap-1.5">
           {["cs", "science", "humanities"].includes(folder) && (
@@ -3767,79 +3779,133 @@ function WaitingChips({ queueCount, threadCount, onGoCapture, onGoThreads }) {
   );
 }
 
-function NextUpSection({ pages, onOpen }) {
-  if (!pages || pages.length === 0) return null;
-  return (
-    <div className="bg-white border border-amber-200 rounded-xl p-4">
-      <div className="flex items-center justify-between mb-3">
-        <h3 className="text-sm font-semibold text-stone-900">Next up</h3>
-        <span className="text-xs text-amber-600 bg-amber-50 border border-amber-100 px-2 py-0.5 rounded-lg">{pages.length} high priority</span>
-      </div>
-      <div className="space-y-1">
-        {pages.slice(0, 5).map(page => (
-          <button key={page.name} onClick={() => onOpen(page.name, page.folder)}
-            className="w-full text-left hover:bg-stone-50 rounded-lg px-2 py-1.5 transition-colors group">
-            <div className="text-sm text-stone-700 group-hover:text-orange-600 truncate">{page.name}</div>
-            <div className="text-xs text-stone-400 truncate">{page.suggested_action}</div>
-          </button>
-        ))}
-      </div>
-    </div>
-  );
-}
-
-// Deterministic duplicate finder (no LLM): similar slugs + shared concept text.
-// Weak pairs are included on purpose; real duplicates score ~0.45-0.57, so the
-// human decides each one in the side-by-side compare view.
-function TidyUpSection({ onMerge, onOpenPage, refreshKey }) {
-  const [pairs, setPairs] = useState(null);
-  const [mergeMax, setMergeMax] = useState(null);
-  const [comparing, setComparing] = useState(null);
+// "Needs attention": one list, every item actionable on the dashboard.
+// Built server-side by GET /attention (no LLM): contradictions, likely
+// duplicate pairs, and unlinked pages paired with their closest page.
+function NeedsAttentionSection({ onMerge, onOpenPage, refreshKey }) {
+  const [data, setData] = useState(null);
+  const [comparing, setComparing] = useState(null); // { pair, kind }
+  const [readingPage, setReadingPage] = useState(null);
 
   useEffect(() => {
-    setPairs(null);
-    api("/consolidation-candidates?limit=8&include_weak=true")
-      .then(d => { setPairs(d.candidates || []); setMergeMax(d.merge_max_chars || null); })
-      .catch(() => setPairs([]));
+    api("/attention")
+      .then(setData)
+      .catch(() => setData({ contradictions: [], pairs: [], orphans: [], counts: {} }));
   }, [refreshKey]);
 
-  function dismiss(pair) {
-    // Hide it right away; the backend remembers it so it stays hidden.
-    setPairs(prev => prev.filter(p => p !== pair));
+  function decided(pair) {
+    // Hide it right away; dismissing is remembered server-side. After a link,
+    // the page gains a backlink and drops off the next load anyway.
+    setData(prev => ({
+      ...prev,
+      pairs: prev.pairs.filter(p => p !== pair),
+      orphans: prev.orphans.filter(p => p !== pair),
+    }));
     setComparing(null);
     api("/consolidation-candidates/dismiss", { method: "POST", body: JSON.stringify({ source: pair.source, target: pair.target }) }).catch(() => {});
   }
 
-  if (pairs && pairs.length === 0) return null;
-  return (
-    <div className="bg-white border border-stone-200 rounded-xl p-4">
-      <div className="flex items-center justify-between mb-3">
-        <h3 className="text-sm font-semibold text-stone-900">Tidy up · possible duplicates</h3>
-        <span className="text-[10px] text-stone-400">compare, then decide</span>
+  if (data === null) {
+    return (
+      <div className="bg-white border border-amber-200 rounded-xl p-4">
+        <h3 className="text-sm font-semibold text-stone-900">Needs attention</h3>
+        <p className="text-xs text-stone-400 mt-2">Checking your wiki…</p>
       </div>
-      {pairs === null ? (
-        <p className="text-xs text-stone-400">Scanning for duplicates…</p>
-      ) : (
-        <div className="space-y-1">
-          {pairs.map(pair => (
-            <button key={`${pair.source}->${pair.target}`} onClick={() => setComparing(pair)}
-              className="w-full flex items-center gap-3 px-2 py-1.5 rounded-lg hover:bg-stone-50 text-left group">
-              <div className="flex-1 min-w-0">
-                <div className="text-sm text-stone-700 truncate group-hover:text-orange-600">{pair.source} <span className="text-stone-400">·</span> {pair.target}</div>
-                <div className="text-xs text-stone-400 truncate">{pair.reasons?.[0] === "weak overlap only" ? "similar names or wording" : pair.reasons?.join(" · ")} · {pair.score}</div>
-              </div>
-              <span className="shrink-0 text-xs font-medium px-3 py-1.5 rounded-lg border border-stone-200 text-stone-700 group-hover:bg-stone-100">Compare</span>
-            </button>
+    );
+  }
+  const total = data.contradictions.length + data.pairs.length + data.orphans.length;
+  if (total === 0) return null;
+
+  const Row = ({ onClick, title, detail, action }) => (
+    <button onClick={onClick} className="w-full flex items-center gap-3 px-2 py-1.5 rounded-lg hover:bg-stone-50 text-left group">
+      <div className="flex-1 min-w-0">
+        <div className="text-sm text-stone-700 truncate group-hover:text-orange-600">{title}</div>
+        <div className="text-xs text-stone-400 truncate">{detail}</div>
+      </div>
+      <span className="shrink-0 text-xs font-medium px-3 py-1.5 rounded-lg border border-stone-200 text-stone-700 group-hover:bg-stone-100">{action}</span>
+    </button>
+  );
+  const Group = ({ label, note, children }) => (
+    <div className="space-y-1">
+      <div className="flex items-baseline justify-between px-2 pt-2">
+        <span className="text-[10px] font-semibold uppercase tracking-wide text-stone-400">{label}</span>
+        {note && <span className="text-[10px] text-stone-400">{note}</span>}
+      </div>
+      {children}
+    </div>
+  );
+  const similarity = pair => pair.reasons?.[0] && pair.reasons[0] !== "weak overlap only" ? pair.reasons.join(" · ") : "similar names or wording";
+
+  return (
+    <div className="bg-white border border-amber-200 rounded-xl p-4">
+      <div className="flex items-center justify-between mb-1">
+        <h3 className="text-sm font-semibold text-stone-900">Needs attention</h3>
+        <span className="text-xs text-amber-600 bg-amber-50 border border-amber-100 px-2 py-0.5 rounded-lg">{total} to decide</span>
+      </div>
+
+      {data.contradictions.length > 0 && (
+        <Group label="Contradictions">
+          {data.contradictions.map(page => (
+            <Row key={page.name} onClick={() => setReadingPage(page.name)}
+              title={page.name} detail="Holds conflicting claims. Resolve them before adding more sources." action="Read" />
           ))}
-        </div>
+        </Group>
       )}
+
+      {data.pairs.length > 0 && (
+        <Group label="Possible duplicates" note="merge, link, or dismiss">
+          {data.pairs.map(pair => (
+            <Row key={`d:${pair.source}:${pair.target}`} onClick={() => setComparing({ pair, kind: "duplicate" })}
+              title={`${pair.source} · ${pair.target}`} detail={`${similarity(pair)} · ${pair.score}`} action="Compare" />
+          ))}
+        </Group>
+      )}
+
+      {data.orphans.length > 0 && (
+        <Group label="No other page links here" note={data.counts?.unlinked_total > data.orphans.length ? `top ${data.orphans.length} of ${data.counts.unlinked_total}` : null}>
+          {data.orphans.map(pair => (
+            <Row key={`o:${pair.source}:${pair.target}`} onClick={() => setComparing({ pair, kind: "unlinked" })}
+              title={pair.source} detail={`closest page: ${pair.target} · ${pair.score}`} action="Compare" />
+          ))}
+        </Group>
+      )}
+
       {comparing && (
-        <ComparePairModal pair={comparing} mergeMax={mergeMax}
+        <ComparePairModal pair={comparing.pair} kind={comparing.kind} mergeMax={data.merge_max_chars}
           onClose={() => setComparing(null)}
           onOpenPage={name => { setComparing(null); onOpenPage(name); }}
           onMerge={pair => { setComparing(null); onMerge(pair); }}
-          onDecided={dismiss} />
+          onDecided={decided} />
       )}
+      {readingPage && (
+        <PageReaderModal name={readingPage} onClose={() => setReadingPage(null)}
+          onOpenPage={name => { setReadingPage(null); onOpenPage(name); }} />
+      )}
+    </div>
+  );
+}
+
+function PageReaderModal({ name, onClose, onOpenPage }) {
+  const [current, setCurrent] = useState(name);
+  const [data, setData] = useState(null);
+
+  useEffect(() => {
+    setData(null);
+    api(`/page/${current}`).then(setData).catch(e => setData({ error: e.message || "Failed to load" }));
+  }, [current]);
+
+  return (
+    <div className="fixed inset-0 bg-black/30 backdrop-blur-sm flex items-center justify-center z-50 p-4">
+      <div className="bg-white rounded-2xl shadow-xl border border-stone-200 p-5 w-full max-w-3xl max-h-[90vh] overflow-y-auto space-y-4">
+        <div className="flex items-center justify-between">
+          <h3 className="font-semibold text-stone-900 truncate">{current}</h3>
+          <button onClick={onClose} className="w-6 h-6 flex items-center justify-center text-stone-400 hover:text-stone-600 rounded-lg hover:bg-stone-100 text-xs">✕</button>
+        </div>
+        {!data ? <p className="text-xs text-stone-400">Loading…</p>
+          : data.error ? <p className="text-xs text-red-500">{data.error}</p>
+          : <ConceptPageView key={current} page={{ ...data.parsed, name: current, pageName: current, backlinks: data.backlinks || [], _onOpenPage: setCurrent }} />}
+        <button onClick={() => onOpenPage(current)} className="text-xs text-orange-600 hover:underline">Open in Browse to edit →</button>
+      </div>
     </div>
   );
 }
@@ -3886,10 +3952,22 @@ function ComparePane({ page, other }) {
   );
 }
 
-function ComparePairModal({ pair, mergeMax, onClose, onOpenPage, onMerge, onDecided }) {
+function ComparePairModal({ pair, kind = "duplicate", mergeMax, onClose, onOpenPage, onMerge, onDecided }) {
+  const unlinked = kind === "unlinked";
   const [pages, setPages] = useState({});
   const [linking, setLinking] = useState(false);
   const [error, setError] = useState("");
+  // Full page is read inside the modal: navigating to Browse unmounted the
+  // dashboard and lost the comparison.
+  const [reading, setReading] = useState(null); // { name, data } | null
+
+  async function readPage(name) {
+    const cached = pages[name];
+    if (cached && !cached.error) { setReading({ name, data: cached }); return; }
+    setReading({ name, data: null });
+    try { setReading({ name, data: await api(`/page/${name}`) }); }
+    catch (e) { setReading({ name, data: { error: e.message || "Failed to load" } }); }
+  }
 
   useEffect(() => {
     for (const name of [pair.source, pair.target]) {
@@ -3919,23 +3997,37 @@ function ComparePairModal({ pair, mergeMax, onClose, onOpenPage, onMerge, onDeci
     <div className="fixed inset-0 bg-black/30 backdrop-blur-sm flex items-center justify-center z-50 p-4">
       <div className="bg-white rounded-2xl shadow-xl border border-stone-200 p-5 w-full max-w-4xl max-h-[90vh] overflow-y-auto space-y-4">
         <div className="flex items-center justify-between">
-          <h3 className="font-semibold text-stone-900">Same concept, related, or unrelated?</h3>
+          {reading ? (
+            <button onClick={() => setReading(null)} className="text-sm text-stone-600 hover:text-stone-900">← Back to compare</button>
+          ) : (
+            <h3 className="font-semibold text-stone-900">{unlinked ? "Nothing links to the left page. Link it to this one?" : "Same concept, related, or unrelated?"}</h3>
+          )}
           <button onClick={onClose} className="w-6 h-6 flex items-center justify-center text-stone-400 hover:text-stone-600 rounded-lg hover:bg-stone-100 text-xs">✕</button>
         </div>
 
+        {reading ? (
+          <div className="min-w-0">
+            {!reading.data ? <p className="text-xs text-stone-400">Loading…</p>
+              : reading.data.error ? <p className="text-xs text-red-500">{reading.data.error}</p>
+              : <ConceptPageView key={reading.name} page={{ ...reading.data.parsed, name: reading.name, pageName: reading.name, backlinks: reading.data.backlinks || [], _onOpenPage: readPage }} />}
+            <button onClick={() => onOpenPage(reading.name)} className="text-xs text-stone-400 hover:text-stone-700">Open in Browse to edit (closes this comparison)</button>
+          </div>
+        ) : (
         <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
           {[[pair.source, pair.target], [pair.target, pair.source]].map(([name, other]) => (
             <div key={name} className="space-y-1.5 min-w-0">
               <ComparePane page={pages[name]} other={other} />
-              <button onClick={() => onOpenPage(name)} className="text-xs text-orange-600 hover:underline">Open full page →</button>
+              <button onClick={() => readPage(name)} className="text-xs text-orange-600 hover:underline">Read full page</button>
             </div>
           ))}
         </div>
+        )}
 
+        {!reading && <>
         <div className="text-xs text-stone-500 space-y-0.5">
           <p><span className="font-medium text-stone-700">Same concept</span>: you'd give them the same heading → Merge.</p>
           <p><span className="font-medium text-stone-700">Related</span>: one is part of the other, or a neighbour → Link them.</p>
-          <p><span className="font-medium text-stone-700">Unrelated</span>: they only share words → Not a duplicate.</p>
+          <p><span className="font-medium text-stone-700">Unrelated</span>: they only share words → {unlinked ? "Not related (shows its next-closest page)" : "Not a duplicate"}.</p>
         </div>
 
         {tooBig && (
@@ -3948,7 +4040,7 @@ function ComparePairModal({ pair, mergeMax, onClose, onOpenPage, onMerge, onDeci
         <div className="flex flex-wrap gap-2 justify-end">
           <button onClick={() => onDecided(pair)} disabled={linking}
             className="px-4 py-2 border border-stone-200 rounded-xl text-sm text-stone-600 hover:bg-stone-50">
-            Not a duplicate
+            {unlinked ? "Not related" : "Not a duplicate"}
           </button>
           <button onClick={linkThem} disabled={!loaded || linking}
             className="px-4 py-2 border border-stone-300 rounded-xl text-sm text-stone-800 hover:bg-stone-100 disabled:opacity-40">
@@ -3959,6 +4051,7 @@ function ComparePairModal({ pair, mergeMax, onClose, onOpenPage, onMerge, onDeci
             Merge…
           </button>
         </div>
+        </>}
       </div>
     </div>
   );
@@ -3971,24 +4064,21 @@ function TrendLine({ current, previous, unit = "" }) {
   return <div className="text-[10px] text-stone-400 mt-1">{text}</div>;
 }
 
-function DashboardTab({ onOpenPage, onGoCapture }) {
+function DashboardTab({ onOpenPage, onGoCapture, active = true }) {
   const [stats, setStats] = useState(null);
-  const [nextUp, setNextUp] = useState(null);
   const [queueCount, setQueueCount] = useState(0);
   const [threadCount, setThreadCount] = useState(0);
   const [loading, setLoading] = useState(true);
   const [mergePair, setMergePair] = useState(null);
   const [tidyKey, setTidyKey] = useState(0);
+  const [visits, setVisits] = useState(0);
+
+  // Tabs stay mounted, so reload each time the dashboard is shown again;
+  // otherwise its numbers would be stale after work in other tabs.
+  useEffect(() => { if (active) setVisits(v => v + 1); }, [active]);
 
   useEffect(() => {
-    // Review ranking reads every page (~1s), so it fills in after the rest.
-    // Re-fetched after a merge, since the merged-away page no longer exists.
-    api("/review-queue?min_priority=high&limit=200")
-      .then(d => setNextUp(d.pages || []))
-      .catch(() => setNextUp([]));
-  }, [tidyKey]);
-
-  useEffect(() => {
+    if (!visits) return;
     async function loadStats() {
       try {
         const [dashboardData, queueData, threadData] = await Promise.all([
@@ -4006,7 +4096,7 @@ function DashboardTab({ onOpenPage, onGoCapture }) {
       }
     }
     loadStats();
-  }, []);
+  }, [visits, tidyKey]);
 
   if (loading) return <div className="text-stone-500 py-8">Loading learning metrics…</div>;
   if (!stats) return <div className="text-red-600 py-8">Failed to load dashboard stats.</div>;
@@ -4058,10 +4148,8 @@ function DashboardTab({ onOpenPage, onGoCapture }) {
       <WaitingChips queueCount={queueCount} threadCount={threadCount}
         onGoCapture={onGoCapture} onGoThreads={() => onOpenPage(undefined, "open-threads")} />
 
-      {/* Next up — the actionable section, so it leads */}
-      <NextUpSection pages={nextUp} onOpen={onOpenPage} />
-
-      <TidyUpSection onMerge={setMergePair} onOpenPage={onOpenPage} refreshKey={tidyKey} />
+      {/* Needs attention: the actionable section, so it leads */}
+      {visits > 0 && <NeedsAttentionSection onMerge={setMergePair} onOpenPage={onOpenPage} refreshKey={`${visits}-${tidyKey}`} />}
       {mergePair && (
         <ConsolidateModal force
           pages={[{ name: mergePair.source, title: mergePair.source }, { name: mergePair.target, title: mergePair.target }]}
@@ -5568,20 +5656,28 @@ export default function App() {
       {/* Main content */}
       <main className="flex-1 flex flex-col overflow-hidden">
         <div className={`${tab === "browse" ? "max-w-6xl" : "max-w-2xl"} flex-1 overflow-y-auto p-4 mx-auto w-full`}>
-          {tab === "ingest" && <IngestTab onApproved={refreshTagGroups} onSwitchToChat={() => setTab("chat")} onOpenPage={openSavedPage} />}
-          {tab === "chat" && (
-            <div className="flex flex-col" style={{ height: "calc(100vh - 120px)" }}>
-              <ChatTab />
+          {/* Every tab stays mounted and inactive ones are hidden, so switching
+              tabs keeps chat history, open comparisons and Browse position. */}
+          <div className={tab === "ingest" ? "" : "hidden"}>
+            <IngestTab onApproved={refreshTagGroups} onSwitchToChat={() => setTab("chat")} onOpenPage={openSavedPage} />
+          </div>
+          <div className={tab === "chat" ? "flex flex-col" : "hidden"} style={{ height: "calc(100vh - 120px)" }}>
+            <ChatTab />
+          </div>
+          <div className={tab === "interview" ? "" : "hidden"}>
+            <InterviewTab />
+          </div>
+          <div className={tab === "browse" ? "flex flex-col" : "hidden"} style={{ height: "calc(100vh - 120px)" }}>
+            <BrowseTab openTarget={browseTarget} active={tab === "browse"} />
+          </div>
+          <div className={tab === "dashboard" ? "" : "hidden"}>
+            <DashboardTab onOpenPage={openSavedPage} onGoCapture={() => setTab("ingest")} active={tab === "dashboard"} />
+          </div>
+          {opsEnabled && (
+            <div className={tab === "operations" ? "" : "hidden"}>
+              <OperationsTab />
             </div>
           )}
-          {tab === "interview" && <InterviewTab />}
-          {tab === "browse" && (
-            <div className="flex flex-col" style={{ height: "calc(100vh - 120px)" }}>
-              <BrowseTab openTarget={browseTarget} />
-            </div>
-          )}
-          {tab === "dashboard" && <DashboardTab onOpenPage={openSavedPage} onGoCapture={() => setTab("ingest")} />}
-          {tab === "operations" && opsEnabled && <OperationsTab />}
         </div>
       </main>
     </div>
