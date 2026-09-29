@@ -214,7 +214,9 @@ cd frontend && npm run build
 | **POST** | **`/create-stub`** | **Create minimal stub page for missing concept** |
 | **POST** | **`/calculate-maturity/{page}`** | **Calculate and update understanding maturity score for a page** |
 | **POST** | **`/calculate-all-maturity`** | **Bulk calculate maturity scores for all concept pages** |
-| POST | `/consolidate` | Merge two concept pages into one |
+| POST | `/consolidate` | Merge two concept pages into one. `dry_run: true` returns the draft; applying sends it back with page hashes and backs up both originals |
+| GET | `/consolidation-candidates` | Likely duplicate page pairs (no LLM). `include_weak=true` for the dashboard's Tidy up list |
+| POST | `/consolidation-candidates/dismiss` | Mark a pair as not a duplicate |
 | POST | `/ingest-text` | Ingest plain text directly (no URL fetch) |
 | POST | `/analyze-traces` | Run weekly self-learning analysis on approval traces |
 | GET | `/system-insights` | Return current system insights and prompt hints |

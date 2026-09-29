@@ -45,3 +45,31 @@ def test_empty_inputs_give_zeros():
         "chat_questions": 0,
         "interview_questions": 0,
     }
+
+
+def test_until_bounds_the_window_for_trends():
+    prev_end = datetime(2026, 8, 29, 12, 0)   # NOW - 30 days
+    reads = [
+        {"ts": "2026-09-27T10:00:00", "concept": "current-window"},
+        {"ts": "2026-08-20T10:00:00", "concept": "previous-window"},
+        {"ts": "2026-07-01T10:00:00", "concept": "too-old"},
+    ]
+    events = [
+        {"event_type": "chat_context", "ts": "2026-09-27T09:00:00"},
+        {"event_type": "chat_context", "ts": "2026-08-15T09:00:00"},
+    ]
+    prev = main._recall_stats(reads, events, now=prev_end, period_days=30, until=prev_end)
+    assert prev["pages_read"] == 1
+    assert prev["questions_asked"] == 1
+
+
+def test_dashboard_stats_until_excludes_later_traces():
+    prev_end = datetime(2026, 8, 29, 12, 0)
+    traces = [
+        {"ts": "2026-09-27T10:00:00", "approved": True, "final_page": "a"},
+        {"ts": "2026-08-20T10:00:00", "approved": True, "final_page": "b"},
+        {"ts": "2026-08-21T10:00:00", "approved": False},
+    ]
+    prev = main._dashboard_stats_from_traces(traces, now=prev_end, period_days=30, until=prev_end)
+    assert prev["total_approved"] == 1
+    assert prev["approval_rate"] == 0.5

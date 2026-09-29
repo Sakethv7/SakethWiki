@@ -95,3 +95,63 @@ zero. The chips navigate. They don't duplicate the lists.
 **Given up.** Two extra requests (`/queue`, `/pages?folder=open-threads`) on
 each Dashboard load. `/queue` is also polled by Capture, so the data may briefly
 differ between tabs.
+
+---
+
+# Round 2 decisions
+
+## ADR-6: Trends as "current minus previous window", neutral colour
+
+**Context.** The tiles give no sense of direction, so no decision can be
+checked afterwards.
+
+**Options.**
+
+| Option | Summary |
+|---|---|
+| A. Delta vs previous 30 days | One extra number per tile, same data. |
+| B. Sparkline per tile | Richer, shows shape over time. |
+| C. Percent change | "↑40%" |
+
+**Choice: A.** It's the smallest change that answers "is it going up or down",
+and it reuses the existing pure functions by calling them with an earlier
+`now`.
+
+**Given up.** Shape. A single delta hides a spike in the middle of the window
+(the heatmap partly covers that). Option C was rejected because small counts
+make percentages jumpy (2 → 4 reads is "+100%").
+
+## ADR-7: Detect duplicates without an LLM; keep the LLM for the merge only
+
+**Context.** You asked whether consolidation help needs an LLM such as Qwen.
+
+**Options.**
+
+| Option | Summary |
+|---|---|
+| A. Deterministic scorer, human decides | Existing `consolidation.py`, shown on the dashboard. |
+| B. Deterministic shortlist, LLM judges each pair | Cheap model says duplicate / related / distinct. |
+| C. Embeddings similarity | Needs `EMBED_ENABLED` and an OpenAI key, which are currently off. |
+
+**Choice: A.** On the real vault the scorer already ranks the true duplicates
+first. With eight pairs on screen, you are a faster and better judge than an
+extra model call.
+
+**Given up.** Recall on duplicates that use different words and different
+names. Two pages about the same idea with no shared vocabulary won't be found.
+Option C would catch those, and option B would cut the false pairs. Both stay
+available as later steps if the list turns out too noisy.
+
+## ADR-8: Show candidates below the old cut-off, and merge with force
+
+**Context.** The finder hides pairs below 0.62. Every real duplicate on the
+vault scores 0.45–0.57.
+
+**Choice.** Request `include_weak=true` and show the top 8 by score, labelled
+"possible duplicates, you decide". Merge sends `force: true`.
+
+**Given up.** Safety margin. The old cut-off existed so that nothing
+low-confidence could be merged automatically. This change keeps a human click
+in front of every merge, but it does make a wrong merge one click away, and
+merges had no preview. That was resolved in the same round: merges are now previewed, hash-checked and backed up (architecture open question 5). I did not change the cut-off inside
+`consolidation.py`, so any automatic caller keeps the strict behavior.

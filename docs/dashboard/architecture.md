@@ -159,3 +159,140 @@ reused as they are.*
    ADR-3). Confirm that's what you want.
 4. **Heatmap reads overlay.** Showing reads next to captures on the heatmap
    would make the ratio visible over time. Worth a follow-up?
+
+---
+
+# Round 2 (2026-09-28): trend arrows and a Tidy up list
+
+Round 1 above is built. This round adds two things. It was written after the
+maturity backfill pushed high-priority pages from 61 to 113, most of them
+flagged "add real backlinks or merge/delete".
+
+## Plain summary
+
+| | Before | Change | Fixes |
+|---|---|---|---|
+| Trends | Each tile shows only this period's number. | Each tile also shows the change against the previous 30 days, e.g. "↑3". | You can see whether a decision like "pause capture" is working. |
+| Tidy up | Likely duplicate pages exist, but nothing shows them. A finder exists in code, but it was too slow to use and hid every real duplicate as "weak". | A "Tidy up" card lists the top likely-duplicate pairs. Each pair has a Merge button that uses the existing merge action. | You see where to consolidate and can act on it in one click. |
+
+## Part A: trend arrows
+
+**Term: previous period.** The 30 days before the current 30-day window, so
+days 31–60 before now. Comparing like-length windows keeps the arrow honest.
+
+The four tiles each get a delta line:
+
+```
+┌──────────────┐
+│     74       │
+│  approved    │
+│  ↓ 9 vs prev │   ← new: current − previous, over the same length window
+└──────────────┘
+```
+
+*Caption: the delta is plain subtraction. For approval rate it is in
+percentage points. No arrow is shown when the previous period has no data.*
+
+Colour is neutral (stone) for all tiles. "Approved going down" is good or bad
+depending on what you are trying to do this month, so the dashboard shows the
+direction and leaves the judgement to you.
+
+Data: `_dashboard_stats_from_traces` and `_recall_stats` already take `now` and
+`period_days`. The endpoint calls each twice, once with `now` and once with
+`now - period_days`, and returns the second result as `previous`. No new log
+files are read.
+
+## Part B: Tidy up
+
+### How duplicates are found (no LLM)
+
+`consolidation.find_candidates` scores every pair of concept pages:
+
+- **Slug similarity**: how alike the two file names are, as a 0–1 ratio
+  (`difflib.SequenceMatcher`). `agent-driven-trace-investigation` and
+  `agent-trace-investigation` score high.
+- **Token overlap (Jaccard)**: the share of words the two pages have in common
+  across title, current-understanding block and tags. Jaccard means
+  |shared words| ÷ |all distinct words in either|.
+- **Score** = 0.55 × slug similarity + 0.45 × token overlap.
+- **Alias match**: if `identity.resolve_slug` maps both to one canonical page,
+  the score is forced to 0.98.
+
+This is cheap, deterministic and explainable: every pair comes with the reason
+it was flagged.
+
+### Two problems found and one already fixed
+
+1. **Speed (fixed in this round, bug fix).** Scoring ~23,000 pairs re-parsed
+   both pages for every pair, and `identity.resolve_slug` re-read every page in
+   the vault on every call. On 215 pages it did not finish in 5 minutes. Both
+   are now cached per run (cleared at the start of each run so edits are never
+   stale). A run now takes about 2 seconds (after the alias-map cache below).
+2. **Cut-off too strict (this proposal).** Only pairs scoring ≥ 0.62 are shown.
+   On the real vault that is zero pairs. The real duplicates score 0.45–0.57:
+
+| Score | Pair | Real duplicate? |
+|---|---|---|
+| 0.566 | model-training-fundamentals ↔ model-training-methodology | yes |
+| 0.555 | agent-driven-trace-investigation ↔ agent-trace-investigation | yes |
+| 0.549 | llm-cost-observability ↔ llm-observability | likely overlap |
+| 0.533 | phase-2-text-to-vector-embeddings ↔ text-to-vector-embeddings | yes |
+| 0.517 | mcp-streamablehttp-transport ↔ mcp-streamablehttp-transport-and-state | yes |
+| 0.513 | data-preparation-for-genai ↔ data-preparation-for-traditional-ml | related, not duplicate |
+| 0.490 | evaluation-datasets-for-ai-systems ↔ regression-testing-for-ai-systems | related, not duplicate |
+| 0.478 | reflection-and-external-feedback-in-agentic-ai ↔ the-reflection-pattern-in-agentic-ai | yes |
+
+*My own judgement from the titles, not verified by reading the pages.*
+
+Roughly 5 of the top 8 are real. That is good enough for a short list you
+review by eye, not good enough for anything automatic.
+
+### Layout
+
+```
+┌───────────────────────────────────────────────────────────┐
+│ Tidy up · possible duplicates             you decide each │
+│  model-training-fundamentals → model-training-methodology │
+│   similar names · shared concept text   0.57   [Merge]    │
+│  …up to 8 pairs                                            │
+└───────────────────────────────────────────────────────────┘
+```
+
+Placed below Next up. It loads last, since the scan takes a few seconds, and
+shows "Scanning for duplicates…" until then.
+
+**Merge** opens the existing `ConsolidateModal` prefilled with the pair. It
+calls `POST /consolidate` with `force: true`, because every candidate here is
+below the "safe_auto" bar by design. The modal already states that the source
+page will be deleted.
+
+### Why not an LLM (answer to the Qwen question)
+
+Finding candidates does not need an LLM. The scorer above already puts the
+real duplicates at the top. What it can't do is tell "duplicate" from "closely
+related". An LLM judge could, but you can too, in about two seconds per pair,
+and you see eight pairs at a time. The LLM is already used where it earns its
+cost: writing the merged page (`consolidate_pages` task).
+
+Routing that merge to Qwen is one env var
+(`LLM_PROVIDER_CONSOLIDATE_PAGES=qwen`). This proposal does **not** do that.
+The merge rewrites your notes and deletes a page, and the README's recommended
+profile keeps it on Anthropic for exactly that reason. It is your call, and it
+can be changed later without code changes.
+
+## Open questions (round 2)
+
+5. ~~Merge has no preview.~~ **Resolved.** `/consolidate` takes
+   `dry_run: true` to return the LLM draft without writing. Applying sends that
+   draft back with content hashes of both pages, and the server refuses (409)
+   if either page changed since. Before writing, both originals are copied to
+   `_wiki/meta/consolidation-backups/<timestamp>/`. The modal shows the draft
+   and warns when the draft is under 60% of the two originals' combined size.
+   First real test: the top pair's draft kept 49% and the warning fired.
+6. ~~Dismissing a false pair.~~ **Resolved.** "Not a duplicate" writes the
+   pair (order-independent) to `_wiki/meta/consolidation-dismissed.json`, and
+   `find_candidates` skips it.
+7. ~~`identity.resolve_slug` is slow everywhere.~~ **Resolved in this round.**
+   `alias_map()` is now cached until a concept page or `aliases.json` changes
+   (checked by file mtimes). Lookups dropped from ~36 ms to ~0.7 ms, and the
+   duplicate scan from ~6 s to ~1.8 s.

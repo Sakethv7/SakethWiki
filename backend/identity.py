@@ -110,11 +110,36 @@ def _iter_page_aliases() -> Iterable[tuple[str, list[str]]]:
                 yield md_file.stem, [str(alias) for alias in aliases]
 
 
+_alias_map_cache: dict = {"key": None, "map": None}
+
+
+def _alias_inputs_key() -> tuple:
+    """Fingerprint of every file alias_map reads: paths plus mtimes. Stat-ing
+    ~200 files is far cheaper than reading and parsing them."""
+    wiki = _vault() / "_wiki"
+    stamps = []
+    for path in [_aliases_path()] + [
+        md for folder in _CONCEPT_FOLDERS for md in (wiki / folder).glob("*.md")
+    ]:
+        try:
+            stamps.append((str(path), path.stat().st_mtime_ns))
+        except OSError:
+            continue
+    return tuple(sorted(stamps))
+
+
 def alias_map() -> dict[str, str]:
     """
     Return {alias_slug: canonical_slug}. Canonical slugs map to themselves.
     Optional vault aliases override built-ins when they define the same alias.
+
+    Cached until a concept page or aliases.json is added, removed or modified;
+    resolve_slug is called per wikilink and per page pair, and rebuilding the
+    map re-read the whole vault every time.
     """
+    key = _alias_inputs_key()
+    if _alias_map_cache["key"] == key:
+        return dict(_alias_map_cache["map"])
     mapping: dict[str, str] = {}
 
     def add(canonical: str, aliases: list[str]) -> None:
@@ -129,7 +154,8 @@ def alias_map() -> dict[str, str]:
         add(canonical, aliases)
     for canonical, aliases in _iter_page_aliases():
         add(canonical, aliases)
-    return mapping
+    _alias_map_cache.update(key=key, map=mapping)
+    return dict(mapping)
 
 
 def resolve_slug(text: str) -> str:

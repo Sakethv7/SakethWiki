@@ -2772,62 +2772,103 @@ function LintPanel({ onClose, onConsolidate, onFix }) {
   );
 }
 
-function ConsolidateModal({ pages, prefill, onClose, onDone }) {
+function ConsolidateModal({ pages, prefill, onClose, onDone, force = false }) {
   const [source, setSource] = useState(prefill?.source || "");
   const [target, setTarget] = useState(prefill?.target || "");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
+  const [draft, setDraft] = useState(null); // dry-run result, shown before anything is written
 
-  async function handleMerge() {
+  const body = extra => JSON.stringify({ source, target, ...(force ? { force: true } : {}), ...extra });
+
+  async function handlePreview() {
     if (!source || !target || source === target) return;
     setLoading(true); setError("");
     try {
-      await api("/consolidate", { method: "POST", body: JSON.stringify({ source, target }) });
+      setDraft(await api("/consolidate", { method: "POST", body: body({ dry_run: true }) }));
+    } catch (e) { setError(e.message); }
+    setLoading(false);
+  }
+
+  async function handleApply() {
+    setLoading(true); setError("");
+    try {
+      await api("/consolidate", { method: "POST", body: body({ merged: draft.preview, source_sha: draft.source_sha, target_sha: draft.target_sha }) });
       onDone();
     } catch (e) { setError(e.message); setLoading(false); }
   }
 
+  // A merged page far shorter than its two inputs usually means the LLM output was cut off.
+  const keptPct = draft ? Math.round((draft.merged_chars / Math.max(1, draft.input_chars)) * 100) : null;
+  const pick = setter => e => { setter(e.target.value); setDraft(null); };
+
   return (
     <div className="fixed inset-0 bg-black/30 backdrop-blur-sm flex items-center justify-center z-50 p-4">
-      <div className="bg-white rounded-2xl shadow-xl border border-stone-200 p-5 w-full max-w-sm space-y-4">
+      <div className={`bg-white rounded-2xl shadow-xl border border-stone-200 p-5 w-full ${draft ? "max-w-2xl" : "max-w-sm"} space-y-4`}>
         <div className="flex items-center justify-between">
-          <h3 className="font-semibold text-stone-900">Merge pages</h3>
+          <h3 className="font-semibold text-stone-900">{draft ? "Review merge" : "Merge pages"}</h3>
           <button onClick={onClose} className="w-6 h-6 flex items-center justify-center text-stone-400 hover:text-stone-600 rounded-lg hover:bg-stone-100 text-xs">✕</button>
         </div>
-        <p className="text-xs text-stone-500">Sonnet will merge SOURCE into TARGET, remove duplicates, fix wikilinks, then delete SOURCE.</p>
 
-        <div className="space-y-1.5">
-          <label className="text-xs font-medium text-stone-600">Source (will be deleted)</label>
-          <select value={source} onChange={e => setSource(e.target.value)}
-            className="w-full border border-stone-200 rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-orange-300 bg-white">
-            <option value="">— select page —</option>
-            {pages.filter(p => p.name !== target).map(p => (
-              <option key={p.name} value={p.name}>{p.title}</option>
-            ))}
-          </select>
-        </div>
+        {!draft ? (
+          <>
+            <p className="text-xs text-stone-500">An LLM drafts SOURCE merged into TARGET. You review the draft before anything is saved. Applying deletes SOURCE; both originals are backed up first.</p>
 
-        <div className="space-y-1.5">
-          <label className="text-xs font-medium text-stone-600">Target (kept, merged into)</label>
-          <select value={target} onChange={e => setTarget(e.target.value)}
-            className="w-full border border-stone-200 rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-orange-300 bg-white">
-            <option value="">— select page —</option>
-            {pages.filter(p => p.name !== source).map(p => (
-              <option key={p.name} value={p.name}>{p.title}</option>
-            ))}
-          </select>
-        </div>
+            <div className="space-y-1.5">
+              <label className="text-xs font-medium text-stone-600">Source (will be deleted)</label>
+              <select value={source} onChange={pick(setSource)}
+                className="w-full border border-stone-200 rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-orange-300 bg-white">
+                <option value="">— select page —</option>
+                {pages.filter(p => p.name !== target).map(p => (
+                  <option key={p.name} value={p.name}>{p.title}</option>
+                ))}
+              </select>
+            </div>
+
+            <div className="space-y-1.5">
+              <label className="text-xs font-medium text-stone-600">Target (kept, merged into)</label>
+              <select value={target} onChange={pick(setTarget)}
+                className="w-full border border-stone-200 rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-orange-300 bg-white">
+                <option value="">— select page —</option>
+                {pages.filter(p => p.name !== source).map(p => (
+                  <option key={p.name} value={p.name}>{p.title}</option>
+                ))}
+              </select>
+            </div>
+          </>
+        ) : (
+          <>
+            <p className="text-xs text-stone-500">
+              <span className="font-medium text-stone-700">{draft.source}</span> → <span className="font-medium text-stone-700">{draft.target}</span>.
+              {" "}Merged page is {draft.merged_chars.toLocaleString()} characters, {keptPct}% of the two originals combined.
+            </p>
+            {keptPct < 60 && (
+              <p className="text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2">
+                The draft is much shorter than the two pages together. Content may have been dropped or cut off. Read it carefully before applying.
+              </p>
+            )}
+            <pre className="text-xs text-stone-700 bg-stone-50 border border-stone-200 rounded-xl p-3 max-h-96 overflow-auto whitespace-pre-wrap">{draft.preview}</pre>
+          </>
+        )}
 
         {error && <p className="text-xs text-red-500">{error}</p>}
 
         <div className="flex gap-2">
-          <button onClick={onClose} className="flex-1 py-2.5 border border-stone-200 rounded-xl text-sm text-stone-600 hover:bg-stone-50 transition-colors">
-            Cancel
+          <button onClick={draft ? () => setDraft(null) : onClose} disabled={loading}
+            className="flex-1 py-2.5 border border-stone-200 rounded-xl text-sm text-stone-600 hover:bg-stone-50 transition-colors">
+            {draft ? "Back" : "Cancel"}
           </button>
-          <button onClick={handleMerge} disabled={!source || !target || source === target || loading}
-            className="flex-1 py-2.5 bg-orange-500 text-white rounded-xl text-sm font-medium hover:bg-orange-600 disabled:opacity-40 transition-colors">
-            {loading ? "Merging…" : "Merge"}
-          </button>
+          {!draft ? (
+            <button onClick={handlePreview} disabled={!source || !target || source === target || loading}
+              className="flex-1 py-2.5 bg-orange-500 text-white rounded-xl text-sm font-medium hover:bg-orange-600 disabled:opacity-40 transition-colors">
+              {loading ? "Drafting…" : "Preview merge"}
+            </button>
+          ) : (
+            <button onClick={handleApply} disabled={loading}
+              className="flex-1 py-2.5 bg-orange-500 text-white rounded-xl text-sm font-medium hover:bg-orange-600 disabled:opacity-40 transition-colors">
+              {loading ? "Applying…" : "Apply merge"}
+            </button>
+          )}
         </div>
       </div>
     </div>
@@ -3747,18 +3788,83 @@ function NextUpSection({ pages, onOpen }) {
   );
 }
 
+// Deterministic duplicate finder (no LLM): similar slugs + shared concept text.
+// Weak pairs are included on purpose; real duplicates score ~0.45-0.57, so the
+// human decides each one. Merge previews an LLM draft via /consolidate before writing.
+function TidyUpSection({ onMerge, refreshKey }) {
+  const [pairs, setPairs] = useState(null);
+
+  useEffect(() => {
+    setPairs(null);
+    api("/consolidation-candidates?limit=8&include_weak=true")
+      .then(d => setPairs(d.candidates || []))
+      .catch(() => setPairs([]));
+  }, [refreshKey]);
+
+  function dismiss(pair) {
+    // Hide it right away; the backend remembers it so it stays hidden.
+    setPairs(prev => prev.filter(p => p !== pair));
+    api("/consolidation-candidates/dismiss", { method: "POST", body: JSON.stringify({ source: pair.source, target: pair.target }) }).catch(() => {});
+  }
+
+  if (pairs && pairs.length === 0) return null;
+  return (
+    <div className="bg-white border border-stone-200 rounded-xl p-4">
+      <div className="flex items-center justify-between mb-3">
+        <h3 className="text-sm font-semibold text-stone-900">Tidy up · possible duplicates</h3>
+        <span className="text-[10px] text-stone-400">you decide each</span>
+      </div>
+      {pairs === null ? (
+        <p className="text-xs text-stone-400">Scanning for duplicates…</p>
+      ) : (
+        <div className="space-y-1">
+          {pairs.map(pair => (
+            <div key={`${pair.source}->${pair.target}`} className="flex items-center gap-3 px-2 py-1.5 rounded-lg hover:bg-stone-50">
+              <div className="flex-1 min-w-0">
+                <div className="text-sm text-stone-700 truncate">{pair.source} <span className="text-stone-400">→</span> {pair.target}</div>
+                <div className="text-xs text-stone-400 truncate">{pair.reasons?.[0] === "weak overlap only" ? "similar names or wording" : pair.reasons?.join(" · ")} · {pair.score}</div>
+              </div>
+              <button onClick={() => dismiss(pair)}
+                className="shrink-0 text-xs px-2 py-1.5 rounded-lg text-stone-400 hover:text-stone-700 hover:bg-stone-100">
+                Not a duplicate
+              </button>
+              <button onClick={() => onMerge(pair)}
+                className="shrink-0 text-xs font-medium px-3 py-1.5 rounded-lg border border-stone-200 text-stone-700 hover:bg-stone-100">
+                Merge…
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function TrendLine({ current, previous, unit = "" }) {
+  if (previous == null || current == null) return null;
+  const diff = Math.round(current - previous);
+  const text = diff === 0 ? "same as prev 30d" : `${diff > 0 ? "↑" : "↓"} ${Math.abs(diff)}${unit} vs prev 30d`;
+  return <div className="text-[10px] text-stone-400 mt-1">{text}</div>;
+}
+
 function DashboardTab({ onOpenPage, onGoCapture }) {
   const [stats, setStats] = useState(null);
   const [nextUp, setNextUp] = useState(null);
   const [queueCount, setQueueCount] = useState(0);
   const [threadCount, setThreadCount] = useState(0);
   const [loading, setLoading] = useState(true);
+  const [mergePair, setMergePair] = useState(null);
+  const [tidyKey, setTidyKey] = useState(0);
 
   useEffect(() => {
     // Review ranking reads every page (~1s), so it fills in after the rest.
-    api("/review-queue?min_priority=high&limit=100")
+    // Re-fetched after a merge, since the merged-away page no longer exists.
+    api("/review-queue?min_priority=high&limit=200")
       .then(d => setNextUp(d.pages || []))
       .catch(() => setNextUp([]));
+  }, [tidyKey]);
+
+  useEffect(() => {
     async function loadStats() {
       try {
         const [dashboardData, queueData, threadData] = await Promise.all([
@@ -3820,6 +3926,8 @@ function DashboardTab({ onOpenPage, onGoCapture }) {
   const periodDays = stats.period_days || 30;
   const heatmapLabel = `${stats.heatmap_days || heatmapWeeks * 7} days`;
   const recall = stats.recall || {};
+  const prev = stats.previous;
+  const prevRate = prev?.approval_rate == null ? null : Math.round(prev.approval_rate * 100);
 
   return (
     <div className="space-y-5 pb-8">
@@ -3829,25 +3937,38 @@ function DashboardTab({ onOpenPage, onGoCapture }) {
       {/* Next up — the actionable section, so it leads */}
       <NextUpSection pages={nextUp} onOpen={onOpenPage} />
 
+      <TidyUpSection onMerge={setMergePair} refreshKey={tidyKey} />
+      {mergePair && (
+        <ConsolidateModal force
+          pages={[{ name: mergePair.source, title: mergePair.source }, { name: mergePair.target, title: mergePair.target }]}
+          prefill={{ source: mergePair.source, target: mergePair.target }}
+          onClose={() => setMergePair(null)}
+          onDone={() => { setMergePair(null); setTidyKey(k => k + 1); }} />
+      )}
+
       {/* Stats row */}
       <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
         <div className="bg-white border border-stone-200 rounded-xl p-3 text-center">
           <div className="text-2xl font-bold text-orange-500">{stats.total_approved}</div>
           <div className="text-[10px] text-stone-500 mt-0.5 leading-tight">approved<br/>{periodDays}d</div>
+          <TrendLine current={stats.total_approved} previous={prev?.total_approved} />
         </div>
         <div className="bg-white border border-stone-200 rounded-xl p-3 text-center">
           <div className="text-2xl font-bold text-blue-500">{recall.pages_read ?? 0}</div>
           <div className="text-[10px] text-stone-500 mt-0.5 leading-tight">pages read<br/>{periodDays}d</div>
+          <TrendLine current={recall.pages_read} previous={prev?.pages_read} />
         </div>
         <div className="bg-white border border-stone-200 rounded-xl p-3 text-center">
           <div className="text-2xl font-bold text-purple-500">{recall.questions_asked ?? 0}</div>
           <div className="text-[10px] text-stone-500 mt-0.5 leading-tight">questions asked<br/>{periodDays}d</div>
+          <TrendLine current={recall.questions_asked} previous={prev?.questions_asked} />
         </div>
         <div className="bg-white border border-stone-200 rounded-xl p-3 text-center">
           <div className={`text-2xl font-bold ${approvalRate != null && approvalRate < 60 ? "text-amber-500" : "text-emerald-500"}`}>
             {approvalRate == null ? "n/a" : `${approvalRate}%`}
           </div>
           <div className="text-[10px] text-stone-500 mt-0.5 leading-tight">approval rate<br/>{periodDays}d</div>
+          <TrendLine current={approvalRate} previous={prevRate} unit=" pts" />
         </div>
       </div>
       {/* Contribution heatmap */}

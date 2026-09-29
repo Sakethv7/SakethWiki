@@ -300,6 +300,17 @@ class ConsolidateRequest(BaseModel):
     source: str   # page to merge FROM (will be deleted after)
     target: str   # page to merge INTO (will be updated)
     force: bool = False  # allow manual override for non-high-confidence pairs
+    dry_run: bool = False  # draft only: return the merged text, write nothing
+    # Apply a previewed draft instead of calling the LLM again. The hashes must
+    # match the pages' current content, so an edit after the preview is caught.
+    merged: Optional[str] = None
+    source_sha: Optional[str] = None
+    target_sha: Optional[str] = None
+
+
+class DismissPairRequest(BaseModel):
+    source: str
+    target: str
 
 
 # ── /ingest ──────────────────────────────────────────────────────────────────
@@ -3184,6 +3195,7 @@ def _dashboard_stats_from_traces(
     now: Optional[datetime] = None,
     period_days: int = 30,
     heatmap_days: int = 112,
+    until: Optional[datetime] = None,
 ) -> dict:
     now = now or datetime.now()
     period_cutoff = now - timedelta(days=period_days)
@@ -3197,7 +3209,9 @@ def _dashboard_stats_from_traces(
             continue
         parsed_rows.append((trace, ts))
 
-    period_rows = [(t, ts) for t, ts in parsed_rows if ts > period_cutoff]
+    # `until` bounds the window from above so an earlier window (for trends)
+    # doesn't also count everything after it.
+    period_rows = [(t, ts) for t, ts in parsed_rows if ts > period_cutoff and (until is None or ts <= until)]
     period_approved = [(t, ts) for t, ts in period_rows if t.get("approved")]
     period_rejected = [(t, ts) for t, ts in period_rows if t.get("approved") is False]
     heatmap_approved = [(t, ts) for t, ts in parsed_rows if t.get("approved") and ts > heatmap_cutoff]
@@ -3276,24 +3290,28 @@ def _recall_stats(
     context_events: list[dict],
     now: Optional[datetime] = None,
     period_days: int = 30,
+    until: Optional[datetime] = None,
 ) -> dict:
     """Recall side of the loop: page reads and questions asked in the period."""
     now = now or datetime.now()
     cutoff = now - timedelta(days=period_days)
+
+    def in_window(ts: Optional[datetime]) -> bool:
+        return bool(ts) and ts > cutoff and (until is None or ts <= until)
 
     read_pages = []
     for entry in reads:
         # /log-read writes concept/ts; older rows may use page/timestamp.
         ts = _parse_iso_datetime(entry.get("ts") or entry.get("timestamp"))
         page = str(entry.get("concept") or entry.get("page") or "").strip()
-        if ts and ts > cutoff and page:
+        if in_window(ts) and page:
             read_pages.append(page)
 
     counts = {field: 0 for field in _QUESTION_EVENTS.values()}
     for event in context_events:
         field = _QUESTION_EVENTS.get(event.get("event_type"))
         ts = _parse_iso_datetime(event.get("ts"))
-        if field and ts and ts > cutoff:
+        if field and in_window(ts):
             counts[field] += 1
 
     return {
@@ -3337,8 +3355,22 @@ async def get_dashboard_stats():
                 except Exception:
                     continue
 
-    stats = _dashboard_stats_from_traces(traces)
-    stats["recall"] = _recall_stats(reads, telemetry.read_context_events(), period_days=stats["period_days"])
+    context_events = telemetry.read_context_events()
+    now = datetime.now()
+    stats = _dashboard_stats_from_traces(traces, now=now)
+    period = stats["period_days"]
+    stats["recall"] = _recall_stats(reads, context_events, now=now, period_days=period)
+
+    # Same-length window just before the current one, for trend arrows.
+    prev_end = now - timedelta(days=period)
+    prev = _dashboard_stats_from_traces(traces, now=prev_end, period_days=period, until=prev_end)
+    prev_recall = _recall_stats(reads, context_events, now=prev_end, period_days=period, until=prev_end)
+    stats["previous"] = {
+        "total_approved": prev["total_approved"],
+        "approval_rate": prev["approval_rate"],
+        "pages_read": prev_recall["pages_read"],
+        "questions_asked": prev_recall["questions_asked"],
+    }
     return stats
 
 
@@ -3837,11 +3869,20 @@ def review_queue(limit: int = 50, min_priority: str = "low"):
     return {"pages": pages, "total": len(pages)}
 
 
+# Plain def: scores every page pair (~seconds); FastAPI runs it in a worker
+# thread so the rest of the dashboard isn't frozen while it runs.
 @app.get("/consolidation-candidates")
-async def consolidation_candidates(limit: int = 50, include_weak: bool = False):
+def consolidation_candidates(limit: int = 50, include_weak: bool = False):
     """Return conservative duplicate/merge candidates without mutating the vault."""
     candidates = consolidation.find_candidates(limit=limit, include_weak=include_weak)
     return {"candidates": candidates, "total": len(candidates)}
+
+
+@app.post("/consolidation-candidates/dismiss")
+def dismiss_consolidation_candidate(req: DismissPairRequest):
+    """Remember that two pages are not duplicates so the pair stops appearing."""
+    consolidation.dismiss_pair(req.source, req.target)
+    return {"success": True}
 
 
 # ── /quick-note ───────────────────────────────────────────────────────────────
@@ -4645,6 +4686,41 @@ async def delete_page(page_name: str):
 
 # ── POST /consolidate ─────────────────────────────────────────────────────────
 
+def _draft_merge(source: str, target: str, source_content: str, target_content: str) -> str:
+    """Ask the LLM for the merged page text. Writes nothing."""
+    prompt = f"""You are merging two wiki pages about the same topic into one clean, canonical page.
+
+TARGET page (keep this slug/title): [[{target}]]
+{target_content}
+
+SOURCE page (merge into target, then it will be deleted): [[{source}]]
+{source_content}
+
+Rules:
+1. Deduplicate: if both pages have an entry from the same URL, keep only one (the fuller one)
+2. Merge all unique ## sections, ordered chronologically by date (oldest first)
+3. Standardise ALL wikilinks to kebab-case: [[ChainOfThought]] → [[chain-of-thought]], [[VectorDatabase]] → [[vector-database]]
+4. Write a single clean YAML frontmatter block using the TARGET page's title and slug
+5. Combine tags from both pages (no duplicates)
+6. Set entry_count = total number of ## sections in the merged result
+7. Set last_updated = today ({datetime.now().strftime("%Y-%m-%d")})
+8. Output ONLY the final merged markdown file, nothing else"""
+
+    merged = llm_client.complete(
+        task="consolidate_pages",
+        model=None,
+        max_tokens=3000,
+        messages=[{"role": "user", "content": prompt}],
+    ).strip()
+    # Strip accidental code fences
+    if merged.startswith("```"):
+        merged = merged.split("```", 2)[1]
+        if merged.startswith("markdown") or merged.startswith("md"):
+            merged = merged.split("\n", 1)[1]
+        merged = merged.rstrip("`").strip()
+    return merged
+
+
 # Plain def: blocking LLM call; FastAPI runs it in a worker thread so
 # other requests aren't frozen while it waits.
 @app.post("/consolidate")
@@ -4690,37 +4766,36 @@ def consolidate(req: ConsolidateRequest):
 
     source_content = source_path.read_text(encoding="utf-8")
     target_content = target_path.read_text(encoding="utf-8")
+    source_sha = hashlib.sha256(source_content.encode()).hexdigest()
+    target_sha = hashlib.sha256(target_content.encode()).hexdigest()
 
-    prompt = f"""You are merging two wiki pages about the same topic into one clean, canonical page.
+    if req.merged is not None:
+        # Applying a previewed draft: refuse if either page changed since.
+        if (req.source_sha, req.target_sha) != (source_sha, target_sha):
+            raise HTTPException(409, "A page changed since the preview. Preview the merge again.")
+        merged = req.merged
+    else:
+        merged = _draft_merge(source, target, source_content, target_content)
 
-TARGET page (keep this slug/title): [[{target}]]
-{target_content}
+    if req.dry_run:
+        return {
+            "success": True,
+            "preview": merged,
+            "source": source,
+            "target": target,
+            "source_sha": source_sha,
+            "target_sha": target_sha,
+            # A merged page much shorter than its inputs usually means the LLM
+            # output hit max_tokens and was cut off.
+            "input_chars": len(source_content) + len(target_content),
+            "merged_chars": len(merged),
+        }
 
-SOURCE page (merge into target, then it will be deleted): [[{source}]]
-{source_content}
-
-Rules:
-1. Deduplicate: if both pages have an entry from the same URL, keep only one (the fuller one)
-2. Merge all unique ## sections, ordered chronologically by date (oldest first)
-3. Standardise ALL wikilinks to kebab-case: [[ChainOfThought]] → [[chain-of-thought]], [[VectorDatabase]] → [[vector-database]]
-4. Write a single clean YAML frontmatter block using the TARGET page's title and slug
-5. Combine tags from both pages (no duplicates)
-6. Set entry_count = total number of ## sections in the merged result
-7. Set last_updated = today ({datetime.now().strftime("%Y-%m-%d")})
-8. Output ONLY the final merged markdown file, nothing else"""
-
-    merged = llm_client.complete(
-        task="consolidate_pages",
-        model=None,
-        max_tokens=3000,
-        messages=[{"role": "user", "content": prompt}],
-    ).strip()
-    # Strip accidental code fences
-    if merged.startswith("```"):
-        merged = merged.split("```", 2)[1]
-        if merged.startswith("markdown") or merged.startswith("md"):
-            merged = merged.split("\n", 1)[1]
-        merged = merged.rstrip("`").strip()
+    # Keep both originals so any merge can be undone by hand.
+    backup_dir = wiki_dir / "meta" / "consolidation-backups" / datetime.now().strftime("%Y%m%d-%H%M%S")
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    (backup_dir / f"{source}.md").write_text(source_content, encoding="utf-8")
+    (backup_dir / f"{target}.md").write_text(target_content, encoding="utf-8")
 
     _atomic_write_path(target_path, merged)
     source_path.unlink()
@@ -4740,6 +4815,7 @@ Rules:
         "success": True,
         "merged_into": f"_wiki/concepts/{target}.md",
         "deleted": f"_wiki/concepts/{source}.md",
+        "backup": str(backup_dir.relative_to(vault_path)),
     }
 
 

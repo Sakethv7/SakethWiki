@@ -107,3 +107,77 @@ page (about 1.3 s on 202 pages) with blocking file I/O. As `async def` it held
 the event loop, so the 10 ms `/dashboard-stats` call waited behind it. As plain
 `def`, FastAPI runs it in its threadpool. The request and response are
 unchanged. Measured: the tiles now render in about 70 ms instead of about 1350 ms.
+
+---
+
+# Round 2 contracts
+
+## `GET /dashboard-stats` (additive)
+
+One new top-level key, `previous`, holding the same metrics for the previous
+window of `period_days`:
+
+```json
+"previous": {
+  "total_approved": 83,
+  "approval_rate": 0.52,
+  "pages_read": 9,
+  "questions_asked": 14
+}
+```
+
+| Field | Type | Meaning |
+|---|---|---|
+| `previous.total_approved` | int ≥ 0 | Approved decisions in days 31–60 before now. |
+| `previous.approval_rate` | float or null | Same definition as `approval_rate`. Null when there were no decisions. |
+| `previous.pages_read` | int ≥ 0 | Read events in that window. |
+| `previous.questions_asked` | int ≥ 0 | Chat + interview questions in that window. |
+
+**Invariant:** the window is `(now − 2·period_days, now − period_days]`, the
+same length as the current one, with no overlap.
+
+Implementation note: `_dashboard_stats_from_traces` counts
+`ts > now − period_days`, so it needs an upper bound as well to exclude the
+current window. `_recall_stats` needs the same bound. Both get an optional
+`until: Optional[datetime]` parameter (default: no upper bound). Existing calls
+are unchanged.
+
+## `GET /consolidation-candidates` (unchanged contract, faster)
+
+Called as `?limit=8&include_weak=true`. Response shape is unchanged:
+`candidates[]` with `source`, `target`, `score`, `confidence`, `reasons`.
+Typical latency on 215 pages: about 1.8 s (previously it did not finish).
+
+## `POST /consolidate` (changed: preview, then apply)
+
+Request fields added (all optional, old callers unaffected):
+
+| Field | Type | Meaning |
+|---|---|---|
+| `dry_run` | bool | Return the LLM draft; write nothing. |
+| `merged` | string | Apply this previewed draft instead of calling the LLM. |
+| `source_sha`, `target_sha` | string | SHA-256 of each page from the preview. Required with `merged`. |
+
+Dry-run response: `preview`, `source`, `target`, `source_sha`, `target_sha`,
+`input_chars`, `merged_chars`.
+
+Apply response adds `backup`: the vault-relative folder holding both
+originals.
+
+Errors: `409` when a page changed after the preview. `400`, `404` as before.
+
+## `POST /consolidation-candidates/dismiss` (new)
+
+`{ "source", "target" }` → `{ "success": true }`. Stores the pair in
+`_wiki/meta/consolidation-dismissed.json`. Order doesn't matter.
+
+## Frontend
+
+- New `TidyUpSection({ onMerge })` below `NextUpSection`. It fetches its own
+  data on mount and shows a loading line while the scan runs.
+- `ConsolidateModal` gains an optional `force` prop and is now two steps for
+  every caller: Preview merge (dry run) → Apply merge. The Lint panel's merges
+  get the preview too.
+- `TidyUpSection` rows have a "Not a duplicate" button.
+- `DashboardTab` tiles render `current − previous` under each value when
+  `previous` exists.

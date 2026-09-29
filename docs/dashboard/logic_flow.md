@@ -111,3 +111,46 @@ No data migration. `/review-due` wrote nothing.
 
 - **UTC vs local timestamps** in `reads.jsonl` (see section 2). Fine for a 30-day
   window. Worth normalizing if a "today" metric is ever added.
+
+---
+
+# Round 2 flows
+
+## Trends
+
+```
+now        = datetime.now()
+current    = stats(now,                  window = period_days)
+previous   = stats(now − period_days,    window = period_days, until = now − period_days)
+response   = {...current, "previous": pick(previous)}
+```
+
+`pick` keeps four fields: approved, approval rate, pages read and questions
+asked. The frontend shows `current − previous` with ↑, ↓, or "same", and hides
+the line when `previous` is missing.
+
+## Tidy up
+
+```mermaid
+sequenceDiagram
+  participant UI as TidyUpSection
+  participant API as FastAPI
+  participant M as ConsolidateModal
+  UI->>API: GET /consolidation-candidates?limit=8&include_weak=true
+  Note over API: ~2 s, worker thread (plain def)
+  API-->>UI: up to 8 pairs with score + reasons
+  UI->>M: Merge clicked → prefill {source, target}, force
+  M->>API: POST /consolidate {source, target, force:true}
+  API-->>M: merged target written, source deleted
+  M->>UI: onDone → re-fetch candidates and Next up
+```
+
+*Caption: the dashboard only reads until you click Merge. The merge is the
+one step that writes, and it goes through the existing, unchanged endpoint.*
+
+`/consolidation-candidates` is `async def` today with blocking work inside, so
+it gets the same plain-`def` change as `/review-queue`. Otherwise its multi-second
+scan would freeze the rest of the dashboard.
+
+Failure: if the candidate request fails, the card is hidden. If a merge fails,
+the modal shows the error, as it already does.
