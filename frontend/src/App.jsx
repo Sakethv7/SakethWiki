@@ -1583,7 +1583,8 @@ function IngestTab({ onApproved, onSwitchToChat, onOpenPage }) {
 
 // ── CHAT TAB ──────────────────────────────────────────────────────────────────
 
-function ChatTab({ prefill }) {
+function ChatTab({ prefill, onOpenPage }) {
+  const [readingPage, setReadingPage] = useState(null);
   const [messages, setMessages] = useState([]);
   const [input, setInput] = useState("");
   // "Ask about it in Chat" from the topic of the day: fill the box, don't send.
@@ -1699,7 +1700,8 @@ function ChatTab({ prefill }) {
                   {msg.pages_read?.length > 0 && (
                     <div className="flex items-center gap-1 flex-wrap flex-1">
                       {msg.pages_read.map(p => (
-                        <span key={p} className="text-[11px] text-stone-400 font-mono bg-stone-100 px-1.5 py-0.5 rounded-md">[[{p}]]</span>
+                        <button key={p} onClick={() => setReadingPage(p)} title="Read this source"
+                          className="text-[11px] text-stone-500 font-mono bg-stone-100 px-1.5 py-0.5 rounded-md hover:bg-orange-50 hover:text-orange-700">[[{p}]]</button>
                       ))}
                     </div>
                   )}
@@ -1774,6 +1776,10 @@ function ChatTab({ prefill }) {
           </button>
         </div>
       </div>
+      {readingPage && (
+        <PageReaderModal name={readingPage} onClose={() => setReadingPage(null)}
+          onOpenPage={name => { setReadingPage(null); onOpenPage?.(name); }} />
+      )}
     </div>
   );
 }
@@ -3495,28 +3501,28 @@ function BrowseTab({ openTarget, active = true }) {
           <h2 className="text-base font-semibold text-stone-900">Knowledge Base</h2>
           <p className="text-xs text-stone-400 mt-0.5">{filtered.length} page{filtered.length !== 1 ? "s" : ""}{deepDiveFilter ? " flagged for deeper research" : reviewFilter ? " in the review queue (conflicts, no links, low maturity, stale)" : ` in ${folder}`}</p>
         </div>
-        <div className="flex gap-1.5">
+        <div className="flex flex-wrap justify-end gap-1.5">
           {["cs", "science", "humanities"].includes(folder) && (
             <>
               <button onClick={handleRandom}
                 className="text-xs px-3 py-1.5 rounded-xl border border-stone-200 text-stone-500 hover:bg-stone-50 transition-colors">
                 🎲 Random
               </button>
-              <button onClick={() => setDeepDiveFilter(v => !v)}
+              <button onClick={() => setDeepDiveFilter(v => !v)} title="Show only pages you flagged for deeper research"
                 className={`text-xs px-3 py-1.5 rounded-xl border transition-colors ${deepDiveFilter ? "bg-orange-500 text-white border-orange-500" : "border-orange-200 text-orange-500 hover:bg-orange-50"}`}>
-                🔍 Want more
+                🔍 Deep-dive list
               </button>
-              <button onClick={toggleReview}
+              <button onClick={toggleReview} title="Pages with conflicts, no links, low maturity, or not revisited"
                 className={`text-xs px-3 py-1.5 rounded-xl border transition-colors ${reviewFilter ? "bg-amber-500 text-white border-amber-500" : "border-amber-200 text-amber-600 hover:bg-amber-50"}`}>
                 🕰 Review
               </button>
             </>
           )}
-          <button onClick={() => { setShowInsights(v => !v); setShowLint(false); }}
+          <button onClick={() => { setShowInsights(v => !v); setShowLint(false); }} title="What the weekly analysis learned about your captures"
             className={`text-xs px-3 py-1.5 rounded-xl border transition-colors ${showInsights ? "bg-indigo-600 text-white border-indigo-600" : "border-indigo-200 text-indigo-500 hover:bg-indigo-50"}`}>
-            🧠 Learn
+            🧠 System insights
           </button>
-          <button onClick={() => { setShowLint(v => !v); setShowInsights(false); }}
+          <button onClick={() => { setShowLint(v => !v); setShowInsights(false); }} title="Scan the vault for broken links, duplicates and gaps"
             className={`text-xs px-3 py-1.5 rounded-xl border transition-colors ${showLint ? "bg-stone-900 text-white border-stone-900" : "border-stone-200 text-stone-500 hover:bg-stone-50"}`}>
             Health
           </button>
@@ -3894,6 +3900,13 @@ function PageReaderModal({ name, onClose, onOpenPage }) {
   useEffect(() => {
     setData(null);
     api(`/page/${current}`).then(setData).catch(e => setData({ error: e.message || "Failed to load" }));
+    // Count reading here the same way Browse does, so in-place readers
+    // (dashboard, Revise, Chat sources) don't undercount "pages read".
+    const started = Date.now();
+    return () => {
+      const dur = Math.round((Date.now() - started) / 1000);
+      if (dur >= 2) api("/log-read", { method: "POST", keepalive: true, body: JSON.stringify({ page: current, duration_seconds: dur }) }).catch(() => {});
+    };
   }, [current]);
 
   return (
@@ -3962,6 +3975,14 @@ function ComparePairModal({ pair, kind = "duplicate", mergeMax, onClose, onOpenP
   // Full page is read inside the modal: navigating to Browse unmounted the
   // dashboard and lost the comparison.
   const [reading, setReading] = useState(null); // { name, data } | null
+  useEffect(() => {
+    if (!reading?.name) return;
+    const started = Date.now();
+    return () => {
+      const dur = Math.round((Date.now() - started) / 1000);
+      if (dur >= 2) api("/log-read", { method: "POST", keepalive: true, body: JSON.stringify({ page: reading.name, duration_seconds: dur }) }).catch(() => {});
+    };
+  }, [reading?.name]);
 
   async function readPage(name) {
     const cached = pages[name];
@@ -5519,10 +5540,11 @@ export default function App() {
 
       {/* Tab bar */}
       <div className="bg-white border-b border-stone-200 px-4">
-        <div className="flex max-w-2xl mx-auto w-full">
+        {/* Scrolls sideways on narrow screens instead of widening the whole page. */}
+        <div className="flex max-w-2xl mx-auto w-full overflow-x-auto">
           {visibleTabs.map((t) => (
             <button key={t.id} onClick={() => setTab(t.id)}
-              className={`flex items-center gap-2 px-4 py-3 text-sm font-medium border-b-2 transition-colors ${
+              className={`flex shrink-0 whitespace-nowrap items-center gap-2 px-4 py-3 text-sm font-medium border-b-2 transition-colors ${
                 tab === t.id
                   ? "border-orange-500 text-orange-600"
                   : "border-transparent text-stone-500 hover:text-stone-700"
@@ -5543,7 +5565,7 @@ export default function App() {
             <IngestTab onApproved={refreshTagGroups} onSwitchToChat={() => setTab("chat")} onOpenPage={openSavedPage} />
           </div>
           <div className={tab === "chat" ? "flex flex-col" : "hidden"} style={{ height: "calc(100vh - 120px)" }}>
-            <ChatTab prefill={chatPrefill} />
+            <ChatTab prefill={chatPrefill} onOpenPage={openSavedPage} />
           </div>
           <div className={tab === "revise" ? "" : "hidden"}>
             <ReviseTab active={tab === "revise"} onOpenPage={openSavedPage} onAsk={askInChat} />
