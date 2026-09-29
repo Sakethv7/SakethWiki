@@ -67,7 +67,7 @@ OLLAMA_MODEL_VISION=qwen2.5vl:7b
 ```
 
 Task keys currently used in code include:
-`INGEST_EXTRACT`, `CHAT_ANSWER`, `INTERVIEW_VERIFY`, `INTERVIEW_GRADE`,
+`INGEST_EXTRACT`, `CHAT_ANSWER`, `REVISION_QUESTIONS`,
 `EVOLUTION_CLASSIFY`, `TAG_CLASSIFY`, `ANALYZE_TRACES`, `LINT_SCAN`,
 `LINT_JSON_FIX`, `CONSOLIDATE_PAGES`, `KNOWLEDGE_GAPS`.
 
@@ -218,6 +218,8 @@ cd frontend && npm run build
 | GET | `/consolidation-candidates` | Likely duplicate page pairs (no LLM). `include_weak=true` for the dashboard's Tidy up list |
 | POST | `/consolidation-candidates/dismiss` | Mark a pair as not a duplicate |
 | GET | `/attention` | Dashboard "Needs attention": contradictions, likely duplicates, and unlinked pages with their closest page (no LLM) |
+| GET | `/revision/today` | Today's revision set (seeded by date) and topic of the day. `summary=1` for the Mac notification |
+| POST | `/revision/rate` | Rate a revision card: forgot / shaky / knew; returns the next due date |
 | POST | `/ingest-text` | Ingest plain text directly (no URL fetch) |
 | POST | `/analyze-traces` | Run weekly self-learning analysis on approval traces |
 | GET | `/system-insights` | Return current system insights and prompt hints |
