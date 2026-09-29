@@ -81,7 +81,7 @@ flowchart TD
     FE -->|Capture URL/text/image| ING[POST /ingest]
     FE -->|Ask question| CHAT[POST /chat]
     FE -->|Browse page| PAGE[GET /page/name]
-    FE -->|Health/review| REVIEW[GET /active-review\nGET /lint\nGET /consolidation-candidates]
+    FE -->|Health/review| REVIEW[GET /review-queue\nGET /lint\nGET /consolidation-candidates]
 
     ING --> FETCH{Input type}
     FETCH -->|URL| HTML[httpx fetch\nBeautifulSoup parse]
@@ -112,9 +112,11 @@ flowchart TD
     REJECT --> TRACE
     TRACE --> PREF
 
-    CHAT --> SYNC[memory_store.sync_index]
-    VAULT --> SYNC
+    WRITE --> SYNC[memory_store.index_page]
+    APPROVE --> SYNC
+    VAULT --> SYNC[startup / reindex: sync_index]
     SYNC --> DB[_wiki/meta/memory.db]
+    CHAT --> DB
     DB --> RETRIEVE[lexical retrieval\noptional embedding rerank]
     ALIAS --> RETRIEVE
     RETRIEVE --> ANSWER[routed chat LLM]
@@ -196,7 +198,7 @@ The Browse tab calls `GET /pages` and `GET /page/{name}`. `vault_reader.py` sear
 
 Maintenance is split into three safety levels.
 
-Active review is deterministic. `/active-review` ranks weak, stale, orphaned, thin, or conflicting pages using maturity, backlinks, read/update signals, entry count, word count, and warning markers. This tells you what to inspect next.
+Active review is deterministic. `/review-queue` ranks weak, stale, orphaned, thin, or conflicting pages using maturity, backlinks, read/update signals, entry count, word count, and warning markers. This tells you what to inspect next. (An `/active-review` alias existed and was removed in the lean refactor; it was byte-identical to `/review-queue`.)
 
 Health check linting can call an LLM for higher-level inconsistencies and gaps, then combines that with deterministic link and identity audits. It should report issues before applying changes.
 
@@ -291,7 +293,7 @@ The understanding block is **rewritten** on each approval (not appended to), so 
 | URL fetch + parse | `httpx + BeautifulSoup` | Zero LLM — deterministic, fast, free |
 | Content extraction (long/image) | Anthropic (`INGEST_EXTRACT`) | Quality-critical; multimodal-heavy |
 | Evolution classification | Ollama/Qwen by default | Contract fallback to Anthropic on invalid output |
-| Chat page selection | Ollama/Qwen by default | Cheap + low latency |
+| Chat / Interview page selection | Deterministic (SQLite FTS + optional vectors) | No LLM — the `chat_select_pages` task was removed in the lean refactor |
 | Chat Q&A | Ollama/Qwen by default | Can be overridden per task |
 | Lint / consolidate / knowledge gaps | Anthropic by default | Integrity-critical tasks |
 | All routing/parsing | Pure Python + `llm_client` | Task-based provider routing + contract guardrails |
@@ -403,7 +405,6 @@ graph LR
     E[frontmatter maturity] --> B
     F[conflict markers] --> B
     B --> G[priority score]
-    G --> H[/active-review]
     G --> I[/review-queue]
 ```
 

@@ -150,11 +150,12 @@ File modifications on disk + ackedMap updated
 ```
 User question
     ↓
-sync_index() → detect changed/deleted pages and refresh memory.db
-    ↓
-SQLite memory search over chunked notes
+SQLite memory search over chunked notes (no per-query vault scan;
+  the index is refreshed on write events and at startup — see below)
     ↓
 optional embedding rerank (only if EMBED_ENABLED=true)
+    ↓
+if the index returns nothing: one keyword-scan fallback (find_relevant_pages)
     ↓
 top page hits + snippets + current understanding
     ↓
@@ -167,7 +168,13 @@ Return: {answer, knowledge_card?, sources}
 
 **Note loop:** Chat answers can call `/chat-notes` with one of four note types: `correction`, `contradiction`, `example`, or `nuance`. The backend writes `event_type: chat_note` to `_wiki/meta/traces.jsonl` and `chat_note` context telemetry, including related pages and the original question. These notes are audit evidence for later concept-page improvement; they do not auto-patch Markdown.
 
+**Observability:** every LLM call routes through `llm_client.complete()`, which writes a row to `telemetry.py`'s JSONL logs and — when `LANGFUSE_*` env is set — emits one generation span to Langfuse (model, tokens, cost, latency, contract/fallback/retry state). Langfuse is optional and non-blocking; a failure there never reaches the caller.
+
 **Design shift:** Markdown is still the source of truth, but it is no longer the retrieval index. The durable retrieval layer lives in `_wiki/meta/memory.db`, which stores page metadata plus chunked snippets and optional embeddings.
+
+**Index freshness:** `memory_store.search` no longer rebuilds the index per query. Single-page writes call `memory_store.index_page` / `remove_page` directly (approve, edit-page, quick-note, add-link, create-stub, consolidate, fix-page, delete-page). A full `sync_index()` runs at startup, after a vault-wide POV rewrite, and on demand via `POST /memory/reindex` — the escape hatch for edits made outside the app (git pull, Obsidian).
+
+**Interview** (`/interview`) uses the same retrieval path as `/chat` and writes an `event_type: interview` trace plus an `interview_context` telemetry event, so practice reps feed the weekly self-learning analysis. Verification is opt-in (`want_verification`); grading runs only when the user submits their own answer.
 
 ### 5. Learning Dashboard
 
@@ -187,6 +194,7 @@ Calculate metrics:
   - Tag frequency (top 10)
   - Source type frequency
   - New concepts this week
+Read reads.jsonl + context_budget_logs.jsonl → recall block
     ↓
 Return: {
   period_days: 30,
@@ -196,34 +204,34 @@ Return: {
   learning_velocity: {entries_per_week, concepts_per_week},
   top_tags: [{tag, count}, ...],
   top_sources: [{source, count}, ...],
-  new_concepts_this_week: number
+  new_concepts_this_week: number,
+  recall: {pages_read, unique_pages_read, questions_asked, chat_questions, interview_questions}
 }
 ```
 
 **Frontend Rendering:**
-- Compact 3-stat row: total approved · unique concepts · new this week
+- Waiting links: queue items (→ Capture) and open threads (→ Browse), shown only when non-zero
+- Next up: top 5 high-priority pages from `GET /review-queue`, each with its suggested action (loads after the tiles)
+- Four 30-day tiles: approved · pages read · questions asked · approval rate
 - Activity heatmap: GitHub-style 16-week × 7-day grid (orange intensity scale)
-- Tag breakdown: Horizontal bars with orange fill, sorted by frequency
-- Source breakdown: Pill chips with emoji indicators
-- "Recently Read" section: last N unique reads (hidden when empty)
+- Design and decisions: `docs/dashboard/`
 
 **Cost:** $0 (file I/O only; no LLM calls)
 
-### 7. Recently Read
+### 7. Read Tracking
 
-**Entry points:** `POST /log-read`, `GET /recent-reads`
+**Entry points:** `POST /log-read`
 
 **Flow:**
 ```
-User navigates away from concept page (Back button or page switch)
+User navigates away from concept page (Back, page switch, leaving Browse, or page unload)
     ↓
 Frontend fires POST /log-read { page, duration_seconds }
     ↓
 Backend appends {ts, concept, duration_seconds} to _wiki/meta/reads.jsonl
     ↓
-GET /recent-reads → deduplicates by concept, returns last N (default 10)
-    ↓
-Dashboard "Recently Read" section renders the list (hidden when empty)
+Read by /dashboard-stats (recall tiles), /review-queue (staleness),
+and /calculate-maturity (activity score)
 ```
 
 **Cost:** $0 (file append + sequential scan)
@@ -512,7 +520,6 @@ Runtime changes such as context-budget increases, routing overrides, eval-case e
 | `/analyze-traces` (weekly) | $0.10-0.30 | 30-60s | Weekly Sonnet analysis |
 | Trace logging | $0 | <1ms | File append only |
 | `/log-read` (read tracking) | $0 | <1ms | File append only |
-| `/recent-reads` (recent pages) | $0 | <5ms | Sequential scan of reads.jsonl |
 | `/normalize-tags` (tag map) | $0 | <5ms | Dict lookup against ontology |
 | `/ingest` (iOS fast path) | $0.02-0.05 | ~20ms (sync) | Background extraction fires async |
 

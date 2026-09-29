@@ -460,7 +460,7 @@ def test_store_image_skips_large_optional_caption(monkeypatch, tmp_path):
     monkeypatch.setattr(llm_client, "complete", fail_if_called)
     image_data = base64.b64encode(b"large-enough-image-bytes").decode("ascii")
 
-    result = asyncio.run(main.store_image(main.IngestRequest(images=[{"data": image_data, "mediaType": "image/png"}])))
+    result = main.store_image(main.IngestRequest(images=[{"data": image_data, "mediaType": "image/png"}]))
     context = telemetry.summarize_context_events()
 
     assert result["saved"][0]["filename"].endswith("image-1.png")
@@ -631,7 +631,7 @@ def test_dashboard_stats_distinguish_new_touched_and_rejected():
     assert stats["top_tags"][0] == {"tag": "Agents", "count": 2}
 
 
-def test_review_due_handles_string_maturity(monkeypatch, tmp_path):
+def test_review_queue_handles_string_maturity(monkeypatch, tmp_path):
     vault = tmp_path / "vault"
     (vault / "_wiki" / "cs").mkdir(parents=True)
     (vault / "_wiki" / "meta").mkdir(parents=True)
@@ -652,11 +652,11 @@ def test_review_due_handles_string_maturity(monkeypatch, tmp_path):
         extra_frontmatter='understanding_maturity: "25"',
     )
 
-    result = asyncio.run(main.review_due())
+    result = main.review_queue(limit=50, min_priority="low")
 
-    names = {row["name"] for row in result["due"]}
-    assert "quoted-maturity" not in names
-    assert "weak-string-maturity" in names
+    reasons = {row["name"]: row["reasons"] for row in result["pages"]}
+    assert not any("maturity" in r for r in reasons["quoted-maturity"])
+    assert "low maturity (25)" in reasons["weak-string-maturity"]
 
 
 def test_telemetry_summarizes_ingest_latency(monkeypatch, tmp_path):

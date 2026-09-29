@@ -50,6 +50,19 @@ async function ensureMermaid() {
   return _mermaidLib;
 }
 
+async function validateMermaidRender(chart) {
+  if (!chart) return;
+  const mermaid = await ensureMermaid();
+  const tmp = document.createElement("div");
+  tmp.style.position = "absolute"; tmp.style.visibility = "hidden";
+  document.body.appendChild(tmp);
+  try {
+    await mermaid.render(`diagram-validation-${Math.random().toString(36).slice(2)}`, sanitizeMermaid(chart), tmp);
+  } finally {
+    try { document.body.removeChild(tmp); } catch {}
+  }
+}
+
 function MermaidDiagram({ chart }) {
   const uid = useRef(`md-${Math.random().toString(36).slice(2)}`);
   const [svg, setSvg] = useState("");
@@ -536,7 +549,7 @@ function QueueSection({ onApproved, onExtractPreview }) {
   );
 }
 
-function HistorySection() {
+function HistorySection({ onOpenPage }) {
   const [entries, setEntries] = useState([]);
   const [open, setOpen] = useState(false);
 
@@ -556,7 +569,10 @@ function HistorySection() {
         <div className="mt-2 space-y-1">
           {entries.length === 0 && <p className="text-xs text-stone-400 px-1">No history yet.</p>}
           {entries.filter(e => e.type !== "delete").map((e, i) => {
-            const page = e.written_to.replace(/^_wiki\/[^/]+\//, "").replace(/\.md$/, "");
+            const writtenTo = e.written_to || "";
+            const writtenMatch = writtenTo.match(/^_wiki\/([^/]+)\/([^/]+)\.md$/);
+            const page = writtenMatch ? writtenMatch[2] : "";
+            const pageFolder = writtenMatch ? writtenMatch[1] : "";
             const tagsArr = e.tags ? e.tags.replace(/^\[|\]$/g, "").split(",").map(t => t.trim()).filter(Boolean) : [];
             const label = e.type === "ingest"
               ? page || e.source.split("/").pop() || "untitled"
@@ -566,7 +582,15 @@ function HistorySection() {
             return (
               <div key={i} className="flex items-start gap-2.5 px-3 py-2 bg-white border border-stone-100 rounded-xl text-xs">
                 <span className="shrink-0 text-stone-300 font-mono">{e.ts.slice(5)}</span>
-                <span className="flex-1 text-stone-600 truncate">{label}</span>
+                {page ? (
+                  <button type="button" onClick={() => onOpenPage?.(page, pageFolder)}
+                    className="flex-1 min-w-0 text-left text-orange-600 hover:text-orange-700 hover:underline truncate"
+                    title={`Open ${page} in Browse`}>
+                    {label}
+                  </button>
+                ) : (
+                  <span className="flex-1 text-stone-600 truncate">{label}</span>
+                )}
                 {tagsArr.slice(0, 2).map(t => (
                   <span key={t} className="shrink-0 text-[10px] px-1.5 py-0.5 bg-stone-100 text-stone-500 rounded-full">{t}</span>
                 ))}
@@ -604,7 +628,7 @@ function looksLikeMarkdownClip(text) {
   return frontmatter || (longEnough && ((heading && bullet) || (heading && linkRef) || (bullet && linkRef) || codeFence));
 }
 
-function IngestTab({ onApproved, onSwitchToChat }) {
+function IngestTab({ onApproved, onSwitchToChat, onOpenPage }) {
   const [input, setInput] = useState("");
   const [images, setImages] = useState([]);
   const [userNotes, setUserNotes] = useState("");
@@ -626,6 +650,8 @@ function IngestTab({ onApproved, onSwitchToChat }) {
   const [savingImage, setSavingImage] = useState(false);
   const [savedImages, setSavedImages] = useState(null);
   const [regeneratingMode, setRegeneratingMode] = useState(null);
+  const [diagramCandidate, setDiagramCandidate] = useState(null);
+  const [diagramIntent, setDiagramIntent] = useState("faithful_source");
   const [polishing, setPolishing] = useState(false);
   const [expanding, setExpanding] = useState(false);
   const [expandOpen, setExpandOpen] = useState(false);
@@ -937,6 +963,22 @@ function IngestTab({ onApproved, onSwitchToChat }) {
     setRegeneratingMode(mode);
     setError("");
     try {
+      if (mode === "diagram") {
+        const display = preview.diff_preview || preview;
+        const data = await api(`/queue/${preview.id}/diagram-regenerations`, {
+          method: "POST",
+          body: JSON.stringify({
+            expected_revision: display.revision || 0,
+            idempotency_key: crypto.randomUUID(),
+            intent: diagramIntent,
+          }),
+        });
+        setDiagramCandidate(data.candidate);
+        setPreview({ ...preview, diff_preview: { ...display, revision: data.revision } });
+        setDone("Validated diagram candidate created — select it to use it");
+        setQueueKey(k => k + 1);
+        return;
+      }
       const data = await api(`/queue/regenerate/${preview.id}`, {
         method: "POST",
         body: JSON.stringify({ mode }),
@@ -950,6 +992,24 @@ function IngestTab({ onApproved, onSwitchToChat }) {
     } finally {
       setRegeneratingMode(null);
     }
+  }
+
+  async function handleSelectDiagramCandidate() {
+    if (!preview?.id || !diagramCandidate) return;
+    setRegeneratingMode("select-diagram"); setError("");
+    try {
+      await validateMermaidRender(diagramCandidate.diagram);
+      const display = preview.diff_preview || preview;
+      const data = await api(`/queue/${preview.id}/diagram-selection`, {
+        method: "POST",
+        body: JSON.stringify({ expected_revision: display.revision || 0, candidate_id: diagramCandidate.id }),
+      });
+      setPreview({ ...preview, diff_preview: { ...display, ...data.diff_preview, revision: data.revision } });
+      setDiagramCandidate(null);
+      setDone("Diagram candidate selected — review before saving to wiki");
+      setQueueKey(k => k + 1);
+    } catch (e) { setError(e.message); }
+    finally { setRegeneratingMode(null); }
   }
 
   return (
@@ -1147,7 +1207,7 @@ function IngestTab({ onApproved, onSwitchToChat }) {
       )}
 
       {!preview && <QueueSection key={queueKey} onApproved={() => { onApproved?.(); setQueueKey(k => k + 1); }} onExtractPreview={(data) => { setPreview(data); setEdits(null); setQueueKey(k => k + 1); }} />}
-      {!preview && <HistorySection />}
+      {!preview && <HistorySection onOpenPage={onOpenPage} />}
 
       {preview && display && (
         <div className="bg-white rounded-2xl border border-stone-200 shadow-sm overflow-hidden">
@@ -1457,11 +1517,23 @@ function IngestTab({ onApproved, onSwitchToChat }) {
                 </div>
               </div>
             )}
+            {diagramCandidate && (
+              <div className="space-y-2 rounded-xl border border-emerald-200 bg-emerald-50/40 p-3">
+                <div className="flex items-center justify-between gap-3">
+                  <p className="text-xs font-semibold text-emerald-800">Validated diagram candidate · {diagramCandidate.diagram_plan?.type || "structure"}</p>
+                  <button onClick={handleSelectDiagramCandidate} disabled={!!regeneratingMode || approving}
+                    className="text-xs px-3 py-1.5 rounded-lg bg-emerald-700 text-white hover:bg-emerald-800 disabled:opacity-40">
+                    {regeneratingMode === "select-diagram" ? "Selecting…" : "Use this diagram"}
+                  </button>
+                </div>
+                {diagramCandidate.diagram ? <MermaidDiagram chart={diagramCandidate.diagram} /> : <p className="text-xs text-emerald-800">This source does not need a diagram. Select to remove the current one.</p>}
+              </div>
+            )}
           </div>
 
           {/* Actions */}
           <div className="px-5 py-4 border-t border-stone-100 bg-stone-50/40 space-y-3">
-            <div className="flex gap-2">
+            <div className="flex flex-wrap gap-2 items-center">
               <button
                 onClick={() => handleRegenerate("full")}
                 disabled={!!regeneratingMode || approving}
@@ -1476,6 +1548,12 @@ function IngestTab({ onApproved, onSwitchToChat }) {
               >
                 {regeneratingMode === "diagram" ? "Regenerating diagram…" : "Regenerate diagram"}
               </button>
+              <select value={diagramIntent} onChange={e => setDiagramIntent(e.target.value)} disabled={!!regeneratingMode || approving}
+                className="text-xs rounded-lg border border-stone-200 bg-white px-2 py-1.5 text-stone-600">
+                <option value="faithful_source">Faithful source</option>
+                <option value="explain_mechanism">Explain mechanism</option>
+                <option value="compare_alternatives">Compare alternatives</option>
+              </select>
             </div>
             <label className="flex items-center gap-2.5 cursor-pointer select-none group">
               <div className={`w-8 h-4 rounded-full transition-colors ${openThread ? "bg-orange-500" : "bg-stone-200"}`}
@@ -1970,13 +2048,13 @@ function ConceptPageView({ page }) {
             title="View evolution timeline"
           >
             <span className="text-lg">{page.evolution_badge}</span>
-            <span className="text-xs font-semibold uppercase tracking-wide opacity-70">Current understanding</span>
+            <span className="text-sm font-semibold uppercase tracking-wide opacity-70">Current understanding</span>
           </button>
           <div className="flex items-center gap-1.5 shrink-0">
             {maturity !== undefined && (
               <>
                 <div className="flex items-center gap-1 px-2 py-1 bg-white/50 rounded-lg">
-                  <span className="text-xs font-medium text-stone-700">{maturity}</span>
+                  <span className="text-xs font-medium text-stone-700">Maturity {maturity}/100</span>
                   <div className="w-16 h-1.5 bg-stone-200 rounded-full overflow-hidden">
                     <div
                       className={`h-full transition-colors ${
@@ -1990,7 +2068,8 @@ function ConceptPageView({ page }) {
                   <button
                     onClick={recalcMaturity}
                     disabled={recalculating}
-                    title="Recalculate maturity score"
+                    aria-label="Recalculate maturity score"
+                    title="Recalculate maturity from backlinks, sources, revisions, activity, and contradictions"
                     className="ml-0.5 text-stone-400 hover:text-stone-600 disabled:opacity-40 transition-colors"
                   >
                     <svg className={`w-3 h-3 ${recalculating ? "animate-spin" : ""}`} fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -2009,7 +2088,7 @@ function ConceptPageView({ page }) {
                   className="text-xs px-2 py-1 bg-white/50 rounded-lg text-stone-500 hover:text-stone-700 disabled:opacity-40"
                   title="Calculate maturity score"
                 >
-                  {recalculating ? "…" : "Score"}
+                    {recalculating ? "…" : "Calculate maturity"}
                 </button>
                 <span className="text-xs opacity-50">·</span>
               </>
@@ -2019,7 +2098,7 @@ function ConceptPageView({ page }) {
             <span className="text-xs opacity-60">{page.entry_count} {page.entry_count === 1 ? "source" : "sources"}</span>
           </div>
         </div>
-        <p className="text-sm leading-relaxed font-medium">
+        <p className="text-lg leading-relaxed font-medium">
           {page.current_understanding || "No understanding captured yet."}
         </p>
         {page.evolution_note && (
@@ -2052,7 +2131,7 @@ function ConceptPageView({ page }) {
                 <button onClick={() => toggleSection(i)}
                   className="w-full flex items-center justify-between px-4 py-2.5 hover:bg-stone-50 transition-colors text-left">
                   <div className="flex items-center gap-2 min-w-0">
-                    <span className="text-xs font-medium text-stone-700 truncate">
+                    <span className="text-base font-medium text-stone-700 truncate">
                       {sec.url ? <a href={sec.url} target="_blank" rel="noreferrer" onClick={e => e.stopPropagation()} className="hover:text-orange-600 transition-colors">{sec.title || sec.url}</a> : (sec.title || "Source")}
                     </span>
                   </div>
@@ -2064,9 +2143,9 @@ function ConceptPageView({ page }) {
                 {expandedSections.has(i) && (
                   <div className="px-4 pb-3 border-t border-stone-50 space-y-2">
                     {sec.bullets?.length > 0 && (
-                      <ul className="space-y-1 mt-2">
+                      <ul className="space-y-2 mt-3">
                         {sec.bullets.map((b, j) => (
-                          <li key={j} className="flex gap-2 text-xs text-stone-600">
+                          <li key={j} className="flex gap-2 text-base leading-relaxed text-stone-700">
                             <span className="text-orange-400 shrink-0 mt-0.5">•</span>
                             <span>{b}</span>
                           </li>
@@ -2074,7 +2153,7 @@ function ConceptPageView({ page }) {
                       </ul>
                     )}
                     {sec.key_insight && (
-                      <p className="text-xs text-stone-500 border-l-2 border-orange-200 pl-2 italic mt-1">{sec.key_insight}</p>
+                      <p className="text-sm text-stone-600 border-l-2 border-orange-200 pl-3 italic mt-2">{sec.key_insight}</p>
                     )}
                     {sec.diagram && <MermaidDiagram chart={sec.diagram} />}
                     {sec.related?.length > 0 && (
@@ -2693,62 +2772,103 @@ function LintPanel({ onClose, onConsolidate, onFix }) {
   );
 }
 
-function ConsolidateModal({ pages, prefill, onClose, onDone }) {
+function ConsolidateModal({ pages, prefill, onClose, onDone, force = false }) {
   const [source, setSource] = useState(prefill?.source || "");
   const [target, setTarget] = useState(prefill?.target || "");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
+  const [draft, setDraft] = useState(null); // dry-run result, shown before anything is written
 
-  async function handleMerge() {
+  const body = extra => JSON.stringify({ source, target, ...(force ? { force: true } : {}), ...extra });
+
+  async function handlePreview() {
     if (!source || !target || source === target) return;
     setLoading(true); setError("");
     try {
-      await api("/consolidate", { method: "POST", body: JSON.stringify({ source, target }) });
+      setDraft(await api("/consolidate", { method: "POST", body: body({ dry_run: true }) }));
+    } catch (e) { setError(e.message); }
+    setLoading(false);
+  }
+
+  async function handleApply() {
+    setLoading(true); setError("");
+    try {
+      await api("/consolidate", { method: "POST", body: body({ merged: draft.preview, source_sha: draft.source_sha, target_sha: draft.target_sha }) });
       onDone();
     } catch (e) { setError(e.message); setLoading(false); }
   }
 
+  // A merged page far shorter than its two inputs usually means the LLM output was cut off.
+  const keptPct = draft ? Math.round((draft.merged_chars / Math.max(1, draft.input_chars)) * 100) : null;
+  const pick = setter => e => { setter(e.target.value); setDraft(null); };
+
   return (
     <div className="fixed inset-0 bg-black/30 backdrop-blur-sm flex items-center justify-center z-50 p-4">
-      <div className="bg-white rounded-2xl shadow-xl border border-stone-200 p-5 w-full max-w-sm space-y-4">
+      <div className={`bg-white rounded-2xl shadow-xl border border-stone-200 p-5 w-full ${draft ? "max-w-2xl" : "max-w-sm"} space-y-4`}>
         <div className="flex items-center justify-between">
-          <h3 className="font-semibold text-stone-900">Merge pages</h3>
+          <h3 className="font-semibold text-stone-900">{draft ? "Review merge" : "Merge pages"}</h3>
           <button onClick={onClose} className="w-6 h-6 flex items-center justify-center text-stone-400 hover:text-stone-600 rounded-lg hover:bg-stone-100 text-xs">✕</button>
         </div>
-        <p className="text-xs text-stone-500">Sonnet will merge SOURCE into TARGET, remove duplicates, fix wikilinks, then delete SOURCE.</p>
 
-        <div className="space-y-1.5">
-          <label className="text-xs font-medium text-stone-600">Source (will be deleted)</label>
-          <select value={source} onChange={e => setSource(e.target.value)}
-            className="w-full border border-stone-200 rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-orange-300 bg-white">
-            <option value="">— select page —</option>
-            {pages.filter(p => p.name !== target).map(p => (
-              <option key={p.name} value={p.name}>{p.title}</option>
-            ))}
-          </select>
-        </div>
+        {!draft ? (
+          <>
+            <p className="text-xs text-stone-500">An LLM drafts SOURCE merged into TARGET. You review the draft before anything is saved. Applying deletes SOURCE; both originals are backed up first.</p>
 
-        <div className="space-y-1.5">
-          <label className="text-xs font-medium text-stone-600">Target (kept, merged into)</label>
-          <select value={target} onChange={e => setTarget(e.target.value)}
-            className="w-full border border-stone-200 rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-orange-300 bg-white">
-            <option value="">— select page —</option>
-            {pages.filter(p => p.name !== source).map(p => (
-              <option key={p.name} value={p.name}>{p.title}</option>
-            ))}
-          </select>
-        </div>
+            <div className="space-y-1.5">
+              <label className="text-xs font-medium text-stone-600">Source (will be deleted)</label>
+              <select value={source} onChange={pick(setSource)}
+                className="w-full border border-stone-200 rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-orange-300 bg-white">
+                <option value="">— select page —</option>
+                {pages.filter(p => p.name !== target).map(p => (
+                  <option key={p.name} value={p.name}>{p.title}</option>
+                ))}
+              </select>
+            </div>
+
+            <div className="space-y-1.5">
+              <label className="text-xs font-medium text-stone-600">Target (kept, merged into)</label>
+              <select value={target} onChange={pick(setTarget)}
+                className="w-full border border-stone-200 rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-orange-300 bg-white">
+                <option value="">— select page —</option>
+                {pages.filter(p => p.name !== source).map(p => (
+                  <option key={p.name} value={p.name}>{p.title}</option>
+                ))}
+              </select>
+            </div>
+          </>
+        ) : (
+          <>
+            <p className="text-xs text-stone-500">
+              <span className="font-medium text-stone-700">{draft.source}</span> → <span className="font-medium text-stone-700">{draft.target}</span>.
+              {" "}Merged page is {draft.merged_chars.toLocaleString()} characters, {keptPct}% of the two originals combined.
+            </p>
+            {keptPct < 60 && (
+              <p className="text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2">
+                The draft is much shorter than the two pages together. Content may have been dropped or cut off. Read it carefully before applying.
+              </p>
+            )}
+            <pre className="text-xs text-stone-700 bg-stone-50 border border-stone-200 rounded-xl p-3 max-h-96 overflow-auto whitespace-pre-wrap">{draft.preview}</pre>
+          </>
+        )}
 
         {error && <p className="text-xs text-red-500">{error}</p>}
 
         <div className="flex gap-2">
-          <button onClick={onClose} className="flex-1 py-2.5 border border-stone-200 rounded-xl text-sm text-stone-600 hover:bg-stone-50 transition-colors">
-            Cancel
+          <button onClick={draft ? () => setDraft(null) : onClose} disabled={loading}
+            className="flex-1 py-2.5 border border-stone-200 rounded-xl text-sm text-stone-600 hover:bg-stone-50 transition-colors">
+            {draft ? "Back" : "Cancel"}
           </button>
-          <button onClick={handleMerge} disabled={!source || !target || source === target || loading}
-            className="flex-1 py-2.5 bg-orange-500 text-white rounded-xl text-sm font-medium hover:bg-orange-600 disabled:opacity-40 transition-colors">
-            {loading ? "Merging…" : "Merge"}
-          </button>
+          {!draft ? (
+            <button onClick={handlePreview} disabled={!source || !target || source === target || loading}
+              className="flex-1 py-2.5 bg-orange-500 text-white rounded-xl text-sm font-medium hover:bg-orange-600 disabled:opacity-40 transition-colors">
+              {loading ? "Drafting…" : "Preview merge"}
+            </button>
+          ) : (
+            <button onClick={handleApply} disabled={loading}
+              className="flex-1 py-2.5 bg-orange-500 text-white rounded-xl text-sm font-medium hover:bg-orange-600 disabled:opacity-40 transition-colors">
+              {loading ? "Applying…" : "Apply merge"}
+            </button>
+          )}
         </div>
       </div>
     </div>
@@ -3010,13 +3130,12 @@ const FOLDERS = [
   { key: "recent", label: "🕐 Recent" },
   { key: "cs", label: "CS / ML" },
   { key: "science", label: "Science" },
-  { key: "humanities", label: "Humanities" },
   { key: "sources", label: "Sources" },
   { key: "insights", label: "Insights" },
   { key: "open-threads", label: "🔍 Threads" },
 ];
 
-function BrowseTab() {
+function BrowseTab({ openTarget }) {
   const [folder, setFolder] = useState("cs");
   const [pages, setPages] = useState([]);
   const [pagesError, setPagesError] = useState(false);
@@ -3120,6 +3239,23 @@ function BrowseTab() {
 
   const _readStartRef = useRef({});
 
+  // Log any page still open when Browse unmounts (tab switch) or the page is
+  // unloaded; otherwise only page-to-page and Back navigation logged reads.
+  // Sub-2s opens are skipped: they aren't reads, and StrictMode's dev-only
+  // mount/unmount/mount would otherwise log a 0s read for every opened page.
+  useEffect(() => {
+    function flushReads() {
+      for (const [page, start] of Object.entries(_readStartRef.current)) {
+        const dur = Math.round((Date.now() - start) / 1000);
+        if (dur < 2) continue;
+        api("/log-read", { method: "POST", keepalive: true, body: JSON.stringify({ page, duration_seconds: dur }) }).catch(() => {});
+      }
+      _readStartRef.current = {};
+    }
+    window.addEventListener("pagehide", flushReads);
+    return () => { window.removeEventListener("pagehide", flushReads); flushReads(); };
+  }, []);
+
   async function openPage(name) {
     setPageLoading(true);
     // Track reading history in localStorage (last 8 pages)
@@ -3146,6 +3282,14 @@ function BrowseTab() {
     } catch { setPageContent("Failed to load page."); setParsedPage(null); setSelected(name); }
     finally { setPageLoading(false); }
   }
+
+  useEffect(() => {
+    if (!openTarget) return;
+    // A folder-only target (e.g. Dashboard's "open threads" link) shows that folder's list.
+    if (!openTarget.name) { if (openTarget.folder) switchFolder(openTarget.folder); return; }
+    if (openTarget.folder && folder !== openTarget.folder) setFolder(openTarget.folder);
+    openPage(openTarget.name);
+  }, [openTarget?.name, openTarget?.folder]);
 
   async function handleRandom() {
     try {
@@ -3210,9 +3354,10 @@ function BrowseTab() {
       } else if (sortBy === "entry_count") {
         return (b.entry_count || 0) - (a.entry_count || 0);
       } else {
-        // "updated" — sort by last_updated date descending (newest first)
-        const dateA = new Date(a.last_updated || 0).getTime();
-        const dateB = new Date(b.last_updated || 0).getTime();
+        // "updated" — use precise save time; date-only metadata ties all pages
+        // saved on the same day and incorrectly falls back to directory order.
+        const dateA = new Date(a.last_saved_at || a.last_updated || 0).getTime();
+        const dateB = new Date(b.last_saved_at || b.last_updated || 0).getTime();
         return dateB - dateA;
       }
     });
@@ -3602,80 +3747,40 @@ function BrowseTab() {
 
 // ── DASHBOARD TAB ─────────────────────────────────────────────────────────────
 
-function RecentlyRead() {
-  const [reads, setReads] = useState([]);
-
-  useEffect(() => {
-    api("/recent-reads?limit=5&max_age_days=30").then(d => setReads(d.reads || [])).catch(() => {});
-  }, []);
-
-  if (reads.length === 0) {
-    return (
-      <div className="bg-white border border-stone-200 rounded-lg p-4">
-        <h3 className="text-sm font-semibold text-stone-900">Recently Read</h3>
-        <p className="text-xs text-stone-400 mt-2">No pages read in the last 30 days.</p>
-      </div>
-    );
-  }
-
-  function fmtAge(ts) {
-    const diffMs = Date.now() - new Date(ts + "Z").getTime();
-    const diffMin = Math.floor(diffMs / 60000);
-    if (diffMin < 1) return "just now";
-    if (diffMin < 60) return `${diffMin}m ago`;
-    const diffHr = Math.floor(diffMin / 60);
-    if (diffHr < 24) return `${diffHr}h ago`;
-    return `${Math.floor(diffHr / 24)}d ago`;
-  }
-
+function WaitingChips({ queueCount, threadCount, onGoCapture, onGoThreads }) {
+  if (!queueCount && !threadCount) return null;
+  const chip = "text-xs font-medium px-3 py-1.5 rounded-lg border transition-colors";
   return (
-    <div className="bg-white border border-stone-200 rounded-lg p-4">
-      <h3 className="text-sm font-semibold text-stone-900 mb-3">Recently Read</h3>
-      <div className="space-y-2">
-        {reads.map((r, i) => (
-          <div key={i} className="flex items-center justify-between">
-            <span className="text-sm text-stone-700 truncate flex-1">{r.concept}</span>
-            <div className="flex items-center gap-2 shrink-0 ml-2">
-              {r.duration_seconds > 0 && (
-                <span className="text-[10px] text-stone-400">{r.duration_seconds}s</span>
-              )}
-              <span className="text-xs text-stone-400">{fmtAge(r.ts)}</span>
-            </div>
-          </div>
-        ))}
-      </div>
+    <div className="flex flex-wrap items-center gap-2">
+      <span className="text-xs text-stone-400">Waiting:</span>
+      {queueCount > 0 && (
+        <button onClick={onGoCapture} className={`${chip} bg-orange-50 border-orange-200 text-orange-700 hover:bg-orange-100`}>
+          {queueCount} in queue →
+        </button>
+      )}
+      {threadCount > 0 && (
+        <button onClick={onGoThreads} className={`${chip} bg-stone-50 border-stone-200 text-stone-700 hover:bg-stone-100`}>
+          {threadCount} open thread{threadCount === 1 ? "" : "s"} →
+        </button>
+      )}
     </div>
   );
 }
 
-function ReviewDueSection({ onNavigate }) {
-  const [due, setDue] = useState(null);
-
-  useEffect(() => {
-    api("/review-due").then(d => setDue(d.due)).catch(() => setDue([]));
-  }, []);
-
-  if (!due || due.length === 0) return null;
-
+function NextUpSection({ pages, onOpen }) {
+  if (!pages || pages.length === 0) return null;
   return (
     <div className="bg-white border border-amber-200 rounded-xl p-4">
       <div className="flex items-center justify-between mb-3">
-        <h3 className="text-sm font-semibold text-stone-900">Due for review</h3>
-        <span className="text-xs text-amber-600 bg-amber-50 border border-amber-100 px-2 py-0.5 rounded-lg">{due.length} pages</span>
+        <h3 className="text-sm font-semibold text-stone-900">Next up</h3>
+        <span className="text-xs text-amber-600 bg-amber-50 border border-amber-100 px-2 py-0.5 rounded-lg">{pages.length} high priority</span>
       </div>
-      <div className="space-y-2">
-        {due.slice(0, 6).map(item => (
-          <button key={item.name} onClick={() => onNavigate?.(item.name)}
-            className="w-full flex items-center justify-between gap-3 text-left hover:bg-stone-50 rounded-lg px-2 py-1.5 transition-colors group">
-            <span className="text-sm text-stone-700 group-hover:text-orange-600 truncate">{item.name}</span>
-            <div className="flex items-center gap-2 shrink-0">
-              {item.maturity != null && (
-                <span className="text-xs text-stone-400">{item.maturity}/100</span>
-              )}
-              <span className="text-xs text-amber-500">
-                {item.days_since_read == null ? "never read" : `${item.days_since_read}d ago`}
-              </span>
-            </div>
+      <div className="space-y-1">
+        {pages.slice(0, 5).map(page => (
+          <button key={page.name} onClick={() => onOpen(page.name, page.folder)}
+            className="w-full text-left hover:bg-stone-50 rounded-lg px-2 py-1.5 transition-colors group">
+            <div className="text-sm text-stone-700 group-hover:text-orange-600 truncate">{page.name}</div>
+            <div className="text-xs text-stone-400 truncate">{page.suggested_action}</div>
           </button>
         ))}
       </div>
@@ -3683,20 +3788,93 @@ function ReviewDueSection({ onNavigate }) {
   );
 }
 
-function DashboardTab({ onNavigateToConcept }) {
+// Deterministic duplicate finder (no LLM): similar slugs + shared concept text.
+// Weak pairs are included on purpose; real duplicates score ~0.45-0.57, so the
+// human decides each one. Merge previews an LLM draft via /consolidate before writing.
+function TidyUpSection({ onMerge, refreshKey }) {
+  const [pairs, setPairs] = useState(null);
+
+  useEffect(() => {
+    setPairs(null);
+    api("/consolidation-candidates?limit=8&include_weak=true")
+      .then(d => setPairs(d.candidates || []))
+      .catch(() => setPairs([]));
+  }, [refreshKey]);
+
+  function dismiss(pair) {
+    // Hide it right away; the backend remembers it so it stays hidden.
+    setPairs(prev => prev.filter(p => p !== pair));
+    api("/consolidation-candidates/dismiss", { method: "POST", body: JSON.stringify({ source: pair.source, target: pair.target }) }).catch(() => {});
+  }
+
+  if (pairs && pairs.length === 0) return null;
+  return (
+    <div className="bg-white border border-stone-200 rounded-xl p-4">
+      <div className="flex items-center justify-between mb-3">
+        <h3 className="text-sm font-semibold text-stone-900">Tidy up · possible duplicates</h3>
+        <span className="text-[10px] text-stone-400">you decide each</span>
+      </div>
+      {pairs === null ? (
+        <p className="text-xs text-stone-400">Scanning for duplicates…</p>
+      ) : (
+        <div className="space-y-1">
+          {pairs.map(pair => (
+            <div key={`${pair.source}->${pair.target}`} className="flex items-center gap-3 px-2 py-1.5 rounded-lg hover:bg-stone-50">
+              <div className="flex-1 min-w-0">
+                <div className="text-sm text-stone-700 truncate">{pair.source} <span className="text-stone-400">→</span> {pair.target}</div>
+                <div className="text-xs text-stone-400 truncate">{pair.reasons?.[0] === "weak overlap only" ? "similar names or wording" : pair.reasons?.join(" · ")} · {pair.score}</div>
+              </div>
+              <button onClick={() => dismiss(pair)}
+                className="shrink-0 text-xs px-2 py-1.5 rounded-lg text-stone-400 hover:text-stone-700 hover:bg-stone-100">
+                Not a duplicate
+              </button>
+              <button onClick={() => onMerge(pair)}
+                className="shrink-0 text-xs font-medium px-3 py-1.5 rounded-lg border border-stone-200 text-stone-700 hover:bg-stone-100">
+                Merge…
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function TrendLine({ current, previous, unit = "" }) {
+  if (previous == null || current == null) return null;
+  const diff = Math.round(current - previous);
+  const text = diff === 0 ? "same as prev 30d" : `${diff > 0 ? "↑" : "↓"} ${Math.abs(diff)}${unit} vs prev 30d`;
+  return <div className="text-[10px] text-stone-400 mt-1">{text}</div>;
+}
+
+function DashboardTab({ onOpenPage, onGoCapture }) {
   const [stats, setStats] = useState(null);
-  const [ops, setOps] = useState(null);
+  const [nextUp, setNextUp] = useState(null);
+  const [queueCount, setQueueCount] = useState(0);
+  const [threadCount, setThreadCount] = useState(0);
   const [loading, setLoading] = useState(true);
+  const [mergePair, setMergePair] = useState(null);
+  const [tidyKey, setTidyKey] = useState(0);
+
+  useEffect(() => {
+    // Review ranking reads every page (~1s), so it fills in after the rest.
+    // Re-fetched after a merge, since the merged-away page no longer exists.
+    api("/review-queue?min_priority=high&limit=200")
+      .then(d => setNextUp(d.pages || []))
+      .catch(() => setNextUp([]));
+  }, [tidyKey]);
 
   useEffect(() => {
     async function loadStats() {
       try {
-        const [dashboardData, operationsData] = await Promise.all([
+        const [dashboardData, queueData, threadData] = await Promise.all([
           api("/dashboard-stats"),
-          api("/operations-overview").catch(() => null),
+          api("/queue").catch(() => null),
+          api("/pages?folder=open-threads").catch(() => null),
         ]);
         setStats(dashboardData);
-        setOps(operationsData);
+        setQueueCount(queueData?.items?.length || 0);
+        setThreadCount(threadData?.pages?.length || 0);
       } catch (err) {
         console.error("Failed to load dashboard stats:", err);
       } finally {
@@ -3744,112 +3922,55 @@ function DashboardTab({ onNavigateToConcept }) {
     return "bg-orange-500";
   }
 
-  const maxTagCount = stats.top_tags.length > 0 ? stats.top_tags[0].count : 1;
   const approvalRate = stats.approval_rate == null ? null : Math.round(stats.approval_rate * 100);
   const periodDays = stats.period_days || 30;
   const heatmapLabel = `${stats.heatmap_days || heatmapWeeks * 7} days`;
-  const llm = ops?.llm_summary || {};
-  const context = ops?.context_summary || {};
-  const opErrors = ops?.errors || [];
-  const opCandidates = ops?.candidates || [];
-  const pendingOps = opCandidates.filter(c => ["candidate", "needs_approval", "eval_ready", "eval_failed", "apply_failed"].includes(c.status || "candidate"));
-  const taskRows = Object.entries(llm.by_task || {});
-  const worstContractTask = taskRows
-    .filter(([, row]) => (row.contract_failure_rate || row.error_rate || 0) > 0)
-    .sort((a, b) => ((b[1].contract_failure_rate || 0) + (b[1].error_rate || 0)) - ((a[1].contract_failure_rate || 0) + (a[1].error_rate || 0)))[0];
-  const slowStage = (context.ingest_slow_stages || [])[0];
-  const opsCost = Number(llm.total_cost_usd || 0);
-  const opsTokens = Number(llm.total_tokens || 0);
-  const opsEstimatedRate = Number(llm.estimated_cost_rate || 0);
-  const ingestP95 = Number(context.ingest_latency_p95_ms || 0);
-  const opsRange = llm.time_range || context.time_range || {};
-  const opsRangeLabel = opsRange.first_ts && opsRange.last_ts
-    ? `${opsRange.first_ts.slice(0, 10)} to ${opsRange.last_ts.slice(0, 10)}`
-    : "no log rows";
-  const contractFailureLabel = worstContractTask
-    ? `${worstContractTask[0]} ${Math.round((worstContractTask[1].contract_failure_rate || 0) * 100)}% · ${worstContractTask[1].calls || 0} calls`
-    : "none";
-  const contractFailureRange = worstContractTask?.[1]?.time_range;
-  const contractFailureDetail = contractFailureRange?.first_ts && contractFailureRange?.last_ts
-    ? `${contractFailureRange.first_ts.slice(0, 10)} to ${contractFailureRange.last_ts.slice(0, 10)}`
-    : "";
+  const recall = stats.recall || {};
+  const prev = stats.previous;
+  const prevRate = prev?.approval_rate == null ? null : Math.round(prev.approval_rate * 100);
 
   return (
     <div className="space-y-5 pb-8">
+      <WaitingChips queueCount={queueCount} threadCount={threadCount}
+        onGoCapture={onGoCapture} onGoThreads={() => onOpenPage(undefined, "open-threads")} />
+
+      {/* Next up — the actionable section, so it leads */}
+      <NextUpSection pages={nextUp} onOpen={onOpenPage} />
+
+      <TidyUpSection onMerge={setMergePair} refreshKey={tidyKey} />
+      {mergePair && (
+        <ConsolidateModal force
+          pages={[{ name: mergePair.source, title: mergePair.source }, { name: mergePair.target, title: mergePair.target }]}
+          prefill={{ source: mergePair.source, target: mergePair.target }}
+          onClose={() => setMergePair(null)}
+          onDone={() => { setMergePair(null); setTidyKey(k => k + 1); }} />
+      )}
+
       {/* Stats row */}
       <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
         <div className="bg-white border border-stone-200 rounded-xl p-3 text-center">
           <div className="text-2xl font-bold text-orange-500">{stats.total_approved}</div>
           <div className="text-[10px] text-stone-500 mt-0.5 leading-tight">approved<br/>{periodDays}d</div>
+          <TrendLine current={stats.total_approved} previous={prev?.total_approved} />
         </div>
         <div className="bg-white border border-stone-200 rounded-xl p-3 text-center">
-          <div className="text-2xl font-bold text-blue-500">{stats.unique_concepts}</div>
-          <div className="text-[10px] text-stone-500 mt-0.5 leading-tight">concepts touched<br/>{periodDays}d</div>
+          <div className="text-2xl font-bold text-blue-500">{recall.pages_read ?? 0}</div>
+          <div className="text-[10px] text-stone-500 mt-0.5 leading-tight">pages read<br/>{periodDays}d</div>
+          <TrendLine current={recall.pages_read} previous={prev?.pages_read} />
         </div>
         <div className="bg-white border border-stone-200 rounded-xl p-3 text-center">
-          <div className="text-2xl font-bold text-purple-500">{stats.new_concepts_this_week}</div>
-          <div className="text-[10px] text-stone-500 mt-0.5 leading-tight">new concepts<br/>7d</div>
+          <div className="text-2xl font-bold text-purple-500">{recall.questions_asked ?? 0}</div>
+          <div className="text-[10px] text-stone-500 mt-0.5 leading-tight">questions asked<br/>{periodDays}d</div>
+          <TrendLine current={recall.questions_asked} previous={prev?.questions_asked} />
         </div>
         <div className="bg-white border border-stone-200 rounded-xl p-3 text-center">
           <div className={`text-2xl font-bold ${approvalRate != null && approvalRate < 60 ? "text-amber-500" : "text-emerald-500"}`}>
             {approvalRate == null ? "n/a" : `${approvalRate}%`}
           </div>
           <div className="text-[10px] text-stone-500 mt-0.5 leading-tight">approval rate<br/>{periodDays}d</div>
+          <TrendLine current={approvalRate} previous={prevRate} unit=" pts" />
         </div>
       </div>
-      <div className="grid grid-cols-2 gap-3">
-        <div className="bg-stone-50 border border-stone-200 rounded-xl px-3 py-2">
-          <p className="text-[10px] uppercase tracking-wide text-stone-400">Velocity</p>
-          <p className="text-sm font-semibold text-stone-800 mt-0.5">{stats.learning_velocity.entries_per_week} approved entries/week</p>
-        </div>
-        <div className="bg-stone-50 border border-stone-200 rounded-xl px-3 py-2">
-          <p className="text-[10px] uppercase tracking-wide text-stone-400">Rejected</p>
-          <p className="text-sm font-semibold text-stone-800 mt-0.5">{stats.total_rejected || 0} rejected / skipped in {periodDays}d</p>
-        </div>
-      </div>
-      <p className="text-[11px] text-stone-400 px-1">
-        Approval rate = approved ingest decisions divided by approved plus rejected decisions in the last {periodDays} days.
-      </p>
-
-      {/* Recently Read */}
-      <RecentlyRead />
-
-      {/* System health */}
-      {ops && (
-        <div className="bg-white border border-stone-200 rounded-xl p-4">
-          <div className="flex items-center justify-between gap-3 mb-3">
-            <h3 className="text-sm font-semibold text-stone-900">System health</h3>
-            <span className="text-[10px] text-stone-400">runtime log · {opsRangeLabel}</span>
-          </div>
-          <div className="grid grid-cols-2 md:grid-cols-4 gap-2">
-            <StatTile label={opsEstimatedRate > 0 ? "Est. LLM spend" : "LLM spend"} value={`$${opsCost.toFixed(4)}`} tone={opsCost > 1 ? "amber" : "stone"} />
-            <StatTile label="Tokens" value={opsTokens.toLocaleString()} />
-            <StatTile label="Ingest p95" value={`${ingestP95 || 0}ms`} tone={ingestP95 > 45000 ? "red" : ingestP95 > 20000 ? "amber" : "stone"} />
-            <StatTile label="Ops errors" value={opErrors.length} tone={opErrors.length ? "red" : "stone"} />
-          </div>
-          <div className="mt-3 grid md:grid-cols-3 gap-2">
-            <div className="rounded-lg border border-stone-200 bg-stone-50 px-3 py-2 min-w-0">
-              <p className="text-[10px] uppercase tracking-wide text-stone-400">Contract risk</p>
-              <p className={`text-sm font-semibold mt-0.5 truncate ${worstContractTask ? "text-red-700" : "text-emerald-700"}`}>{contractFailureLabel}</p>
-              {contractFailureDetail && <p className="text-[10px] text-stone-400 mt-0.5">{contractFailureDetail}</p>}
-            </div>
-            <div className="rounded-lg border border-stone-200 bg-stone-50 px-3 py-2 min-w-0">
-              <p className="text-[10px] uppercase tracking-wide text-stone-400">Slowest ingest stage</p>
-              <p className="text-sm font-semibold text-stone-800 mt-0.5 truncate">
-                {slowStage ? `${slowStage.stage} ${slowStage.avg_ms}ms` : "no samples"}
-              </p>
-            </div>
-            <div className="rounded-lg border border-stone-200 bg-stone-50 px-3 py-2 min-w-0">
-              <p className="text-[10px] uppercase tracking-wide text-stone-400">Pending ops actions</p>
-              <p className={`text-sm font-semibold mt-0.5 ${pendingOps.length ? "text-amber-700" : "text-stone-800"}`}>{pendingOps.length}</p>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* Review Due */}
-      <ReviewDueSection onNavigate={onNavigateToConcept} />
-
       {/* Contribution heatmap */}
       <div className="bg-white border border-stone-200 rounded-xl p-4">
         <div className="flex items-center justify-between gap-3 mb-3">
@@ -3886,52 +4007,6 @@ function DashboardTab({ onNavigateToConcept }) {
           <span className="text-[9px] text-stone-400">more</span>
         </div>
       </div>
-
-      {/* Top Tags */}
-      {stats.top_tags.length > 0 && (
-        <div className="bg-white border border-stone-200 rounded-xl p-4">
-          <div className="flex items-center justify-between gap-3 mb-3">
-            <h3 className="text-sm font-semibold text-stone-900">Top tags</h3>
-            <span className="text-[10px] text-stone-400">approved {periodDays}d</span>
-          </div>
-          <div className="space-y-2">
-            {stats.top_tags.slice(0, 8).map((item) => (
-              <div key={item.tag} className="flex items-center gap-2">
-                <span className="text-xs text-stone-600 w-20 shrink-0 truncate">{item.tag}</span>
-                <div className="flex-1 h-2 bg-stone-100 rounded-full overflow-hidden">
-                  <div
-                    className="h-full bg-orange-400 rounded-full transition-all"
-                    style={{ width: `${(item.count / maxTagCount) * 100}%` }}
-                  />
-                </div>
-                <span className="text-xs text-stone-400 w-4 text-right shrink-0">{item.count}</span>
-              </div>
-            ))}
-          </div>
-        </div>
-      )}
-
-      {/* Sources */}
-      {stats.top_sources.length > 0 && (
-        <div className="bg-white border border-stone-200 rounded-xl p-4">
-          <div className="flex items-center justify-between gap-3 mb-3">
-            <h3 className="text-sm font-semibold text-stone-900">Sources</h3>
-            <span className="text-[10px] text-stone-400">approved {periodDays}d</span>
-          </div>
-          <div className="flex flex-wrap gap-2">
-            {stats.top_sources.map((item) => {
-              const sourceEmoji = { tweet: "𝕏", article: "📄", video: "📺", blog: "✍️", paper: "📜", clip: "🔗", link: "🔗", lecture: "▣", text: "T", unknown: "❓" };
-              return (
-                <div key={item.source} className="flex items-center gap-1.5 bg-stone-50 border border-stone-200 rounded-lg px-3 py-1.5">
-                  <span className="text-sm">{sourceEmoji[item.source] || "🔗"}</span>
-                  <span className="text-xs text-stone-600 capitalize">{item.source}</span>
-                  <span className="text-xs font-semibold text-stone-800">{item.count}</span>
-                </div>
-              );
-            })}
-          </div>
-        </div>
-      )}
     </div>
   );
 }
@@ -4928,15 +5003,30 @@ function ScoreBadge({ score }) {
   );
 }
 
+const INTERVIEW_VERIFY_KEY = "sw_interview_want_verification";
+
+function loadWantVerification() {
+  try { return localStorage.getItem(INTERVIEW_VERIFY_KEY) === "1"; }
+  catch { return false; }
+}
+
 function InterviewTab() {
   const [question, setQuestion] = useState("");
   const [myAnswer, setMyAnswer] = useState("");
   const [showMyAnswer, setShowMyAnswer] = useState(false);
+  const [wantVerification, setWantVerification] = useState(loadWantVerification);
   const [loading, setLoading] = useState(false);
-  const [stage, setStage] = useState(""); // "wiki" | "verifying" | ""
   const [result, setResult] = useState(null);
   const [gapStatus, setGapStatus] = useState({}); // index → "adding"|"added"|"error"
   const [error, setError] = useState(null);
+
+  function toggleVerification() {
+    setWantVerification(v => {
+      const next = !v;
+      try { localStorage.setItem(INTERVIEW_VERIFY_KEY, next ? "1" : "0"); } catch {}
+      return next;
+    });
+  }
 
   async function handleSubmit() {
     if (!question.trim() || loading) return;
@@ -4944,14 +5034,13 @@ function InterviewTab() {
     setResult(null);
     setError(null);
     setGapStatus({});
-    setStage("wiki");
     try {
-      setStage("verifying");
       const data = await api("/interview", {
         method: "POST",
         body: JSON.stringify({
           question: question.trim(),
           user_answer: showMyAnswer && myAnswer.trim() ? myAnswer.trim() : null,
+          want_verification: wantVerification,
         }),
       });
       setResult(data);
@@ -4959,7 +5048,6 @@ function InterviewTab() {
       setError(e.message);
     } finally {
       setLoading(false);
-      setStage("");
     }
   }
 
@@ -5025,6 +5113,17 @@ function InterviewTab() {
           )}
         </div>
 
+        {/* Verify toggle — runs the extra verifier pass + gap list. Persisted. */}
+        <label className="flex items-center gap-2 text-xs text-stone-500 cursor-pointer select-none">
+          <input
+            type="checkbox"
+            checked={wantVerification}
+            onChange={toggleVerification}
+            className="rounded border-stone-300 text-orange-500 focus:ring-orange-300"
+          />
+          Verify the wiki answer and list knowledge gaps
+        </label>
+
         <div className="flex items-center justify-between">
           <p className="text-xs text-stone-400">⌘↵ to submit</p>
           <button
@@ -5032,7 +5131,7 @@ function InterviewTab() {
             disabled={loading || !question.trim()}
             className="px-4 py-2 rounded-lg bg-orange-500 text-white text-sm font-medium hover:bg-orange-600 disabled:opacity-40 disabled:cursor-not-allowed"
           >
-            {loading ? (stage === "wiki" ? "Searching wiki…" : "Verifying…") : "Run"}
+            {loading ? "Running…" : "Run"}
           </button>
         </div>
       </div>
@@ -5065,7 +5164,8 @@ function InterviewTab() {
             )}
           </div>
 
-          {/* Verification */}
+          {/* Verification — only when the user opted in */}
+          {result.verification && (
           <div className="bg-white rounded-xl border border-stone-200 p-4 space-y-3">
             <div className="flex items-center justify-between">
               <p className="text-xs font-semibold text-stone-400 uppercase tracking-wide">Verification</p>
@@ -5113,6 +5213,7 @@ function InterviewTab() {
               <p className="text-xs text-emerald-600">No gaps found — wiki answer looks complete.</p>
             )}
           </div>
+          )}
 
           {/* User grading */}
           {grading && (
@@ -5279,12 +5380,31 @@ function BackendStatus() {
 
 export default function App() {
   const [tab, setTab] = useState("ingest");
+  const [browseTarget, setBrowseTarget] = useState(null);
   const [tagGroups, setTagGroups] = useState({});
+  const [opsEnabled, setOpsEnabled] = useState(false);
 
   useEffect(() => { fetchTagGroups().then(setTagGroups); }, []);
 
+  useEffect(() => {
+    fetch(`${API}/health`)
+      .then(r => r.json())
+      .then(d => setOpsEnabled(!!d.ops_enabled))
+      .catch(() => setOpsEnabled(false));
+  }, []);
+
+  const visibleTabs = opsEnabled ? TABS : TABS.filter(t => t.id !== "operations");
+  useEffect(() => {
+    if (tab === "operations" && !opsEnabled) setTab("ingest");
+  }, [tab, opsEnabled]);
+
   function refreshTagGroups() {
     fetchTagGroups().then(setTagGroups);
+  }
+
+  function openSavedPage(name, folder) {
+    setBrowseTarget({ name, folder });
+    setTab("browse");
   }
 
   return (
@@ -5307,7 +5427,7 @@ export default function App() {
       {/* Tab bar */}
       <div className="bg-white border-b border-stone-200 px-4">
         <div className="flex max-w-2xl mx-auto w-full">
-          {TABS.map((t) => (
+          {visibleTabs.map((t) => (
             <button key={t.id} onClick={() => setTab(t.id)}
               className={`flex items-center gap-2 px-4 py-3 text-sm font-medium border-b-2 transition-colors ${
                 tab === t.id
@@ -5323,8 +5443,8 @@ export default function App() {
 
       {/* Main content */}
       <main className="flex-1 flex flex-col overflow-hidden">
-        <div className="flex-1 overflow-y-auto p-4 max-w-2xl mx-auto w-full">
-          {tab === "ingest" && <IngestTab onApproved={refreshTagGroups} onSwitchToChat={() => setTab("chat")} />}
+        <div className={`${tab === "browse" ? "max-w-6xl" : "max-w-2xl"} flex-1 overflow-y-auto p-4 mx-auto w-full`}>
+          {tab === "ingest" && <IngestTab onApproved={refreshTagGroups} onSwitchToChat={() => setTab("chat")} onOpenPage={openSavedPage} />}
           {tab === "chat" && (
             <div className="flex flex-col" style={{ height: "calc(100vh - 120px)" }}>
               <ChatTab />
@@ -5333,11 +5453,11 @@ export default function App() {
           {tab === "interview" && <InterviewTab />}
           {tab === "browse" && (
             <div className="flex flex-col" style={{ height: "calc(100vh - 120px)" }}>
-              <BrowseTab />
+              <BrowseTab openTarget={browseTarget} />
             </div>
           )}
-          {tab === "dashboard" && <DashboardTab onNavigateToConcept={() => setTab("browse")} />}
-          {tab === "operations" && <OperationsTab />}
+          {tab === "dashboard" && <DashboardTab onOpenPage={openSavedPage} onGoCapture={() => setTab("ingest")} />}
+          {tab === "operations" && opsEnabled && <OperationsTab />}
         </div>
       </main>
     </div>

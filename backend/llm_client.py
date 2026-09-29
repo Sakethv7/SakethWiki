@@ -5,14 +5,20 @@ Default behavior stays Anthropic-first. Set env vars to route selected tasks
 to Qwen (or other OpenAI-compatible providers) without changing app code.
 """
 import json
+import logging
 import os
+import random
 import time
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from typing import Any, Optional
 
 import httpx
 
 import telemetry
+
+logger = logging.getLogger(__name__)
 
 CRITICAL_TASKS = {
     "INGEST_EXTRACT",
@@ -24,11 +30,153 @@ CRITICAL_TASKS = {
     "EVOLUTION_CLASSIFY",
 }
 
+RETRYABLE_HTTP_STATUSES = {408, 409, 429, 500, 502, 503, 504, 529}
+
 
 @dataclass
 class CompletionResult:
     text: str
     usage: dict[str, Any] = field(default_factory=dict)
+
+
+def _env_number(name: str, default: float, minimum: float, maximum: float) -> float:
+    try:
+        value = float(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        value = default
+    return min(maximum, max(minimum, value))
+
+
+def _retry_config() -> tuple[int, float, float]:
+    attempts = int(_env_number("LLM_MAX_ATTEMPTS", 3, 1, 5))
+    base_seconds = _env_number("LLM_RETRY_BASE_SECONDS", 1, 0, 10)
+    max_seconds = _env_number("LLM_RETRY_MAX_SECONDS", 8, 0, 30)
+    return attempts, base_seconds, max_seconds
+
+
+def _exception_status(exc: Exception) -> Optional[int]:
+    status = getattr(exc, "status_code", None)
+    if status is None:
+        status = getattr(getattr(exc, "response", None), "status_code", None)
+    try:
+        return int(status) if status is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _is_retryable_exception(exc: Exception) -> bool:
+    status = _exception_status(exc)
+    if status is not None:
+        return status in RETRYABLE_HTTP_STATUSES
+    if isinstance(exc, (httpx.TimeoutException, httpx.NetworkError)):
+        return True
+    # Anthropic wraps httpx failures without always preserving an HTTP status.
+    return type(exc).__name__ in {"APIConnectionError", "APITimeoutError"}
+
+
+def _retry_after_seconds(exc: Exception) -> Optional[float]:
+    response = getattr(exc, "response", None)
+    headers = getattr(response, "headers", None)
+    if not headers:
+        return None
+    raw = headers.get("retry-after")
+    if not raw:
+        return None
+    try:
+        return max(0.0, float(raw))
+    except (TypeError, ValueError):
+        try:
+            retry_at = parsedate_to_datetime(str(raw))
+            if retry_at.tzinfo is None:
+                retry_at = retry_at.replace(tzinfo=timezone.utc)
+            return max(0.0, (retry_at - datetime.now(timezone.utc)).total_seconds())
+        except (TypeError, ValueError, OverflowError):
+            return None
+
+
+def _call_with_retry(call, *, provider: str, model: str) -> tuple[CompletionResult, int]:
+    max_attempts, base_seconds, max_seconds = _retry_config()
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return call(), attempt
+        except Exception as exc:
+            if attempt >= max_attempts or not _is_retryable_exception(exc):
+                setattr(exc, "llm_attempts", attempt)
+                raise
+            exponential = base_seconds * (2 ** (attempt - 1))
+            jittered = exponential * random.uniform(0.75, 1.25)
+            retry_after = _retry_after_seconds(exc) or 0.0
+            delay = min(max_seconds, max(jittered, retry_after))
+            logger.warning(
+                "LLM transient failure provider=%s model=%s attempt=%s/%s; "
+                "retrying in %.2fs: %s",
+                provider,
+                model,
+                attempt,
+                max_attempts,
+                delay,
+                type(exc).__name__,
+            )
+            time.sleep(delay)
+
+    raise RuntimeError("unreachable retry state")
+
+
+# ── Langfuse observability (optional) ─────────────────────────────────────────
+# One generation observation per completed task. Entirely no-op unless
+# LANGFUSE_PUBLIC_KEY / LANGFUSE_SECRET_KEY are set and the SDK is installed.
+# A Langfuse failure must never surface to the caller — everything is swallowed.
+
+_LF_CLIENT = None
+_LF_RESOLVED = False
+
+
+def _langfuse_client():
+    global _LF_CLIENT, _LF_RESOLVED
+    if _LF_RESOLVED:
+        return _LF_CLIENT
+    _LF_RESOLVED = True
+    if not (os.environ.get("LANGFUSE_PUBLIC_KEY") and os.environ.get("LANGFUSE_SECRET_KEY")):
+        return None
+    try:
+        from langfuse import Langfuse  # reads LANGFUSE_* from env
+        _LF_CLIENT = Langfuse()
+    except Exception as e:  # ImportError, bad config, version drift
+        logger.warning("Langfuse disabled (init failed): %s", e)
+        _LF_CLIENT = None
+    return _LF_CLIENT
+
+
+def _lf_emit(*, task, model, input_payload, output_text, usage, metadata, error):
+    client = _langfuse_client()
+    if client is None:
+        return
+    kwargs = dict(
+        name=str(task),
+        model=str(model),
+        input=input_payload,
+        output=(output_text or None),
+        metadata=metadata,
+    )
+    if error:
+        kwargs["level"] = "ERROR"
+        kwargs["status_message"] = str(error)[:1000]
+    if usage:
+        usage_details = {
+            "input": int(usage.get("input_tokens", 0) or 0),
+            "output": int(usage.get("output_tokens", 0) or 0),
+        }
+    else:
+        usage_details = None
+    try:
+        if hasattr(client, "start_generation"):          # langfuse v3 low-level SDK
+            client.start_generation(usage_details=usage_details, **kwargs).end()
+        elif hasattr(client, "generation"):              # langfuse v2
+            if usage_details:
+                kwargs["usage"] = usage_details
+            client.generation(**kwargs)
+    except Exception as e:
+        logger.warning("Langfuse emit failed for task=%s: %s", task, e)
 
 
 def _task_key(task: str) -> str:
@@ -115,6 +263,14 @@ def _fallback_enabled(task: str) -> bool:
         return False
 
     return key in CRITICAL_TASKS
+
+
+def _contract_repair_enabled(task: str) -> bool:
+    """Allow an immediate operational rollback of structured-output repair."""
+    key = _task_key(task)
+    setting = "LLM_INGEST_CONTRACT_REPAIR" if key == "INGEST_EXTRACT" else "LLM_SLICE_CONTRACT_REPAIR"
+    value = os.environ.get(setting, "true").strip().lower()
+    return value not in {"0", "false", "no", "off"}
 
 
 def _strip_fences(text: str) -> str:
@@ -299,7 +455,12 @@ def _anthropic_complete(
 ) -> CompletionResult:
     import anthropic
 
-    client = anthropic.Anthropic(api_key=api_key or os.environ.get("ANTHROPIC_API_KEY"))
+    # Retry centrally in _call_with_retry so the configured attempt budget and
+    # telemetry reflect actual provider requests instead of nested SDK retries.
+    client = anthropic.Anthropic(
+        api_key=api_key or os.environ.get("ANTHROPIC_API_KEY"),
+        max_retries=0,
+    )
 
     # Add prompt caching to system prompt — stable instructions cached at 10% input cost after first hit
     system_param = system
@@ -437,6 +598,9 @@ def complete(
     primary_err: Optional[Exception] = None
     primary_text = ""
     primary_usage: dict[str, Any] = {}
+    primary_attempts = 0
+    fallback_attempts = 0
+    contract_repair_attempts = 0
     input_chars = telemetry.estimate_chars({"system": system, "messages": messages})
 
     def _log(*, text: str = "", usage: Optional[dict[str, Any]] = None, fallback_used: bool = False, fallback_model: str = "", contract_ok: bool = False, error: str = "") -> None:
@@ -462,36 +626,132 @@ def complete(
                 "has_images": has_images,
                 "contract_ok": contract_ok,
                 "fallback_used": fallback_used,
+                "primary_attempts": primary_attempts,
+                "fallback_attempts": fallback_attempts,
+                "contract_repair_attempts": contract_repair_attempts,
                 "error": error,
             }
+        )
+        _lf_emit(
+            task=key,
+            model=effective_model,
+            input_payload=(
+                f"<{len(messages)} message(s), image blocks omitted>"
+                if has_images else {"system": system, "messages": messages}
+            ),
+            output_text=text,
+            usage=usage,
+            metadata={
+                "provider": effective_provider,
+                "requested_provider": requested_provider,
+                "fallback_used": fallback_used,
+                "fallback_model": fallback_model,
+                "contract_ok": contract_ok,
+                "expect_json": bool(expect_json),
+                "has_images": has_images,
+                "max_tokens": max_tokens,
+                "duration_ms": round((time.perf_counter() - started) * 1000, 1),
+                "primary_attempts": primary_attempts,
+                "fallback_attempts": fallback_attempts,
+                "contract_repair_attempts": contract_repair_attempts,
+                **{k: v for k, v in cost.items() if "cost" in k or "token" in k},
+            },
+            error=error or None,
         )
 
     try:
         if provider == "anthropic":
-            primary_result = _anthropic_complete(
-                model=resolved_model,
-                max_tokens=max_tokens,
-                messages=messages,
-                system=system,
-                api_key=api_key,
-            )
-        else:
-            primary_result = _openai_compat_complete(
+            primary_result, primary_attempts = _call_with_retry(
+                lambda: _anthropic_complete(
+                    model=resolved_model,
+                    max_tokens=max_tokens,
+                    messages=messages,
+                    system=system,
+                    api_key=api_key,
+                ),
                 provider=provider,
                 model=resolved_model,
-                max_tokens=max_tokens,
-                messages=messages,
-                system=system,
-                api_key=api_key,
+            )
+        else:
+            primary_result, primary_attempts = _call_with_retry(
+                lambda: _openai_compat_complete(
+                    provider=provider,
+                    model=resolved_model,
+                    max_tokens=max_tokens,
+                    messages=messages,
+                    system=system,
+                    api_key=api_key,
+                ),
+                provider=provider,
+                model=resolved_model,
             )
         primary_text = primary_result.text
         primary_usage = primary_result.usage
     except Exception as e:
         primary_err = e
+        primary_attempts = int(getattr(e, "llm_attempts", primary_attempts or 1))
 
     if primary_text and _valid_contract(primary_text, expect_json, required_json_keys):
         _log(text=primary_text, usage=primary_usage, contract_ok=True)
         return primary_text
+
+    # A structured response that exhausts its output budget is usually an
+    # incomplete JSON object, not a provider outage. Give only these
+    # non-mutating planning/extraction tasks one compact repair attempt. The original
+    # capture remains in the caller's queue until this function returns a
+    # valid draft, so this cannot duplicate a vault write.
+    if key in {"INGEST_EXTRACT", "SLICE_CONTENT"} and _contract_repair_enabled(task) and primary_text and expect_json:
+        repair_messages = [
+            *messages,
+            {
+                "role": "user",
+                "content": (
+                    "Your previous response failed the required JSON contract. "
+                    "Return a replacement now: JSON only, no markdown fences, "
+                    "include every required field, keep every array concise. "
+                    + ("For a topic split, return an array of chapter objects with paragraph indices only. " if key == "SLICE_CONTENT" else "Set diagram to an empty string unless a diagram is essential. ")
+                    + "Previous invalid response follows:\n"
+                    f"{primary_text}"
+                ),
+            },
+        ]
+        repair_floor = 1000 if key == "SLICE_CONTENT" else 1600
+        repair_max_tokens = min(max(max_tokens, repair_floor), 2200)
+        try:
+            if provider == "anthropic":
+                repair_result, contract_repair_attempts = _call_with_retry(
+                    lambda: _anthropic_complete(
+                        model=resolved_model,
+                        max_tokens=repair_max_tokens,
+                        messages=repair_messages,
+                        system=system,
+                        api_key=api_key,
+                    ),
+                    provider=provider,
+                    model=resolved_model,
+                )
+            else:
+                repair_result, contract_repair_attempts = _call_with_retry(
+                    lambda: _openai_compat_complete(
+                        provider=provider,
+                        model=resolved_model,
+                        max_tokens=repair_max_tokens,
+                        messages=repair_messages,
+                        system=system,
+                        api_key=api_key,
+                    ),
+                    provider=provider,
+                    model=resolved_model,
+                )
+            if _valid_contract(repair_result.text, expect_json, required_json_keys):
+                _log(text=repair_result.text, usage=repair_result.usage, contract_ok=True)
+                return repair_result.text
+            primary_text = repair_result.text
+            primary_usage = repair_result.usage
+        except Exception as repair_err:
+            # Keep the original contract failure surface. Transport failures
+            # during repair are already bounded by _call_with_retry.
+            logger.warning("ingest contract repair failed: %s", repair_err)
 
     if provider == "anthropic" or not _fallback_enabled(task):
         if primary_err:
@@ -504,16 +764,21 @@ def complete(
         task, "anthropic", model, has_images
     )
     try:
-        fallback_result = _anthropic_complete(
+        fallback_result, fallback_attempts = _call_with_retry(
+            lambda: _anthropic_complete(
+                model=fallback_model,
+                max_tokens=max_tokens,
+                messages=messages,
+                system=system,
+                api_key=api_key,
+            ),
+            provider="anthropic",
             model=fallback_model,
-            max_tokens=max_tokens,
-            messages=messages,
-            system=system,
-            api_key=api_key,
         )
         fallback_text = fallback_result.text
         fallback_usage = fallback_result.usage
     except Exception as fallback_err:
+        fallback_attempts = int(getattr(fallback_err, "llm_attempts", fallback_attempts or 1))
         err = f"{type(fallback_err).__name__}: {fallback_err}"
         _log(text=primary_text, usage=primary_usage, fallback_used=True, fallback_model=fallback_model, contract_ok=False, error=err)
         raise

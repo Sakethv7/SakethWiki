@@ -562,7 +562,13 @@ def _vector_hits(conn: sqlite3.Connection, query: str, limit: int = 40) -> list[
     return hits[:limit]
 
 
-def search(query: str, limit: int = 5, *, sync: bool = True) -> list[dict]:
+def search(query: str, limit: int = 5, *, sync: bool = False) -> list[dict]:
+    """Rank indexed pages for a query using hybrid lexical + vector retrieval.
+
+    `sync` defaults to False: the index is refreshed on write events (approve,
+    edit-page), at startup, and via POST /memory/reindex — not on every query.
+    Pass sync=True only for a one-off call that must see brand-new pages.
+    """
     if not query or not query.strip():
         return []
 

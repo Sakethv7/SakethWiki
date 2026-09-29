@@ -51,7 +51,6 @@ LLM_PROVIDER=anthropic
 
 # Route chat to Qwen for lower cost
 LLM_PROVIDER_CHAT_ANSWER=qwen
-LLM_PROVIDER_CHAT_SELECT_PAGES=qwen
 LLM_MODEL_CHAT_ANSWER=qwen-plus
 ```
 
@@ -68,9 +67,9 @@ OLLAMA_MODEL_VISION=qwen2.5vl:7b
 ```
 
 Task keys currently used in code include:
-`INGEST_EXTRACT`, `CHAT_SELECT_PAGES`, `CHAT_ANSWER`, `EVOLUTION_CLASSIFY`,
-`TAG_CLASSIFY`, `ANALYZE_TRACES`, `LINT_SCAN`, `LINT_JSON_FIX`,
-`CONSOLIDATE_PAGES`, `KNOWLEDGE_GAPS`.
+`INGEST_EXTRACT`, `CHAT_ANSWER`, `INTERVIEW_VERIFY`, `INTERVIEW_GRADE`,
+`EVOLUTION_CLASSIFY`, `TAG_CLASSIFY`, `ANALYZE_TRACES`, `LINT_SCAN`,
+`LINT_JSON_FIX`, `CONSOLIDATE_PAGES`, `KNOWLEDGE_GAPS`.
 
 Embedding-backed memory retrieval is optional and opt-in:
 
@@ -113,6 +112,24 @@ Contract fallback guardrail (implemented in `llm_client`):
 - `LLM_FALLBACK_TO_ANTHROPIC=true` to force fallback on contract failures.
 - `LLM_FALLBACK_<TASK>=true|false` for per-task control.
 - Critical tasks default to fallback even when global flag is unset.
+
+### LLM Observability (Langfuse, optional)
+
+`llm_client.complete()` emits one generation span per task — model, tokens,
+cost, latency, `contract_ok`, `fallback_used`, retry attempts — to
+[Langfuse](https://langfuse.com). It is a **no-op** unless both
+`LANGFUSE_PUBLIC_KEY` and `LANGFUSE_SECRET_KEY` are set and `langfuse` is
+installed (`pip install langfuse`). A Langfuse outage never affects a request.
+
+```bash
+LANGFUSE_PUBLIC_KEY=pk-lf-...
+LANGFUSE_SECRET_KEY=sk-lf-...
+LANGFUSE_HOST=https://cloud.langfuse.com   # or your self-hosted URL
+```
+
+Start with Langfuse Cloud's free tier; move `LANGFUSE_HOST` to a self-hosted
+instance later with no other change. The local `telemetry.py` JSONL logs keep
+writing alongside Langfuse.
 
 ### Config + Docs Sync Policy
 
@@ -197,12 +214,13 @@ cd frontend && npm run build
 | **POST** | **`/create-stub`** | **Create minimal stub page for missing concept** |
 | **POST** | **`/calculate-maturity/{page}`** | **Calculate and update understanding maturity score for a page** |
 | **POST** | **`/calculate-all-maturity`** | **Bulk calculate maturity scores for all concept pages** |
-| POST | `/consolidate` | Merge two concept pages into one |
+| POST | `/consolidate` | Merge two concept pages into one. `dry_run: true` returns the draft; applying sends it back with page hashes and backs up both originals |
+| GET | `/consolidation-candidates` | Likely duplicate page pairs (no LLM). `include_weak=true` for the dashboard's Tidy up list |
+| POST | `/consolidation-candidates/dismiss` | Mark a pair as not a duplicate |
 | POST | `/ingest-text` | Ingest plain text directly (no URL fetch) |
 | POST | `/analyze-traces` | Run weekly self-learning analysis on approval traces |
 | GET | `/system-insights` | Return current system insights and prompt hints |
 | **POST** | **`/log-read`** | **Log a page read with duration to `meta/reads.jsonl`** |
-| **GET** | **`/recent-reads`** | **Return last N unique recently-read pages** |
 | **POST** | **`/edit-page/{name}`** | **Edit concept page body (preserves frontmatter, git commits)** |
 | **POST** | **`/normalize-tags`** | **Map tag synonyms to canonical tags via tag-ontology.json** |
 | **GET** | **`/tag-ontology`** | **Return the canonical tag ontology** |
@@ -421,10 +439,11 @@ No request body needed. Displays in the **Dashboard** tab:
 - **Top sources:** Source type breakdown (tweets, articles, etc.)
 - **Weekly badges:** True new concepts this week and concepts touched this week
 - **Summary metrics:** 30-day approved/rejected aggregates and unique concepts
+- **Recall (`recall` block):** page reads, unique pages read, and chat/interview questions asked in the same 30-day period
 
 **Frontend visualization:**
-- Dashboard tab with learning-health cards, compact Operations health, recent reads, review-due items, activity heatmap, tag breakdown, and source list
-- Learning data is derived from `_wiki/meta/traces.jsonl`; Operations health is derived from runtime telemetry logs and displays the log date range. Historical usage rows without provider token data are estimated from character counts and labeled as estimated.
+- Dashboard tab: "waiting" links (queue items, open threads), a Next up list (top 5 high-priority pages from `/review-queue`, each with a suggested action), four 30-day tiles (approved, pages read, questions asked, approval rate), and the activity heatmap
+- Capture metrics come from `_wiki/meta/traces.jsonl`. The `recall` block of `/dashboard-stats` counts page reads from `_wiki/meta/reads.jsonl` and chat/interview questions from `context_budget_logs.jsonl`. System health lives in the Operations tab.
 
 ---
 
@@ -433,12 +452,20 @@ No request body needed. Displays in the **Dashboard** tab:
 ```
 ~/SakethVault/
 └── _wiki/
-    ├── concepts/     ← One .md per concept — evolves over time
-    ├── sources/      ← One .md per URL ingested (immutable record)
-    ├── insights/     ← Synthesised insight pages
-    ├── meta/         ← System pages (index, log)
-    └── index.md      ← Auto-rebuilt on every write
+    ├── cs/            ← Concept pages: CS / ML / DSA / systems — evolve over time
+    ├── science/       ← Concept pages: math and science
+    ├── sources/       ← One .md per URL ingested (immutable record)
+    ├── insights/      ← Synthesised insight pages
+    ├── open-threads/  ← Concepts flagged for deeper research (deep-dive)
+    ├── lectures/      ← Lecture / talk capture notes
+    ├── assets/        ← Pasted images referenced by pages
+    ├── meta/          ← System state (memory.db, traces.jsonl, telemetry, index cache)
+    └── index.md       ← Auto-rebuilt on every write
 ```
+
+> A `humanities/` folder is recognised by the reader but is not a Browse tab
+> until it holds pages. Concept retrieval and the knowledge graph currently
+> span `cs/` and `science/`.
 
 ---
 
@@ -488,10 +515,6 @@ Response:
 
 Appends to `_wiki/meta/reads.jsonl`. Used by the frontend to log read duration when navigating away.
 
-### GET /recent-reads
-
-Returns last N unique recently-read pages (default N=10).
-
 ### POST /normalize-tags
 
 ```json
@@ -530,6 +553,13 @@ Paste images anywhere on the page (Cmd+V) — no textarea focus required. Or dra
 Capture responses include latency metadata. `/ingest` logs stage timings for fetch, slicing, image uncertainty extraction, web gap search, vision/text extraction, and queue staging. `/store-image` logs image decode, caption, and write timings. The preview card shows client/server timing for the current run, and Operations → Telemetry keeps recent ingest/image-save latency plus slow-stage summaries.
 
 Image asset captioning is optional metadata. Large pasted images skip the separate caption LLM call and fall back to deterministic filenames so full-resolution screenshots do not create expensive or noisy `IMAGE_CAPTION` contract failures. The main `/ingest` vision path still receives the images for knowledge extraction and diagram recovery.
+
+> **Operations is paused by default.** The subsystem below (system loop, eval
+> harness, trace critic, action candidates, the Operations tab and its routes)
+> only loads when `ENABLE_OPS=true`. It is being held while LLM observability
+> moves to Langfuse; a smaller recommendation loop will be rebuilt from real
+> data later. The knowledge feedback loop — `/analyze-traces`, the weekly
+> analysis, and `system-insights.md` — runs regardless of the flag.
 
 Operations → Usage summarizes LLM token and cost telemetry by task, route, and recent expensive call. Provider-reported token usage is used when available; otherwise SakethWiki estimates tokens from character counts. Costs use built-in per-million-token defaults for common configured models and can be overridden with environment variables such as `LLM_PRICE_ANTHROPIC_CLAUDE_SONNET_4_6_INPUT_PER_1M` and `LLM_PRICE_ANTHROPIC_CLAUDE_SONNET_4_6_OUTPUT_PER_1M`. The UI displays cost per 1M tokens instead of raw dollars per token because raw per-token values are too small to read safely.
 

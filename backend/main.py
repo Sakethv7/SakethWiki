@@ -1,10 +1,11 @@
 """
 SakethWiki FastAPI backend.
 
-POST /ingest      — fetch URL / accept text/image, extract via Sonnet, stage to queue
+POST /ingest      — fetch URL / accept text/image, extract via routed LLM, stage to queue
 GET  /queue       — list pending HITL items
 POST /approve/{id} — approve or reject a queued item
-POST /chat        — keyword-matched RAG chat via Haiku
+POST /chat        — RAG chat over the SQLite memory index (keyword-scan fallback)
+POST /interview   — same retrieval as /chat; opt-in verifier + answer grader
 GET  /pages       — list all concept pages with metadata
 GET  /page/{name} — full content of a concept page
 """
@@ -37,7 +38,7 @@ if _env_path.exists():
 
 import httpx
 from bs4 import BeautifulSoup
-from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi import APIRouter, FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -64,11 +65,37 @@ from contextlib import asynccontextmanager
 async def lifespan(app):
     """Start background tasks on app startup."""
     memory_store.initialize()
+    _schedule_memory_sync()  # refresh the index once, off the request path
     asyncio.create_task(_weekly_analysis_scheduler())
     # Start folder watcher for screenshot inbox
     import image_watcher
     image_watcher.start()
     yield
+
+
+def _schedule_memory_sync() -> None:
+    """Refresh the SQLite memory index in the background.
+
+    Retrieval (`memory_store.search`) no longer syncs on every query. Instead we
+    sync on write events — startup, /approve, /edit-page — and via the manual
+    POST /memory/reindex. Fire-and-forget so it never delays a response.
+    """
+    async def _run():
+        try:
+            loop = asyncio.get_event_loop()
+            result = await loop.run_in_executor(None, memory_store.sync_index)
+            logger.info(
+                "memory index synced: indexed=%s unchanged=%s removed=%s",
+                result.get("indexed"), result.get("unchanged"), result.get("removed"),
+            )
+        except Exception as e:
+            logger.warning("background memory sync failed: %s", e)
+
+    try:
+        asyncio.get_event_loop().create_task(_run())
+    except RuntimeError:
+        # No running loop (e.g. called from a sync context in tests) — skip.
+        pass
 
 app = FastAPI(title="SakethWiki API", version="1.0.0", lifespan=lifespan)
 
@@ -83,14 +110,21 @@ app.add_middleware(
 
 URL_SCRAPE_CHAR_LIMIT   = 5000   # max chars kept from fetched URL body
 URL_SCRAPE_LINK_LIMIT   = 20     # max external links scraped per page
-RAG_TOP_K               = 10     # top-k pages considered for chat context
-RAG_CONTEXT_BUDGET      = 6000   # total chars of vault context injected into chat
+RAG_TOP_K               = int(os.environ.get("RAG_TOP_K", 5))          # top-k pages for chat/interview context
+RAG_CONTEXT_BUDGET      = int(os.environ.get("RAG_CONTEXT_BUDGET", 4000))  # chars of vault context injected into chat/interview
 SELF_LEARN_TRACE_WINDOW = 100    # last N traces sent to Sonnet for weekly analysis
 LINT_CACHE_TTL_SECONDS  = 86400  # 24 h — lint report cache validity
 WEEKLY_ANALYSIS_INTERVAL_SECONDS = 3600  # scheduler checks every hour
+ANALYSIS_RETRY_BACKOFF_SECONDS = 86400   # after an attempt (pass or fail), wait a day before retrying
 SOURCE_VERDICTS = {"ingest", "source_only", "reject"}
 KNOWLEDGE_SHAPES = {"taxonomy", "mechanism", "architecture", "argument", "case_study", "none"}
 CHAT_NOTE_TYPES = {"correction", "contradiction", "example", "nuance"}
+
+# Operations subsystem (system loop, eval harness, trace critic, action
+# candidates, the Operations tab). Paused by default — set ENABLE_OPS=true to
+# register its routes and show the tab. The knowledge feedback loop
+# (/analyze-traces, weekly scheduler, system-insights) runs regardless.
+ENABLE_OPS = os.environ.get("ENABLE_OPS", "false").strip().lower() in {"1", "true", "yes", "on"}
 
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -172,6 +206,18 @@ class RegenerateRequest(BaseModel):
     mode: str = "full"  # full | diagram
 
 
+class DiagramRegenerationRequest(BaseModel):
+    expected_revision: int
+    idempotency_key: str
+    intent: str = "faithful_source"
+    feedback: str = ""
+
+
+class DiagramSelectionRequest(BaseModel):
+    expected_revision: int
+    candidate_id: str
+
+
 class ApproveRequest(BaseModel):
     approved: bool
     redirect_note: Optional[str] = None
@@ -215,6 +261,7 @@ class PreferenceReviewRequest(BaseModel):
 class InterviewRequest(BaseModel):
     question: str
     user_answer: Optional[str] = None
+    want_verification: bool = False
 
 
 class GapQueueRequest(BaseModel):
@@ -253,6 +300,17 @@ class ConsolidateRequest(BaseModel):
     source: str   # page to merge FROM (will be deleted after)
     target: str   # page to merge INTO (will be updated)
     force: bool = False  # allow manual override for non-high-confidence pairs
+    dry_run: bool = False  # draft only: return the merged text, write nothing
+    # Apply a previewed draft instead of calling the LLM again. The hashes must
+    # match the pages' current content, so an edit after the preview is caught.
+    merged: Optional[str] = None
+    source_sha: Optional[str] = None
+    target_sha: Optional[str] = None
+
+
+class DismissPairRequest(BaseModel):
+    source: str
+    target: str
 
 
 # ── /ingest ──────────────────────────────────────────────────────────────────
@@ -431,6 +489,9 @@ def _stage_markdown_clip(markdown: str, source_url: str = "", clip_title: str = 
         "source_type": "clip_markdown",
         "clip_signature": sig,
         "raw_markdown": text,
+        "source_evidence": {"text": text, "images": []},
+        "revision": 0,
+        "diagram_revisions": [],
         "inbox_file": inbox_file,
         "staged_at": datetime.now().isoformat(),
         "status": "pending",
@@ -439,25 +500,103 @@ def _stage_markdown_clip(markdown: str, source_url: str = "", clip_title: str = 
     return item
 
 
+DIAGRAM_INTENTS = {"faithful_source", "explain_mechanism", "compare_alternatives"}
+
+
+def _diagram_evidence(item: dict) -> tuple[str, list]:
+    """Return only capture-time evidence; never re-fetch a drifting URL."""
+    evidence = item.get("source_evidence") if isinstance(item.get("source_evidence"), dict) else {}
+    text = str(evidence.get("text") or item.get("raw_markdown") or "").strip()
+    images = evidence.get("images") if isinstance(evidence.get("images"), list) else []
+    return text, images
+
+
+def _regeneration_plan(item: dict, evidence: str, intent: str) -> dict:
+    """Reuse the curation decision, allowing an explicit no-diagram outcome."""
+    current = _normalize_diagram_plan(item.get("diagram_plan"))
+    if not current.get("needed"):
+        return {"needed": False, "type": "none", "reason": "Source has no approved visual structure."}
+    shape = str(item.get("knowledge_shape") or "none").lower()
+    types = {
+        "taxonomy": "hierarchy", "mechanism": "flowchart", "architecture": "architecture",
+        "argument": "comparison", "case_study": "flowchart",
+    }
+    plan_type = types.get(shape, current.get("type", "flowchart"))
+    if intent == "compare_alternatives" and shape in {"argument", "taxonomy"}:
+        plan_type = "comparison"
+    return {
+        "needed": True,
+        "type": plan_type,
+        "reason": f"Regenerated from captured {shape if shape != 'none' else 'source'} structure.",
+    }
+
+
+def _diagram_node_labels(diagram: str) -> list[str]:
+    return [label.strip() for label in _re.findall(r"\[([^\]]+)\]", diagram or "") if label.strip()]
+
+
+def _validate_diagram_candidate(diagram: str, plan: dict, evidence: str, key_concepts: list) -> dict:
+    """Cheap deterministic gate; browser Mermaid remains the final renderer."""
+    if not plan.get("needed"):
+        return {"syntax_valid": True, "shape_match": True, "grounded_labels": True, "selectable": True}
+    clean = _normalize_mermaid(diagram or "").strip()
+    if not _re.match(r"^(?:flowchart|graph)\s+(?:TB|TD|BT|RL|LR)\b", clean, flags=_re.I):
+        return {"syntax_valid": False, "shape_match": False, "grounded_labels": False, "selectable": False,
+                "reason": "Diagram must start with a Mermaid flowchart direction."}
+    if len(_re.findall(r"(?:-->|---|==>)", clean)) < 2 or len(_diagram_node_labels(clean)) < 3:
+        return {"syntax_valid": False, "shape_match": False, "grounded_labels": False, "selectable": False,
+                "reason": "Diagram needs at least three labeled nodes and two relationships."}
+    if plan.get("type") == "hierarchy" and not _re.search(r"flowchart\s+(?:TB|TD)\b", clean, flags=_re.I):
+        return {"syntax_valid": True, "shape_match": False, "grounded_labels": False, "selectable": False,
+                "reason": "A hierarchy must use a top-down layout."}
+    evidence_tokens = set(_re.findall(r"[a-z0-9]+", (evidence + " " + " ".join(map(str, key_concepts or []))).lower()))
+    unsupported = []
+    for label in _diagram_node_labels(clean):
+        tokens = [t for t in _re.findall(r"[a-z0-9]+", label.lower()) if len(t) > 2]
+        if tokens and not any(t in evidence_tokens for t in tokens):
+            unsupported.append(label)
+    if unsupported:
+        return {"syntax_valid": True, "shape_match": True, "grounded_labels": False, "selectable": False,
+                "reason": f"Unsupported labels: {', '.join(unsupported[:3])}."}
+    return {"syntax_valid": True, "shape_match": True, "grounded_labels": True, "selectable": True}
+
+
+def _generate_evidence_diagram(item: dict, evidence: str, images: list, plan: dict, intent: str, feedback: str) -> str:
+    if not plan.get("needed"):
+        return ""
+    if images:
+        # Vision generation uses the original labels and directions where available.
+        return _vision_diagram(images, item.get("title", "Concept"), item.get("summary", []))
+    prompt = f"""Generate a Mermaid diagram strictly from the captured source below.
+
+Title: {item.get('title', 'Concept')}
+Required structure: {plan.get('type')}
+Reviewer intent: {intent}
+Reviewer feedback (non-authoritative): {feedback or 'None'}
+
+Rules:
+- Return NONE if the source does not support this structure.
+- Use only component names, concepts, and relationships supported by the source.
+- Use flowchart TD for hierarchy; flowchart LR otherwise.
+- 3-10 nodes, short labels, at least two arrows.
+- Return raw Mermaid only: no fences or explanation.
+
+Captured source:
+{evidence[:10000]}"""
+    raw = llm_client.complete(task="diagram", model=None, max_tokens=600,
+                              messages=[{"role": "user", "content": prompt}]).strip()
+    raw = _re.sub(r"^```(?:mermaid)?\s*", "", raw)
+    raw = _re.sub(r"\s*```$", "", raw).strip()
+    return "" if raw == "NONE" else _normalize_mermaid(raw)
+
+
 def _regen_item(item: dict, mode: str = "full") -> dict:
     """Regenerate queue item extraction from raw markdown or source URL."""
     updated = dict(item)
     existing_pages = [p["name"] for p in vault_reader.list_concept_pages()]
 
     if mode == "diagram":
-        updated["diagram"] = _llm_diagram(
-            title=updated.get("title", "Concept"),
-            summary=updated.get("summary", []),
-            key_concepts=updated.get("key_concepts", []),
-        )
-        updated["diagram_plan"] = {
-            "needed": bool(updated.get("diagram")),
-            "type": "regenerated",
-            "reason": "Diagram was explicitly regenerated from the review queue.",
-        }
-        updated["regenerated_at"] = datetime.now().isoformat()
-        updated["regenerated_mode"] = "diagram"
-        return updated
+        raise HTTPException(410, "Diagram-only regeneration moved to versioned candidates.")
 
     raw_md = updated.get("raw_markdown", "")
     src_url = updated.get("url", "")
@@ -635,6 +774,9 @@ async def ingest(req: IngestRequest, request: Request):
             "references": extraction.get("references", []),
             "diagram": extraction.get("diagram", ""),
             **_curation_fields(extraction),
+            "source_evidence": {"text": raw_text, "images": all_images},
+            "revision": 0,
+            "diagram_revisions": [],
             "staged_at": datetime.now().isoformat(),
             "status": "pending",
         }
@@ -1270,7 +1412,7 @@ def _extract_with_sonnet(text: str, images: Optional[list], source_url: str,
             "If the image has no structural diagram (e.g. pure text slide, photo), return \"\"."
         )
         content_budget = 10000
-        max_out = 1500
+        max_out = 1800
     elif content_len > 8000:
         depth = "long-form"
         model = "claude-haiku-4-5-20251001"   # Haiku handles long text fine; Sonnet only needed for images
@@ -1283,7 +1425,7 @@ def _extract_with_sonnet(text: str, images: Optional[list], source_url: str,
             "Add 'classDef accent fill:#c4573a,color:#fff,font-weight:bold' and apply :::accent to 1-2 key nodes (entry or critical output)."
         )
         content_budget = 10000
-        max_out = 1500
+        max_out = 1800
     elif content_len > 1500:
         depth = "medium"
         model = "claude-haiku-4-5-20251001"  # structured extraction, no deep reasoning
@@ -1295,14 +1437,14 @@ def _extract_with_sonnet(text: str, images: Optional[list], source_url: str,
             "Add 'classDef accent fill:#c4573a,color:#fff,font-weight:bold' and apply :::accent to 1-2 key nodes."
         )
         content_budget = 6000
-        max_out = 1200
+        max_out = 1600
     else:
         depth = "short"
         model = "claude-haiku-4-5-20251001"  # short structured extraction
         bullet_rule = "2-3 bullets — each a sharp, distinct insight. Neutral, precise technical prose (no first-person, no 'I learned')."
         diagram_rule = 'Return "" — short content rarely benefits from a diagram.'
         content_budget = 3000
-        max_out = 1200  # 800 truncated the 13-key JSON contract mid-response
+        max_out = 1400  # Structured JSON needs headroom even for short captures.
 
     content_budget = _ingest_source_budget(content_budget)
     source_chars_total = len(text or "")
@@ -1365,16 +1507,16 @@ Rules:
   * ingest = source contains durable educational signal for the wiki.
   * source_only = source is mainly event/news/social context; keep links or provenance but write only the transferable educational core.
   * reject = no durable educational value for this wiki. Use reject for recipes, shopping, celebrity gossip, announcements without transferable concepts, or pure hype.
-- educational_core: extract only reusable concepts, mechanisms, distinctions, failure modes, or implementation lessons. Do not include conference chronology, who-posted-what timelines, sponsor copy, social proof, or namedropping unless it defines the concept.
-- discarded_context: list 1-5 specific details intentionally excluded from durable notes, especially event chronology, hype context, or non-educational background.
+- educational_core: 1-3 reusable concepts, mechanisms, distinctions, failure modes, or implementation lessons. Do not include conference chronology, who-posted-what timelines, sponsor copy, social proof, or namedropping unless it defines the concept.
+- discarded_context: 0-2 specific details intentionally excluded from durable notes, especially event chronology, hype context, or non-educational background.
 - knowledge_shape: choose the dominant structure before writing bullets. Use taxonomy for categories, mechanism for cause/effect or procedure, architecture for components/layers, argument for claims/tradeoffs, case_study for one concrete example, none for weak structure.
 - summary: {bullet_rule}
 - suggested_page: use an existing slug if one fits; otherwise create a lowercase-hyphenated slug
-- suggested_wikilinks: 3-6 related concepts as kebab-case slugs — prefer existing page slugs listed above
-- tags: pick 1-4 from this exact list only: {tags_list}
-- key_concepts: 4-8 specific terms or ideas from the content
-- references: pick the most valuable external links mentioned in the content (YouTube videos, GitHub repos, papers, key articles). Empty list [] if none. Max 5 links.
-- diagram_plan: decide whether a diagram is actually useful before drawing. Prefer no diagram over a generic hub-and-spoke summary. If source contains an existing diagram, reproduce its structure. If source has clean conceptual structure but no diagram, create a new useful visual from that structure.
+- suggested_wikilinks: 0-3 related concepts as kebab-case slugs — prefer existing page slugs listed above
+- tags: pick 1-3 from this exact list only: {tags_list}
+- key_concepts: 3-5 specific terms or ideas from the content
+- references: pick the most valuable external links mentioned in the content (YouTube videos, GitHub repos, papers, key articles). Empty list [] if none. Max 3 links.
+- diagram_plan: decide whether a diagram is actually useful before drawing. Prefer no diagram over a generic hub-and-spoke summary. Keep `reason` under 12 words.
 - diagram: {diagram_rule} Escape all newlines as \\n in the JSON string. No special chars in node labels.""",
     })
 
@@ -1510,11 +1652,54 @@ def _slice_content(text: str, source_url: str, existing_pages: list) -> list[dic
     3. Reconstruct chapter texts from the paragraph groups.
     """
     paragraphs = [p.strip() for p in _re.split(r"\n\n+", text) if p.strip()]
-    no_split = [{"title": "", "text": text, "concept_hint": ""}]
+    no_split = [{"title": "", "text": text, "concept_hint": "", "split_mode": "none"}]
 
     # Don't slice short content or content with fewer than 4 paragraphs
     if len(text) < 2500 or len(paragraphs) < 4:
         return no_split
+
+    def _structural_fallback(mode: str) -> list[dict]:
+        """Split only at explicit headings or conservative paragraph size bounds."""
+        heading_matches = list(_re.finditer(r"(?m)^#{1,6}\s+(.+?)\s*$", text))
+        sections = []
+        if len(heading_matches) >= 2:
+            for i, match in enumerate(heading_matches):
+                start = match.end()
+                end = heading_matches[i + 1].start() if i + 1 < len(heading_matches) else len(text)
+                body = text[start:end].strip()
+                if body:
+                    sections.append({"title": match.group(1).strip(), "text": body, "concept_hint": ""})
+        if len(sections) < 2:
+            sections = []
+            current, current_len = [], 0
+            for paragraph in paragraphs:
+                if current and current_len + len(paragraph) > 4500:
+                    sections.append({"title": "", "text": "\n\n".join(current), "concept_hint": ""})
+                    current, current_len = [], 0
+                current.append(paragraph)
+                current_len += len(paragraph)
+            if current:
+                sections.append({"title": "", "text": "\n\n".join(current), "concept_hint": ""})
+        if len(sections) < 2:
+            telemetry.log_context_event("topic_split", {"mode": "none", "reason": "no_reliable_structure"})
+            return no_split
+        if len(sections) > 5:
+            overflow = sections[4:]
+            sections = sections[:4] + [{
+                "title": sections[4].get("title", ""),
+                "text": "\n\n".join(item["text"] for item in overflow),
+                "concept_hint": "",
+            }]
+        for section in sections:
+            section["split_mode"] = mode
+        telemetry.log_context_event("topic_split", {"mode": mode, "count": len(sections)})
+        return sections[:5]
+
+    # Explicit headings are stronger evidence than an LLM guess and avoid an
+    # unnecessary planner call for well-structured Markdown/HTML captures.
+    heading_fallback = _structural_fallback("headings") if _re.search(r"(?m)^#{1,6}\s+", text) else None
+    if heading_fallback and len(heading_fallback) > 1:
+        return heading_fallback
 
     # Cap what we send to the LLM — beyond ~8000 chars the paragraph list itself
     # gives enough signal for boundary detection without sending the full body.
@@ -1548,7 +1733,7 @@ Paragraphs:
         raw = llm_client.complete(
             task="slice_content",
             model=None,
-            max_tokens=700,
+            max_tokens=1000,
             messages=[{"role": "user", "content": prompt}],
             expect_json=True,
         ).strip()
@@ -1556,10 +1741,28 @@ Paragraphs:
         end   = raw.rfind("]") + 1
         chapters = json.loads(raw[start:end]) if start >= 0 else None
     except Exception:
-        return no_split
+        return _structural_fallback("paragraph_chunks")
 
     if not chapters or len(chapters) <= 1:
+        telemetry.log_context_event("topic_split", {"mode": "none", "reason": "unified_or_no_plan"})
         return no_split
+
+    # A syntactically valid array is not enough: coverage must be exact so no
+    # source paragraph disappears or is duplicated across child wikis.
+    if not isinstance(chapters, list) or len(chapters) > 5:
+        return _structural_fallback("paragraph_chunks")
+    seen = []
+    for chapter in chapters:
+        if not isinstance(chapter, dict):
+            return _structural_fallback("paragraph_chunks")
+        indices = chapter.get("paragraphs")
+        if not isinstance(indices, list) or not indices:
+            return _structural_fallback("paragraph_chunks")
+        if any(not isinstance(index, int) or index < 0 or index >= len(paragraphs) for index in indices):
+            return _structural_fallback("paragraph_chunks")
+        seen.extend(indices)
+    if sorted(seen) != list(range(len(paragraphs))) or len(set(seen)) != len(seen):
+        return _structural_fallback("paragraph_chunks")
 
     # Reconstruct full chapter texts (use original paragraphs, not the truncated preview)
     result = []
@@ -1573,9 +1776,21 @@ Paragraphs:
                 "title": (ch.get("title") or "").strip(),
                 "text":  chapter_text,
                 "concept_hint": (ch.get("concept_hint") or "").strip(),
+                "split_mode": "llm",
             })
 
-    return result if len(result) > 1 else no_split
+    if len(result) > 5:
+        overflow = result[4:]
+        result = result[:4] + [{
+            "title": overflow[0].get("title", ""),
+            "text": "\n\n".join(item["text"] for item in overflow),
+            "concept_hint": "",
+            "split_mode": "llm",
+        }]
+    if len(result) > 1:
+        telemetry.log_context_event("topic_split", {"mode": "llm", "count": len(result)})
+        return result
+    return _structural_fallback("paragraph_chunks")
 
 
 def _safe_node_label(text: str, max_words: int = 6, max_chars: int = 44) -> str:
@@ -2052,6 +2267,90 @@ async def queue_regenerate(item_id: str, req: RegenerateRequest):
     }
 
 
+@app.post("/queue/{item_id}/diagram-regenerations")
+async def create_diagram_regeneration(item_id: str, req: DiagramRegenerationRequest):
+    """Create a validated candidate without changing the selected queue draft."""
+    if req.intent not in DIAGRAM_INTENTS:
+        raise HTTPException(422, "intent must be faithful_source, explain_mechanism, or compare_alternatives")
+    if not req.idempotency_key.strip():
+        raise HTTPException(422, "idempotency_key is required")
+    if len(req.feedback) > 500:
+        raise HTTPException(422, "feedback must be at most 500 characters")
+    item = queue_manager.get_by_id(item_id)
+    if not item:
+        raise HTTPException(404, f"Item {item_id} not found in queue")
+    if int(item.get("revision", 0)) != req.expected_revision:
+        raise HTTPException(409, detail={"message": "Queue item changed; refresh before regenerating.", "item": item})
+    for candidate in item.get("diagram_revisions", []):
+        if candidate.get("idempotency_key") == req.idempotency_key:
+            return {"id": item_id, "revision": item.get("revision", 0), "candidate": candidate,
+                    "selected_candidate_id": item.get("selected_diagram_candidate_id")}
+
+    evidence, images = _diagram_evidence(item)
+    if not evidence and not images:
+        raise HTTPException(422, "This queued item has no retained source evidence; use full regeneration or edit manually.")
+    plan = _regeneration_plan(item, evidence, req.intent)
+    try:
+        diagram = _generate_evidence_diagram(item, evidence, images, plan, req.intent, req.feedback.strip())
+    except Exception as exc:
+        logger.warning("diagram regeneration failed for %s: %s", item_id, exc)
+        raise HTTPException(503, "Diagram generation is unavailable; the current draft was unchanged.")
+    validation = _validate_diagram_candidate(diagram, plan, evidence, item.get("key_concepts", []))
+    if not validation.get("selectable"):
+        raise HTTPException(422, detail={"message": "Candidate failed validation; the current draft was unchanged.",
+                                         "validation": validation})
+    candidate = {
+        "id": str(uuid.uuid4()), "idempotency_key": req.idempotency_key,
+        "parent_revision": req.expected_revision, "created_at": datetime.now().isoformat(),
+        "intent": req.intent, "feedback": req.feedback.strip(),
+        "evidence_hash": hashlib.sha256((evidence + str(len(images))).encode()).hexdigest(),
+        "diagram_plan": plan, "diagram": diagram, "validation": validation,
+        "generator": {"prompt_version": "evidence-diagram-v1"},
+    }
+    updated = dict(item)
+    updated["diagram_revisions"] = [*item.get("diagram_revisions", []), candidate]
+    updated["revision"] = req.expected_revision + 1
+    ok, current = queue_manager.update_if_revision(item_id, req.expected_revision, updated)
+    if not ok:
+        if current is None:
+            raise HTTPException(404, f"Item {item_id} not found in queue")
+        raise HTTPException(409, detail={"message": "Queue item changed; refresh before regenerating.", "item": current})
+    telemetry.log_context_event("diagram_regeneration", {
+        "item_id": item_id, "intent": req.intent, "plan_type": plan.get("type"),
+        "evidence_hash": candidate["evidence_hash"], "validation": validation,
+    })
+    return {"id": item_id, "revision": updated["revision"], "candidate": candidate,
+            "selected_candidate_id": updated.get("selected_diagram_candidate_id")}
+
+
+@app.post("/queue/{item_id}/diagram-selection")
+async def select_diagram_candidate(item_id: str, req: DiagramSelectionRequest):
+    item = queue_manager.get_by_id(item_id)
+    if not item:
+        raise HTTPException(404, f"Item {item_id} not found in queue")
+    if int(item.get("revision", 0)) != req.expected_revision:
+        raise HTTPException(409, detail={"message": "Queue item changed; refresh before selecting.", "item": item})
+    candidate = next((c for c in item.get("diagram_revisions", []) if c.get("id") == req.candidate_id), None)
+    if not candidate:
+        raise HTTPException(404, "Diagram candidate not found")
+    if not candidate.get("validation", {}).get("selectable"):
+        raise HTTPException(422, "Only validated diagram candidates can be selected")
+    updated = dict(item)
+    updated["diagram"] = candidate.get("diagram", "")
+    updated["diagram_plan"] = candidate.get("diagram_plan", {})
+    updated["selected_diagram_candidate_id"] = candidate["id"]
+    updated["revision"] = req.expected_revision + 1
+    ok, current = queue_manager.update_if_revision(item_id, req.expected_revision, updated)
+    if not ok:
+        if current is None:
+            raise HTTPException(404, f"Item {item_id} not found in queue")
+        raise HTTPException(409, detail={"message": "Queue item changed; refresh before selecting.", "item": current})
+    return {"id": item_id, "revision": updated["revision"], "diff_preview": {
+        "diagram": updated["diagram"], "diagram_plan": updated["diagram_plan"],
+        "selected_diagram_candidate_id": updated["selected_diagram_candidate_id"],
+    }}
+
+
 # ── queue decisions ───────────────────────────────────────────────────────────
 
 async def _decide_queue_item(item_id: str, req: ApproveRequest):
@@ -2305,38 +2604,6 @@ def _extract_topic(msg: str, relevant_names: list) -> Optional[str]:
     return scored[0]
 
 
-def _semantic_page_select(message: str, page_summaries: str) -> list[str]:
-    """
-    Stage 1: Ask Haiku which pages are relevant to the user's question.
-    Sends one line per page (name + understanding block excerpt), returns up to 5 slugs.
-    Cheap: ~200 input tokens, no full page content.
-    """
-    prompt = (
-        f"User question: {message}\n\n"
-        "Below are all concept pages in the wiki (name | understanding excerpt).\n"
-        "Return ONLY a JSON array of the 1-5 most relevant page slugs (e.g. [\"kv-cache\",\"attention\"]).\n"
-        "If nothing is relevant, return [].\n\n"
-        f"{page_summaries}"
-    )
-    try:
-        raw = llm_client.complete(
-            task="chat_select_pages",
-            model=None,
-            max_tokens=200,
-            messages=[{"role": "user", "content": prompt}],
-            expect_json=True,
-        ).strip()
-    except Exception as e:
-        logger.warning("chat_select_pages failed; falling back to keyword match: %s", e)
-        return []
-    try:
-        start = raw.find("[")
-        end = raw.rfind("]") + 1
-        return json.loads(raw[start:end]) if start >= 0 else []
-    except (json.JSONDecodeError, ValueError):
-        return []
-
-
 @app.post("/chat")
 async def chat(req: ChatRequest):
     if not req.message or not req.message.strip():
@@ -2347,25 +2614,15 @@ async def chat(req: ChatRequest):
     try:
         memory_hits = await loop.run_in_executor(None, memory_store.search, req.message, RAG_TOP_K)
     except Exception as e:
-        logger.warning("memory search failed; falling back to semantic page selection: %s", e)
+        logger.warning("memory search failed; falling back to keyword match: %s", e)
 
     relevant_names = [hit["page_name"] for hit in memory_hits]
 
-    # Fallback: original page-selection path
+    # Single fallback: keyword scan with synonym expansion. No LLM, no index.
     if not relevant_names:
-        all_pages = vault_reader.list_concept_pages()
-        page_summaries_parts = []
-        for p in all_pages:
-            content = vault_reader.read_page(p["name"]) or ""
-            body = _strip_frontmatter(content)
-            excerpt = body[:200].replace("\n", " ").strip()
-            page_summaries_parts.append(f"{p['name']} | {excerpt}")
-        page_summaries = "\n".join(page_summaries_parts)
         relevant_names = await loop.run_in_executor(
-            None, _semantic_page_select, req.message, page_summaries
+            None, vault_reader.find_relevant_pages, req.message
         )
-    if not relevant_names:
-        relevant_names = vault_reader.find_relevant_pages(req.message)
 
     context_budget = _chat_context_budget()
     context_parts = []
@@ -2626,22 +2883,24 @@ async def interview(req: InterviewRequest):
     if not req.question or not req.question.strip():
         raise HTTPException(400, "question cannot be empty")
 
-    # Stage 1: RAG — same page selection as /chat
-    all_pages = vault_reader.list_concept_pages()
-    page_summaries_parts = []
-    for p in all_pages:
-        content = vault_reader.read_page(p["name"]) or ""
-        body = _strip_frontmatter(content)
-        excerpt = body[:200].replace("\n", " ").strip()
-        page_summaries_parts.append(f"{p['name']} | {excerpt}")
-    page_summaries = "\n".join(page_summaries_parts)
-
     loop = asyncio.get_event_loop()
-    relevant_names = await loop.run_in_executor(
-        None, _semantic_page_select, req.question, page_summaries
-    )
+
+    # Stage 1: RAG — identical retrieval path to /chat (SQLite memory index,
+    # keyword scan as the single fallback). No per-call vault scan, no LLM
+    # page-selection step.
+    memory_hits = []
+    try:
+        memory_hits = await loop.run_in_executor(
+            None, memory_store.search, req.question, RAG_TOP_K
+        )
+    except Exception as e:
+        logger.warning("interview memory search failed; falling back to keyword match: %s", e)
+
+    relevant_names = [hit["page_name"] for hit in memory_hits]
     if not relevant_names:
-        relevant_names = vault_reader.find_relevant_pages(req.question)
+        relevant_names = await loop.run_in_executor(
+            None, vault_reader.find_relevant_pages, req.question
+        )
 
     pages_content = vault_reader.read_pages_content(relevant_names[:RAG_TOP_K])
     context_parts = []
@@ -2680,18 +2939,49 @@ async def interview(req: InterviewRequest):
         messages=[{"role": "user", "content": user_content}],
     )
 
-    # Stage 2: Verify with routed model (default: Ollama/Qwen3:14b via LLM_PROVIDER_INTERVIEW_VERIFY)
+    # Record the practice rep as trace + telemetry so the weekly self-learning
+    # analysis and the system evals can see interview activity. Best-effort —
+    # a logging failure must never block the answer.
+    had_user_answer = bool(req.user_answer and req.user_answer.strip())
     try:
-        verification = await loop.run_in_executor(
-            None, _run_verifier, req.question, wiki_answer
-        )
+        _append_trace({
+            "id": f"interview-{uuid.uuid4().hex[:12]}",
+            "ts": datetime.now().isoformat(),
+            "event_type": "interview",
+            "question": req.question.strip()[:1000],
+            "pages_read": relevant_names[:RAG_TOP_K],
+            "want_verification": req.want_verification,
+            "had_user_answer": had_user_answer,
+            "source_type": "interview",
+        })
     except Exception as e:
-        logger.warning("Interview verifier failed: %s", e)
-        verification = {"score": None, "verdict": "Verification unavailable", "gaps": []}
+        logger.warning("interview trace write failed: %s", e)
+    try:
+        telemetry.log_context_event("interview_context", {
+            "task": "interview",
+            "query": req.question,
+            "memory_hits": len(memory_hits),
+            "pages_read": relevant_names[:RAG_TOP_K],
+            "context_chars_used": len(context),
+            "context_budget": RAG_CONTEXT_BUDGET,
+        })
+    except Exception as e:
+        logger.warning("interview telemetry write failed: %s", e)
+
+    # Stage 2: Verify — opt-in. Runs only when the user asked to be graded.
+    verification = None
+    if req.want_verification:
+        try:
+            verification = await loop.run_in_executor(
+                None, _run_verifier, req.question, wiki_answer
+            )
+        except Exception as e:
+            logger.warning("Interview verifier failed: %s", e)
+            verification = {"score": None, "verdict": "Verification unavailable", "gaps": []}
 
     # Stage 3: Grade user's own answer if provided
     user_grading = None
-    if req.user_answer and req.user_answer.strip():
+    if had_user_answer:
         try:
             user_grading = await loop.run_in_executor(
                 None, _run_grader, req.question, wiki_answer, req.user_answer
@@ -2703,7 +2993,7 @@ async def interview(req: InterviewRequest):
     return {
         "wiki_answer": wiki_answer,
         "pages_read": relevant_names,
-        "verification": verification,
+        **({"verification": verification} if verification is not None else {}),
         **({"user_grading": user_grading} if user_grading is not None else {}),
     }
 
@@ -2734,7 +3024,7 @@ async def queue_gap(req: GapQueueRequest):
 @app.get("/health")
 async def health():
     """Lightweight liveness probe — no DB, no LLM, just confirms the process is up."""
-    return {"status": "ok"}
+    return {"status": "ok", "ops_enabled": ENABLE_OPS}
 
 
 @app.get("/pages")
@@ -2812,7 +3102,7 @@ async def recent_pages(days: int = 7):
         for p in vault_reader.list_pages_in_folder(folder):
             if (p.get("last_updated") or p.get("date") or "") >= cutoff:
                 all_pages.append(p)
-    all_pages.sort(key=lambda p: p.get("last_updated") or p.get("date") or "", reverse=True)
+    all_pages.sort(key=lambda p: p.get("last_saved_at") or p.get("last_updated") or p.get("date") or "", reverse=True)
     return {"pages": all_pages}
 
 
@@ -2905,6 +3195,7 @@ def _dashboard_stats_from_traces(
     now: Optional[datetime] = None,
     period_days: int = 30,
     heatmap_days: int = 112,
+    until: Optional[datetime] = None,
 ) -> dict:
     now = now or datetime.now()
     period_cutoff = now - timedelta(days=period_days)
@@ -2918,7 +3209,9 @@ def _dashboard_stats_from_traces(
             continue
         parsed_rows.append((trace, ts))
 
-    period_rows = [(t, ts) for t, ts in parsed_rows if ts > period_cutoff]
+    # `until` bounds the window from above so an earlier window (for trends)
+    # doesn't also count everything after it.
+    period_rows = [(t, ts) for t, ts in parsed_rows if ts > period_cutoff and (until is None or ts <= until)]
     period_approved = [(t, ts) for t, ts in period_rows if t.get("approved")]
     period_rejected = [(t, ts) for t, ts in period_rows if t.get("approved") is False]
     heatmap_approved = [(t, ts) for t, ts in parsed_rows if t.get("approved") and ts > heatmap_cutoff]
@@ -2989,6 +3282,46 @@ def _dashboard_stats_from_traces(
     }
 
 
+_QUESTION_EVENTS = {"chat_context": "chat_questions", "interview_context": "interview_questions"}
+
+
+def _recall_stats(
+    reads: list[dict],
+    context_events: list[dict],
+    now: Optional[datetime] = None,
+    period_days: int = 30,
+    until: Optional[datetime] = None,
+) -> dict:
+    """Recall side of the loop: page reads and questions asked in the period."""
+    now = now or datetime.now()
+    cutoff = now - timedelta(days=period_days)
+
+    def in_window(ts: Optional[datetime]) -> bool:
+        return bool(ts) and ts > cutoff and (until is None or ts <= until)
+
+    read_pages = []
+    for entry in reads:
+        # /log-read writes concept/ts; older rows may use page/timestamp.
+        ts = _parse_iso_datetime(entry.get("ts") or entry.get("timestamp"))
+        page = str(entry.get("concept") or entry.get("page") or "").strip()
+        if in_window(ts) and page:
+            read_pages.append(page)
+
+    counts = {field: 0 for field in _QUESTION_EVENTS.values()}
+    for event in context_events:
+        field = _QUESTION_EVENTS.get(event.get("event_type"))
+        ts = _parse_iso_datetime(event.get("ts"))
+        if field and in_window(ts):
+            counts[field] += 1
+
+    return {
+        "pages_read": len(read_pages),
+        "unique_pages_read": len(set(read_pages)),
+        "questions_asked": sum(counts.values()),
+        **counts,
+    }
+
+
 @app.get("/dashboard-stats")
 async def get_dashboard_stats():
     """
@@ -3012,10 +3345,50 @@ async def get_dashboard_stats():
                 except Exception:
                     continue
 
-    return _dashboard_stats_from_traces(traces)
+    reads = []
+    reads_path = vault_path / "_wiki" / "meta" / "reads.jsonl"
+    if reads_path.exists():
+        for line in reads_path.read_text(encoding="utf-8").splitlines():
+            if line.strip():
+                try:
+                    reads.append(json.loads(line))
+                except Exception:
+                    continue
+
+    context_events = telemetry.read_context_events()
+    now = datetime.now()
+    stats = _dashboard_stats_from_traces(traces, now=now)
+    period = stats["period_days"]
+    stats["recall"] = _recall_stats(reads, context_events, now=now, period_days=period)
+
+    # Same-length window just before the current one, for trend arrows.
+    prev_end = now - timedelta(days=period)
+    prev = _dashboard_stats_from_traces(traces, now=prev_end, period_days=period, until=prev_end)
+    prev_recall = _recall_stats(reads, context_events, now=prev_end, period_days=period, until=prev_end)
+    stats["previous"] = {
+        "total_approved": prev["total_approved"],
+        "approval_rate": prev["approval_rate"],
+        "pages_read": prev_recall["pages_read"],
+        "questions_asked": prev_recall["questions_asked"],
+    }
+    return stats
 
 
 # ── /analyze-traces ──────────────────────────────────────────────────────────
+
+# Only the fields the analysis prompt describes. Full traces carry summaries,
+# diagrams and curation text that the prompt never uses and that made each
+# call ~84K input tokens.
+_ANALYSIS_TRACE_FIELDS = (
+    "approved", "event_type", "note_type", "note", "target_pages", "title",
+    "suggested_page", "final_page", "page_corrected", "evolution_type",
+    "was_duplicate", "tags_suggested", "tags_final", "tags_corrected", "source_type",
+)
+
+
+def _compact_trace(trace: dict) -> dict:
+    return {k: trace[k] for k in _ANALYSIS_TRACE_FIELDS if k in trace}
+
 
 @app.post("/analyze-traces")
 async def analyze_traces():
@@ -3043,7 +3416,9 @@ async def analyze_traces():
         raise HTTPException(400, f"Need at least 3 traces to analyze (have {len(traces)})")
 
     # Build compact trace summary for the prompt
-    trace_summary = json.dumps(traces[-SELF_LEARN_TRACE_WINDOW:], indent=2)
+    trace_summary = "\n".join(
+        json.dumps(_compact_trace(t)) for t in traces[-SELF_LEARN_TRACE_WINDOW:]
+    )
 
     # Static instructions go in `system` (auto prompt-cached). The trace dump
     # — by far the largest and most repeated part of this call, since
@@ -3096,6 +3471,8 @@ Respond with a JSON object (no markdown fences):
   "summary": "2-3 sentence overall summary of system health"
 }
 
+Keep every list to at most 5 items, each item under 30 words.
+
 prompt_hints must be actionable, specific, and short — they will be directly injected into the extraction system prompt. E.g.:
 - "Twitter content about agent tooling maps to existing pages more often than it needs a new page — prefer existing slugs"
 - "The tag Agentic is frequently corrected to Agents — use Agents for tool-use and orchestration content"
@@ -3116,7 +3493,7 @@ prompt_hints must be actionable, specific, and short — they will be directly i
     raw = llm_client.complete(
         task="analyze_traces",
         model=None,
-        max_tokens=2000,
+        max_tokens=4000,
         system=system_prompt,
         messages=[{"role": "user", "content": user_content}],
         expect_json=True,
@@ -3178,7 +3555,9 @@ traces_analyzed: {len(traces)}
     insights_path = vault_path / "_wiki" / "meta" / "system-insights.md"
     insights_path.parent.mkdir(parents=True, exist_ok=True)
     _atomic_write_path(insights_path, content)
-    routed = system_loop.run_system_loop(auto_apply=True)
+    # Trace analysis (above) is the knowledge loop and always runs. Routing the
+    # findings into bounded system actions is Operations — gated.
+    routed = system_loop.run_system_loop(auto_apply=True) if ENABLE_OPS else None
 
     return {
         "success": True,
@@ -3227,13 +3606,18 @@ async def get_system_insights():
     }
 
 
-@app.post("/inference-report")
+# ── Operations subsystem ─────────────────────────────────────────────────────
+# These routes register only when ENABLE_OPS is true (see include_router below).
+ops_router = APIRouter()
+
+
+@ops_router.post("/inference-report")
 async def generate_inference_report():
     """Generate a Markdown inference report from runtime LLM/context telemetry."""
     return telemetry.generate_inference_report()
 
 
-@app.post("/system-loop/run")
+@ops_router.post("/system-loop/run")
 async def run_system_loop(auto_apply: bool = True):
     """
     Generate inference + system-loop reports and route bounded system improvements.
@@ -3244,26 +3628,26 @@ async def run_system_loop(auto_apply: bool = True):
     return system_loop.run_system_loop(auto_apply=auto_apply)
 
 
-@app.get("/system-loop/actions")
+@ops_router.get("/system-loop/actions")
 async def get_system_loop_actions(limit: int = 100):
     """Return recent system-loop routed actions."""
     return {"actions": telemetry.read_system_actions(limit=limit)}
 
 
-@app.get("/system-actions")
+@ops_router.get("/system-actions")
 async def get_system_actions(status: Optional[str] = None):
     """Return staged/applied/rejected system action candidates."""
     return {"candidates": system_loop.list_action_candidates(status=status)}
 
 
-@app.post("/trace-critic/run")
+@ops_router.post("/trace-critic/run")
 async def run_trace_critic():
     """Run the bounded LLM trace critic and stage only supported action candidates."""
     actions: list[dict] = []
     return system_loop.run_trace_critic(actions)
 
 
-@app.post("/system-actions/{candidate_id}/approve")
+@ops_router.post("/system-actions/{candidate_id}/approve")
 async def approve_system_action(candidate_id: str):
     try:
         return {"candidate": system_loop.approve_action_candidate(candidate_id)}
@@ -3271,7 +3655,7 @@ async def approve_system_action(candidate_id: str):
         raise HTTPException(404, str(e))
 
 
-@app.post("/system-actions/{candidate_id}/reject")
+@ops_router.post("/system-actions/{candidate_id}/reject")
 async def reject_system_action(candidate_id: str, req: RejectSystemActionRequest):
     try:
         return {"candidate": system_loop.reject_action_candidate(candidate_id, req.reason)}
@@ -3279,7 +3663,7 @@ async def reject_system_action(candidate_id: str, req: RejectSystemActionRequest
         raise HTTPException(404, str(e))
 
 
-@app.post("/system-actions/{candidate_id}/eval")
+@ops_router.post("/system-actions/{candidate_id}/eval")
 async def eval_system_action(candidate_id: str):
     try:
         return system_loop.run_candidate_eval(candidate_id)
@@ -3287,7 +3671,7 @@ async def eval_system_action(candidate_id: str):
         raise HTTPException(404, str(e))
 
 
-@app.post("/evals/run")
+@ops_router.post("/evals/run")
 async def run_evals(include_judge: bool = True):
     """Run the current replay eval suite and write an eval report."""
     report = eval_harness.run_eval(include_judge=include_judge)
@@ -3295,7 +3679,7 @@ async def run_evals(include_judge: bool = True):
     return {"eval": report, "actions": actions}
 
 
-@app.post("/reports/read")
+@ops_router.post("/reports/read")
 async def read_report(req: ReportPathRequest):
     report_dir = telemetry.reports_dir().resolve()
     try:
@@ -3312,7 +3696,7 @@ async def read_report(req: ReportPathRequest):
     }
 
 
-@app.get("/operations-overview")
+@ops_router.get("/operations-overview")
 async def operations_overview():
     llm_summary = telemetry.summarize_llm_calls()
     context_summary = telemetry.summarize_context_events()
@@ -3346,6 +3730,10 @@ async def operations_overview():
         "runtime_overrides": overrides,
         "reports": reports,
     }
+
+
+if ENABLE_OPS:
+    app.include_router(ops_router)
 
 
 # ── /follow-up/{page_name} ───────────────────────────────────────────────────
@@ -3472,24 +3860,29 @@ async def get_backlinks(page_name: str):
 # ── /review-queue ─────────────────────────────────────────────────────────────
 
 @app.get("/review-queue")
-async def review_queue(limit: int = 50, min_priority: str = "low"):
-    """Return active review queue ranked by maturity, staleness, backlinks, and conflicts."""
+def review_queue(limit: int = 50, min_priority: str = "low"):
+    """Return active review queue ranked by maturity, staleness, backlinks, and conflicts.
+
+    Plain def: build_queue reads every page (~1s), so FastAPI runs it in a
+    worker thread instead of blocking the event loop for other requests."""
     pages = active_review.build_queue(limit=limit, min_priority=min_priority)
     return {"pages": pages, "total": len(pages)}
 
 
-@app.get("/active-review")
-async def active_review_queue(limit: int = 50, min_priority: str = "low"):
-    """Explicit active review endpoint for weak, stale, orphaned, or conflicting concepts."""
-    pages = active_review.build_queue(limit=limit, min_priority=min_priority)
-    return {"pages": pages, "total": len(pages)}
-
-
+# Plain def: scores every page pair (~seconds); FastAPI runs it in a worker
+# thread so the rest of the dashboard isn't frozen while it runs.
 @app.get("/consolidation-candidates")
-async def consolidation_candidates(limit: int = 50, include_weak: bool = False):
+def consolidation_candidates(limit: int = 50, include_weak: bool = False):
     """Return conservative duplicate/merge candidates without mutating the vault."""
     candidates = consolidation.find_candidates(limit=limit, include_weak=include_weak)
     return {"candidates": candidates, "total": len(candidates)}
+
+
+@app.post("/consolidation-candidates/dismiss")
+def dismiss_consolidation_candidate(req: DismissPairRequest):
+    """Remember that two pages are not duplicates so the pair stops appearing."""
+    consolidation.dismiss_pair(req.source, req.target)
+    return {"success": True}
 
 
 # ── /quick-note ───────────────────────────────────────────────────────────────
@@ -3563,6 +3956,10 @@ understanding_version: 1
     content = re.sub(r"(entry_count:\s*)(\d+)", bump, content)
 
     _atomic_write_path(page_path, content)
+    try:
+        memory_store.index_page(page_path.stem)
+    except Exception as _e:
+        logger.warning("memory index update failed for quick-note %s: %s", page_path.stem, _e)
 
     # Append trace
     try:
@@ -3892,8 +4289,9 @@ def _apply_safe_link_fixes_to_content(content: str, valid_pages: set[str]) -> tu
 
 
 
+# Plain def: reads the vault; FastAPI runs it in a worker thread.
 @app.get("/lint")
-async def get_lint_cache():
+def get_lint_cache():
     """
     Return the last cached lint report if it exists, or 204 if no cache.
     Use POST /lint to generate or refresh the health check report.
@@ -3911,8 +4309,10 @@ async def get_lint_cache():
     return cached_clean
 
 
+# Plain def: blocking LLM call; FastAPI runs it in a worker thread so
+# other requests aren't frozen while it waits.
 @app.post("/lint")
-async def lint_wiki(req: LintRequest):
+def lint_wiki(req: LintRequest):
     """
     Scan the entire wiki with Sonnet and return a structured health report:
     - inconsistencies across pages
@@ -4286,8 +4686,45 @@ async def delete_page(page_name: str):
 
 # ── POST /consolidate ─────────────────────────────────────────────────────────
 
+def _draft_merge(source: str, target: str, source_content: str, target_content: str) -> str:
+    """Ask the LLM for the merged page text. Writes nothing."""
+    prompt = f"""You are merging two wiki pages about the same topic into one clean, canonical page.
+
+TARGET page (keep this slug/title): [[{target}]]
+{target_content}
+
+SOURCE page (merge into target, then it will be deleted): [[{source}]]
+{source_content}
+
+Rules:
+1. Deduplicate: if both pages have an entry from the same URL, keep only one (the fuller one)
+2. Merge all unique ## sections, ordered chronologically by date (oldest first)
+3. Standardise ALL wikilinks to kebab-case: [[ChainOfThought]] → [[chain-of-thought]], [[VectorDatabase]] → [[vector-database]]
+4. Write a single clean YAML frontmatter block using the TARGET page's title and slug
+5. Combine tags from both pages (no duplicates)
+6. Set entry_count = total number of ## sections in the merged result
+7. Set last_updated = today ({datetime.now().strftime("%Y-%m-%d")})
+8. Output ONLY the final merged markdown file, nothing else"""
+
+    merged = llm_client.complete(
+        task="consolidate_pages",
+        model=None,
+        max_tokens=3000,
+        messages=[{"role": "user", "content": prompt}],
+    ).strip()
+    # Strip accidental code fences
+    if merged.startswith("```"):
+        merged = merged.split("```", 2)[1]
+        if merged.startswith("markdown") or merged.startswith("md"):
+            merged = merged.split("\n", 1)[1]
+        merged = merged.rstrip("`").strip()
+    return merged
+
+
+# Plain def: blocking LLM call; FastAPI runs it in a worker thread so
+# other requests aren't frozen while it waits.
 @app.post("/consolidate")
-async def consolidate(req: ConsolidateRequest):
+def consolidate(req: ConsolidateRequest):
     """
     Merge `source` page into `target` using Sonnet:
     - Deduplicates entries from the same URL
@@ -4329,37 +4766,36 @@ async def consolidate(req: ConsolidateRequest):
 
     source_content = source_path.read_text(encoding="utf-8")
     target_content = target_path.read_text(encoding="utf-8")
+    source_sha = hashlib.sha256(source_content.encode()).hexdigest()
+    target_sha = hashlib.sha256(target_content.encode()).hexdigest()
 
-    prompt = f"""You are merging two wiki pages about the same topic into one clean, canonical page.
+    if req.merged is not None:
+        # Applying a previewed draft: refuse if either page changed since.
+        if (req.source_sha, req.target_sha) != (source_sha, target_sha):
+            raise HTTPException(409, "A page changed since the preview. Preview the merge again.")
+        merged = req.merged
+    else:
+        merged = _draft_merge(source, target, source_content, target_content)
 
-TARGET page (keep this slug/title): [[{target}]]
-{target_content}
+    if req.dry_run:
+        return {
+            "success": True,
+            "preview": merged,
+            "source": source,
+            "target": target,
+            "source_sha": source_sha,
+            "target_sha": target_sha,
+            # A merged page much shorter than its inputs usually means the LLM
+            # output hit max_tokens and was cut off.
+            "input_chars": len(source_content) + len(target_content),
+            "merged_chars": len(merged),
+        }
 
-SOURCE page (merge into target, then it will be deleted): [[{source}]]
-{source_content}
-
-Rules:
-1. Deduplicate: if both pages have an entry from the same URL, keep only one (the fuller one)
-2. Merge all unique ## sections, ordered chronologically by date (oldest first)
-3. Standardise ALL wikilinks to kebab-case: [[ChainOfThought]] → [[chain-of-thought]], [[VectorDatabase]] → [[vector-database]]
-4. Write a single clean YAML frontmatter block using the TARGET page's title and slug
-5. Combine tags from both pages (no duplicates)
-6. Set entry_count = total number of ## sections in the merged result
-7. Set last_updated = today ({datetime.now().strftime("%Y-%m-%d")})
-8. Output ONLY the final merged markdown file, nothing else"""
-
-    merged = llm_client.complete(
-        task="consolidate_pages",
-        model=None,
-        max_tokens=3000,
-        messages=[{"role": "user", "content": prompt}],
-    ).strip()
-    # Strip accidental code fences
-    if merged.startswith("```"):
-        merged = merged.split("```", 2)[1]
-        if merged.startswith("markdown") or merged.startswith("md"):
-            merged = merged.split("\n", 1)[1]
-        merged = merged.rstrip("`").strip()
+    # Keep both originals so any merge can be undone by hand.
+    backup_dir = wiki_dir / "meta" / "consolidation-backups" / datetime.now().strftime("%Y%m%d-%H%M%S")
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    (backup_dir / f"{source}.md").write_text(source_content, encoding="utf-8")
+    (backup_dir / f"{target}.md").write_text(target_content, encoding="utf-8")
 
     _atomic_write_path(target_path, merged)
     source_path.unlink()
@@ -4379,6 +4815,7 @@ Rules:
         "success": True,
         "merged_into": f"_wiki/concepts/{target}.md",
         "deleted": f"_wiki/concepts/{source}.md",
+        "backup": str(backup_dir.relative_to(vault_path)),
     }
 
 
@@ -4698,6 +5135,10 @@ async def add_link(req: AddLinkRequest):
         content = content.rstrip() + f"\n\nSee also: {link}\n"
 
     _atomic_write_path(from_file, content)
+    try:
+        memory_store.index_page(from_page)
+    except Exception as _e:
+        logger.warning("memory index update failed for %s: %s", from_page, _e)
     return {"added": True, "message": f"Added {link} to {from_page}"}
 
 
@@ -4738,45 +5179,52 @@ understanding_version: 1
 > Stub — no entries yet. Add content via Capture.{reason_line}
 """
     _atomic_write_path(file_path, content)
+    try:
+        memory_store.index_page(slug)
+    except Exception as _e:
+        logger.warning("memory index update failed for stub %s: %s", slug, _e)
     return {"created": True, "slug": slug, "message": f"Created stub page '{title}'"}
 
 
 # ── utilities ─────────────────────────────────────────────────────────────────
+
+def _analysis_due(insights_path: Path, traces_path: Path,
+                  last_attempt: Optional[datetime], now: datetime) -> bool:
+    """True when a week has passed since the last successful analysis and no
+    attempt was made in the last day. The attempt check stops a failing
+    analysis from being retried (and billed) every hour."""
+    if last_attempt and (now - last_attempt).total_seconds() < ANALYSIS_RETRY_BACKOFF_SECONDS:
+        return False
+    if insights_path.exists():
+        from vault_reader import _parse_frontmatter
+        last = _parse_frontmatter(insights_path.read_text(encoding="utf-8")).get("last_analyzed", "")
+        if not last:
+            return False
+        return (now.date() - datetime.fromisoformat(str(last)).date()).days >= 7
+    if traces_path.exists():
+        # Never run before — run if we have at least 5 traces
+        return sum(1 for l in traces_path.read_text().splitlines() if l.strip()) >= 5
+    return False
+
 
 async def _weekly_analysis_scheduler():
     """
     Background task: runs trace analysis automatically once a week.
     Checks every hour if a week has passed since last analysis.
     """
+    last_attempt: Optional[datetime] = None
     while True:
         try:
             vault_path = Path(os.environ.get("VAULT_PATH", "/Users/sakethv7/SakethVault"))
             insights_path = vault_path / "_wiki" / "meta" / "system-insights.md"
             traces_path = vault_path / "_wiki" / "meta" / "traces.jsonl"
 
-            should_run = False
-            if insights_path.exists():
-                from vault_reader import _parse_frontmatter
-                meta = _parse_frontmatter(insights_path.read_text(encoding="utf-8"))
-                last = meta.get("last_analyzed", "")
-                if last:
-                    from datetime import date
-                    last_date = date.fromisoformat(last)
-                    if (date.today() - last_date).days >= 7:
-                        should_run = True
-            elif traces_path.exists():
-                # Never run before — run if we have at least 5 traces
-                count = sum(1 for l in traces_path.read_text().splitlines() if l.strip())
-                if count >= 5:
-                    should_run = True
-
-            if should_run:
+            if _analysis_due(insights_path, traces_path, last_attempt, datetime.now()):
+                last_attempt = datetime.now()
                 try:
-                    # Import httpx to call our own endpoint internally
-                    import httpx as _httpx
-                    _httpx.post("http://localhost:8001/analyze-traces", timeout=60)
+                    await analyze_traces()
                 except Exception as _e:
-                    logger.warning("weekly analysis scheduler HTTP call failed: %s", _e)
+                    logger.warning("weekly trace analysis failed; next attempt in 24h: %s", _e)
 
         except Exception as _e:
             logger.warning("weekly analysis scheduler outer loop error: %s", _e)
@@ -5006,33 +5454,6 @@ async def log_read(req: LogReadRequest):
     return {"ok": True}
 
 
-@app.get("/recent-reads")
-async def recent_reads(limit: int = 10, max_age_days: int = 30):
-    vault_path = Path(os.environ.get("VAULT_PATH", "/Users/sakethv7/SakethVault"))
-    reads_path = vault_path / "_wiki" / "meta" / "reads.jsonl"
-    if not reads_path.exists():
-        return {"reads": []}
-    lines = reads_path.read_text(encoding="utf-8").splitlines()
-    cutoff = datetime.utcnow() - timedelta(days=max(1, min(max_age_days, 365)))
-    # Parse last 200 lines, deduplicate keeping most recent occurrence
-    seen = {}
-    for line in reversed(lines[-200:]):
-        if not line.strip():
-            continue
-        try:
-            entry = json.loads(line)
-            concept = entry.get("concept", "")
-            ts = _parse_iso_datetime(entry.get("ts"))
-            if not ts or ts < cutoff:
-                continue
-            if concept and concept not in seen:
-                seen[concept] = entry
-        except Exception:
-            continue
-    ordered = sorted(seen.values(), key=lambda e: e.get("ts", ""), reverse=True)
-    return {"reads": ordered[:limit]}
-
-
 # ── /edit-page/{page} ────────────────────────────────────────────────────────
 
 class EditPageRequest(BaseModel):
@@ -5154,65 +5575,6 @@ async def random_concept():
     return {"name": page["name"]}
 
 
-# ── /review-due ───────────────────────────────────────────────────────────────
-
-@app.get("/review-due")
-async def review_due():
-    """
-    Return concept pages that are overdue for review.
-    Criteria: not read in 30+ days AND maturity < 70.
-    Reads meta/reads.jsonl for last-read timestamps.
-    """
-    vault_path = Path(os.environ.get("VAULT_PATH", "/Users/sakethv7/SakethVault"))
-    reads_path = vault_path / "_wiki" / "meta" / "reads.jsonl"
-
-    # Build last-read map: page → most recent read date
-    last_read: dict[str, datetime] = {}
-    if reads_path.exists():
-        with open(reads_path) as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    entry = json.loads(line)
-                    page = entry.get("page", "")
-                    ts = datetime.fromisoformat(entry.get("timestamp", ""))
-                    if page and (page not in last_read or ts > last_read[page]):
-                        last_read[page] = ts
-                except (json.JSONDecodeError, ValueError, KeyError):
-                    continue
-
-    now = datetime.now()
-    cutoff = now - timedelta(days=30)
-    due = []
-    for p in vault_reader.list_concept_pages():
-        name = p["name"]
-        content = vault_reader.read_page(name) or ""
-        fm = vault_reader._parse_frontmatter(content)
-        raw_maturity = fm.get("understanding_maturity")
-        try:
-            maturity = int(raw_maturity) if raw_maturity not in {None, ""} else None
-        except (TypeError, ValueError):
-            maturity = None
-        if maturity is not None and maturity >= 70:
-            continue  # solid, skip
-        last = last_read.get(name)
-        if last and last > cutoff:
-            continue  # recently read, skip
-        days_since = (now - last).days if last else None
-        due.append({
-            "name": name,
-            "maturity": maturity,
-            "days_since_read": days_since,
-            "last_read": last.isoformat() if last else None,
-        })
-
-    # Sort: never-read first, then longest overdue
-    due.sort(key=lambda x: (x["days_since_read"] is not None, -(x["days_since_read"] or 9999)))
-    return {"due": due, "total": len(due)}
-
-
 # ── /rewrite-notes ────────────────────────────────────────────────────────────
 
 class RewriteNotesRequest(BaseModel):
@@ -5221,8 +5583,10 @@ class RewriteNotesRequest(BaseModel):
     context: str = ""
 
 
+# Plain def: blocking LLM call; FastAPI runs it in a worker thread so
+# other requests aren't frozen while it waits.
 @app.post("/store-image")
-async def store_image(req: IngestRequest):
+def store_image(req: IngestRequest):
     """
     Save a pasted image directly to _wiki/assets/ without LLM extraction.
     Returns the Obsidian-compatible embed path so the frontend can insert it.
@@ -5343,8 +5707,10 @@ class ExpandNotesRequest(BaseModel):
     count: int = 2       # how many new bullets to add
 
 
+# Plain def: blocking LLM call; FastAPI runs it in a worker thread so
+# other requests aren't frozen while it waits.
 @app.post("/expand-notes")
-async def expand_notes(req: ExpandNotesRequest):
+def expand_notes(req: ExpandNotesRequest):
     """
     Add new insight bullets in a given direction, appended to the existing set.
     """
@@ -5426,8 +5792,10 @@ def _parse_bullet_array(raw: str) -> list[str]:
     return lines[:4]
 
 
+# Plain def: blocking LLM call; FastAPI runs it in a worker thread so
+# other requests aren't frozen while it waits.
 @app.post("/rewrite-notes")
-async def rewrite_notes(req: RewriteNotesRequest):
+def rewrite_notes(req: RewriteNotesRequest):
     """
     Rewrite POV/first-person summary bullets as neutral, precise technical notes
     in the style of Lilian Weng's blog — factual, dense, no 'I learned' openers.
@@ -5555,6 +5923,12 @@ def _run_vault_polish(task_id: str) -> None:
     task["message"] = f"Polished {bullets_updated} bullet{'s' if bullets_updated != 1 else ''} across {pages_updated} page{'s' if pages_updated != 1 else ''}."
     task["current_page"] = None
 
+    if pages_updated:
+        try:
+            memory_store.sync_index()
+        except Exception as _e:
+            logger.warning("memory sync after vault polish failed: %s", _e)
+
 
 @app.post("/vault/rewrite-pov-notes")
 async def vault_rewrite_pov_notes():
@@ -5582,8 +5956,10 @@ async def vault_rewrite_pov_notes_status(task_id: str):
 
 # ── /knowledge-gaps/{page_name} ───────────────────────────────────────────────
 
+# Plain def: blocking LLM call; FastAPI runs it in a worker thread so
+# other requests aren't frozen while it waits.
 @app.post("/knowledge-gaps/{page_name}")
-async def knowledge_gaps(page_name: str):
+def knowledge_gaps(page_name: str):
     """
     Generate 5 questions Saketh probably can't answer yet from his own notes.
     Also returns prerequisites and a concept diagram.
