@@ -431,8 +431,18 @@ def sync_index() -> dict:
     }
 
 
+# Question words match nearly every chunk; with OR-joined terms they swamped
+# the real keywords ("what is vram offloading" ranked unrelated long pages first).
+_STOPWORDS = frozenset(
+    "a an and are as at be by can do does for from how i in is it me my of on or "
+    "should the their there this to was what when where which who why will with you your "
+    "explain tell about vs".split()
+)
+
+
 def _fts_query(query: str) -> str:
-    terms = [term for term in "".join(c if c.isalnum() else " " for c in query.lower()).split() if len(term) > 1]
+    terms = [term for term in "".join(c if c.isalnum() else " " for c in query.lower()).split()
+             if len(term) > 1 and term not in _STOPWORDS]
     if not terms:
         return ""
     return " OR ".join(dict.fromkeys(terms))
@@ -473,7 +483,9 @@ def _lexical_hits(conn: sqlite3.Connection, query: str, limit: int = 40) -> list
                         "heading": row["heading"],
                         "snippet": row["snippet"],
                         "current_understanding": row["current_understanding"],
-                        "score": 1.0 / (1.0 + max(0.0, float(row["rank"]))),
+                        # FTS5 bm25() is negative; more negative = better. The old
+                        # 1/(1+max(0, rank)) scored every hit 1.0.
+                        "score": max(0.0, -float(row["rank"])),
                     }
                 )
             if hits:
@@ -609,12 +621,18 @@ def search(query: str, limit: int = 5, *, sync: bool = False) -> list[dict]:
                 "headings": [],
             },
         )
-        page["score"] += combined
+        # Best chunk dominates; extra matching chunks add a little. A plain sum
+        # let long pages with many weak matches outrank the exact page.
+        page["_chunk_scores"] = page.get("_chunk_scores", []) + [combined]
+        best, *rest = sorted(page["_chunk_scores"], reverse=True)
+        page["score"] = best + 0.1 * sum(rest)
         if entry["snippet"] not in page["snippets"] and len(page["snippets"]) < 3:
             page["snippets"].append(entry["snippet"])
         if entry["heading"] and entry["heading"] not in page["headings"] and len(page["headings"]) < 3:
             page["headings"].append(entry["heading"])
 
+    for page in page_scores.values():
+        page.pop("_chunk_scores", None)
     ranked = sorted(page_scores.values(), key=lambda item: item["score"], reverse=True)
     return ranked[:limit]
 

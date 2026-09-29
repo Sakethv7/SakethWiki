@@ -164,3 +164,23 @@ JSONL logs, so the two sinks agree.
   from the same `_usage_with_estimates` values used for the JSONL log, so both
   sinks agree and `LLM_PRICE_*` overrides are honored. `usage_details` (token
   counts) is passed to Langfuse's native field.
+
+## Retrieval ranking fix (2026-09-29)
+
+| | Before | Change | Fixes |
+|---|---|---|---|
+| Lexical score | `1/(1+max(0, bm25))`. SQLite FTS5's `bm25()` is negative (more negative = better), so every hit scored 1.0. | Score is `-bm25`, normalized per query as before. | Strong matches outrank weak ones. |
+| Query terms | Every word over one character, OR-joined, including "what", "is", "how". | A small stopword list is removed first. | Question words no longer match nearly every chunk. |
+| Page score | Sum of chunk scores, so long pages with many weak hits won. | Best chunk + 0.1 × the rest. | The exact page beats a long, loosely related one. |
+
+Measured on the live vault (60 pages each, `search(q, 5)`):
+
+| Query set | Top-1 before → after | Top-3 before → after |
+|---|---|---|
+| "What is {title}?" | 16 → 55 | 49 → 59 |
+| 10 words from the page's summary | 25 → 58 | 48 → 60 |
+
+Caveat: both sets are known-item queries built from indexed text, so they
+measure the ranking bug, not real paraphrase recall. A regression test
+(`test_exact_page_outranks_long_page_with_many_weak_matches`) fails on the
+old code.

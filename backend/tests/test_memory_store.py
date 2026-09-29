@@ -1016,3 +1016,27 @@ def test_trace_critic_drops_malformed_candidates(monkeypatch, tmp_path):
     assert result["ran"] is True
     assert result["staged"] == []
     assert system_loop.list_action_candidates() == []
+
+
+def test_exact_page_outranks_long_page_with_many_weak_matches(monkeypatch, tmp_path):
+    # Regression: bm25() is negative, and the old 1/(1+max(0, rank)) scored every
+    # hit 1.0, so page score was just the count of matching chunks. Stopwords
+    # ("what", "is") also matched everything.
+    vault = tmp_path / "vault"
+    (vault / "_wiki" / "cs").mkdir(parents=True)
+    (vault / "_wiki" / "meta").mkdir(parents=True)
+    monkeypatch.setenv("VAULT_PATH", str(vault))
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_COMPAT_API_KEY", raising=False)
+
+    _write_page(vault / "_wiki" / "cs" / "vram-offloading.md", "VRAM Offloading", "Inference",
+                "## VRAM offloading\n\n- VRAM offloading moves weights between GPU VRAM and system RAM on demand.")
+    long_body = "\n\n".join(
+        f"## Section {i}\n\n- What is an agent loop? It is a loop that is run by what the model decides, and VRAM is mentioned once."
+        for i in range(12)
+    )
+    _write_page(vault / "_wiki" / "cs" / "agent-loops.md", "Agent Loops", "Agentic", long_body)
+
+    memory_store.sync_index()
+    hits = memory_store.search("What is VRAM offloading?", limit=2)
+    assert hits[0]["page_name"] == "vram-offloading"
