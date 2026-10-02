@@ -60,7 +60,7 @@ Approve → wiki_writer.py → Atomic file write → Vault + Trace
 
 **Image paste & drag-and-drop:** Document-level `paste` listener captures clipboard images anywhere on the page (not just textarea focus). Drag-and-drop onto the capture card shows an orange highlight. Thumbnail click opens full-size. `+` tile adds more images. Images sent as base64 in `/ingest` payload.
 
-**Key design:** Zero LLM for parsing (BeautifulSoup only). LLM is task-routed (Anthropic/Ollama/Qwen) for semantic work with contract fallback on critical paths. All writes are atomic (write-to-temp → rename).
+**Key design:** Zero LLM for parsing (BeautifulSoup only). LLM is task-routed (default route plus per-task overrides: Gemini via an OpenAI-compatible API, Anthropic, or Ollama) for semantic work with contract fallback on critical paths. All writes are atomic (write-to-temp → rename).
 
 ### 2. Self-Learning Loop
 
@@ -70,7 +70,7 @@ Approve → wiki_writer.py → Atomic file write → Vault + Trace
 ```
 traces.jsonl (all approve/reject history)
     ↓
-Routed analysis model reads last 100 traces (default Sonnet)
+Routed analysis model reads last 100 traces (`ANALYZE_TRACES`, pinned to Anthropic in `.env`)
     ↓
 Identifies patterns:
   - Tag confusion (what gets corrected most often?)
@@ -101,9 +101,9 @@ Next /ingest → reads Prompt Hints section → injects into extraction prompt
 │    - MD5(pages_list) matches stored hash?            │
 │    - force_refresh=false?                            │
 │    ↓ YES → Return cached report (~8ms)               │
-│    ↓ NO  → Proceed to Sonnet scan                    │
+│    ↓ NO  → Proceed to model scan (Anthropic)         │
 │                                                        │
-│ 2. Scans entire vault with Claude Sonnet (40s):       │
+│ 2. Scans every page, first 1200 chars each (40s):     │
 │    - semantic inconsistencies (2+ page conflicts)    │
 │    - missing connections (contextual gaps)           │
 │    - suggested articles (concepts with no pages)     │
@@ -347,10 +347,11 @@ Return: component breakdown + final score
 ```
 ~/SakethVault/
 ├── _wiki/
-│   ├── concepts/                     ← Evolving knowledge
+│   ├── cs/ science/                  ← Evolving concept pages
 │   │   ├── rag.md
 │   │   ├── agents.md
 │   │   └── ...
+│   ├── open-threads/ lectures/ inbox/ assets/
 │   ├── sources/                      ← Immutable audit trail
 │   │   ├── 2026-04-15-lilian-weng-agents.md
 │   │   └── ...
@@ -360,11 +361,13 @@ Return: component breakdown + final score
 │   │   ├── reads.jsonl               ← Read log {ts, concept, duration_seconds}
 │   │   ├── system-insights.md        ← Weekly analysis output
 │   │   ├── index.md                  ← Auto-rebuilt vault index
-│   │   ├── hitl_queue.json           ← Items awaiting review
-│   │   ├── lint-cache.json           ← Cached health check report (<24h TTL)
+│   │   ├── memory.db                 ← SQLite chunk index (derived, rebuildable)
 │   │   └── tag-ontology.json         ← Canonical tags + synonym map
 │   └── standards.md                  ← Wiki standards (health check rules)
 └── .obsidian/                        ← Obsidian config (optional)
+
+<repo>/hitl_queue.json                ← Items awaiting review (lives beside the app, not in the vault)
+<repo>/backend/lint_cache.json        ← Cached health check report (<24h TTL)
 ```
 
 ### Concept Page Structure
@@ -456,7 +459,7 @@ Runtime changes such as context-budget increases, routing overrides, eval-case e
 
 ### 1. **Vault-First, File-Based**
 - All data is plain Markdown (Obsidian compatible)
-- No database, no embeddings, zero infrastructure
+- Markdown files are the source of truth. A SQLite index (`memory.db`) is derived from them and rebuildable. Embeddings are opt-in (`EMBED_ENABLED`). No separate services.
 - git-friendly — entire vault is versionable
 - Portable — zip and move to any device
 
@@ -473,8 +476,8 @@ Runtime changes such as context-budget increases, routing overrides, eval-case e
 ### 4. **LLM Where Rule-Based Fails**
 - URL parsing: BeautifulSoup (zero LLM)
 - Extraction: task-routed model (default Anthropic on long/image)
-- Evolution classification: task-routed model (default local; fallback on contract failure)
-- Chat: task-routed model (default local; low latency)
+- Evolution classification: task-routed model (pinned to Anthropic in `.env`; strict output contract)
+- Chat: task-routed model (default route, Gemini 2.5 Flash in the recommended profile; low latency)
 
 ### 5. **Living Understanding Blocks**
 - NOT append-only — single synthesized block at top
@@ -492,7 +495,7 @@ Runtime changes such as context-budget increases, routing overrides, eval-case e
 - localStorage for front-end state (health check acked items)
 - File system for all data (Markdown + JSON lines)
 - Traces append-only (never modified, only appended)
-- Index rebuilt on every write (zero stale state)
+- Index updated per page on every write; full re-sync at startup and via `POST /memory/reindex` for edits made outside the app
 
 ### 8. **Self-Healing Automation**
 - Health check scans for structural issues
@@ -505,6 +508,8 @@ Runtime changes such as context-budget increases, routing overrides, eval-case e
 ---
 
 ## Performance & Costs
+
+> The model names in the Notes column below come from an earlier routing setup. The current default route is Gemini 2.5 Flash with six integrity tasks pinned to Anthropic (see `CONCEPTS.md`, Model Assignment). Treat these costs as unverified for the current setup.
 
 | Operation | Cost | Latency | Notes |
 |-----------|------|---------|-------|

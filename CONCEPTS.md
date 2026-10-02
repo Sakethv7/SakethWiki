@@ -41,7 +41,7 @@ graph TB
     end
 
     subgraph Vault["Vault (~/SakethVault)"]
-        T --> U[_wiki/concepts/*.md]
+        T --> U[_wiki/cs · science · open-threads/*.md]
         T --> V[_wiki/sources/*.md]
         T --> W[_wiki/index.md]
         T --> TR[_wiki/meta/traces.jsonl\nappend trace]
@@ -291,11 +291,11 @@ The understanding block is **rewritten** on each approval (not appended to), so 
 | Task | Default Route | Notes |
 |------|---------------|-------|
 | URL fetch + parse | `httpx + BeautifulSoup` | Zero LLM — deterministic, fast, free |
-| Content extraction (long/image) | Anthropic (`INGEST_EXTRACT`) | Quality-critical; multimodal-heavy |
-| Evolution classification | Ollama/Qwen by default | Contract fallback to Anthropic on invalid output |
+| Content extraction | Default route (`INGEST_EXTRACT`; Gemini 2.5 Flash in the recommended profile) | Listed as a critical task for contract checking. Pin it with `LLM_PROVIDER_INGEST_EXTRACT=anthropic` if quality needs it |
+| Evolution classification | Anthropic (`EVOLUTION_CLASSIFY`, pinned in `.env`) | Can change durable pages, so it uses the strict output contract and the stronger route |
 | Chat / Interview page selection | Deterministic (SQLite FTS + optional vectors) | No LLM — the `chat_select_pages` task was removed in the lean refactor |
-| Chat Q&A | Ollama/Qwen by default | Can be overridden per task |
-| Lint / consolidate / knowledge gaps | Anthropic by default | Integrity-critical tasks |
+| Chat Q&A | Default route (Gemini 2.5 Flash in the recommended profile) | Override per task with `LLM_PROVIDER_CHAT_ANSWER` |
+| Lint / consolidate / knowledge gaps / trace analysis | Anthropic (pinned in `.env`) | Integrity-critical tasks |
 | All routing/parsing | Pure Python + `llm_client` | Task-based provider routing + contract guardrails |
 
 ## Memory Substrate
@@ -566,11 +566,11 @@ Cost: one Sonnet call per week (~$0.10-0.30). Trace logging is zero cost (file a
 ### Vault in `~/` not `~/Documents/`
 macOS TCC (Transparency Consent Control) blocks apps launched from the dock from reading `~/Documents/` unless Full Disk Access is granted. The vault lives at `~/SakethVault` to avoid this entirely.
 
-### No Database, Files Only
-Obsidian compatibility — vault must be readable as plain Markdown. No complex queries needed; keyword search + LLM routing covers 95% of use cases. Zero infra, git-friendly, portable.
+### Files Are the Source of Truth, SQLite Is a Derived Index
+Obsidian compatibility — the vault must be readable as plain Markdown, and every page is a plain file. Retrieval uses a SQLite index (`_wiki/meta/memory.db`) built from those files. The index can be deleted and rebuilt (`POST /memory/reindex`), so nothing lives only in the database. The first version had no database. The index was added later as a deliberate shift (see "Design shift" in `ARCHITECTURE.md`, Chat & Knowledge Retrieval). Still git-friendly and portable.
 
-### No Embeddings
-Keyword match + LLM routing is sufficient for a personal wiki of this scale. No vector DB to run, no embedding costs, instant startup. Synonym expansion in `find_relevant_pages` covers common semantic gaps (e.g. "transformer" → finds "attention" pages).
+### Embeddings Are Opt-In
+Retrieval is lexical by default (SQLite FTS over chunked pages). Set `EMBED_ENABLED=true` and an embedding key to store vectors in the same index and blend semantic with lexical search. No separate vector DB either way. Keyword match is sufficient for a personal wiki of this scale, and the default has no embedding cost and starts instantly. Synonym expansion in `find_relevant_pages` covers common semantic gaps (e.g. "transformer" → finds "attention" pages).
 
 ### Living Understanding Block (not append-only)
 Old design: every new source just appended a `##` section. Problem: understanding never compounded — it just stacked. New design: the `> Current understanding` block at the top is rewritten on each approval to reflect the most evolved synthesis. Source sections below it are the immutable evidence trail.
@@ -600,11 +600,13 @@ Raw markdown clipping is now treated as transport. The value layer is refinement
 ```
 ~/SakethVault/
 └── _wiki/
-    ├── concepts/           ← One .md per concept, evolves over time
+    ├── cs/                 ← Concept pages, one .md per concept, evolve over time
     │   ├── rag.md
     │   ├── agents.md
     │   ├── kv-cache.md
     │   └── ...
+    ├── science/            ← Concept pages (second domain folder)
+    ├── open-threads/ lectures/ inbox/ assets/
     ├── sources/            ← One .md per URL ingested (never modified)
     │   ├── 2026-04-06-lilian-weng-agents.md
     │   └── ...
