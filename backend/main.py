@@ -473,6 +473,12 @@ def _attach_report(item: dict) -> dict:
     return item
 
 
+def _needs_review(report: Optional[dict]) -> bool:
+    """A decision is needed before this clip touches a page (ADR 7)."""
+    report = report or {}
+    return report.get("band") in ("duplicate", "overlap", "conflict") and bool(report.get("target_page"))
+
+
 def _duplicate_body(report: dict) -> dict:
     return {
         "queued": False,
@@ -2216,6 +2222,17 @@ async def ingest_direct(req: IngestRequest):
         "status": "approved",
     }
 
+    await loop.run_in_executor(None, _attach_report, item)
+    report = item["conflict_report"]
+    if report["band"] == "duplicate":
+        return _duplicate_body(report)
+    if _needs_review(report):
+        # ADR 7: no direct write. Queue it so the review screen can decide.
+        item["status"] = "pending"
+        queue_manager.enqueue(item)
+        return {"queued": True, "needs_review": True, "id": item["id"], "title": item["title"],
+                "conflict_report": report}
+
     try:
         file_path = wiki_writer.write_approved(item)
     except Exception as e:
@@ -2453,6 +2470,7 @@ async def _decide_queue_item(item_id: str, req: ApproveRequest):
         return {"success": True, "action": "rejected", "file_written": None}
 
     # If queued via Share Sheet (pending_extraction=True), run extraction now
+    extracted_now = False
     if item.get("pending_extraction") and item.get("url"):
         try:
             _approve_loop = asyncio.get_running_loop()
@@ -2473,8 +2491,18 @@ async def _decide_queue_item(item_id: str, req: ApproveRequest):
                 **_curation_fields(extraction),
                 "pending_extraction": False,
             })
+            extracted_now = True
         except Exception as _e:
             logger.warning("background extraction failed for item %s: %s", item_id, _e)
+
+    # ADR 7: a clip that overlaps, conflicts or repeats a page is never written without a chosen resolution.
+    if req.approved and not req.resolution:
+        if extracted_now:  # extracted just now, so there is no report yet
+            await asyncio.get_running_loop().run_in_executor(None, _attach_report, item)
+            queue_manager.update(item_id, item)
+        if _needs_review(item.get("conflict_report")):
+            report = item["conflict_report"]
+            raise HTTPException(409, {"error": "needs_review", "band": report["band"], "target_page": report["target_page"]})
 
     # Snapshot original values before edits (for trace logging)
     item["_original_suggested_page"] = item.get("suggested_page", "")

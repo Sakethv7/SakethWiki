@@ -88,6 +88,10 @@ The old 409 "Clip already processed" stays for exact signature matches (PR 7 rul
 
 Each item adds `conflict_report` (ConflictReport or absent for items captured before this change).
 
+### `POST /ingest-direct`
+
+Extracts, compares, then acts on the band (ADR 7). `distinct` or `unknown`: writes as before. `overlap` or `conflict`: queues the item with its report and returns `{"queued": true, "needs_review": true, "id": ..., "conflict_report": ...}`. `duplicate`: writes nothing and returns the duplicate body.
+
 ### `POST /queue/batch-decision`
 
 An approve for an item whose band is `duplicate`, `overlap` or `conflict` (with a target page) returns that item's result as `{"success": false, "code": "needs_review"}`. Nothing is written for it.
@@ -106,7 +110,7 @@ class ApproveRequest(BaseModel):
 Rules:
 
 - `approved: false` is skip. `resolution` is ignored.
-- `resolution` omitted: current behavior (approve-time classification). Kept for items with no report.
+- `resolution` omitted: current behavior (approve-time classification) for items with no report, or whose band is `distinct` or `unknown`. If the band is `duplicate`, `overlap` or `conflict`, the response is 409 `needs_review`. An item that was still extracting is compared first and saved back to the queue with its report.
 - `resolution` set and the item has a report: the target hash is checked first.
 
 Responses:
@@ -116,6 +120,7 @@ Responses:
 | 200 | existing success body plus `"resolution": "<value>"` and `"archived": "<path>"` for `replace` | Written |
 | 404 | existing | Item not found |
 | 409 | `{"error": "report_stale", "target_page": "..."}` | Target hash changed since the report |
+| 409 | `{"error": "needs_review", "band": "...", "target_page": "..."}` | Approve with no `resolution` while the band is `duplicate`, `overlap` or `conflict` (ADR 7) |
 | 422 | standard | Unknown `resolution` value |
 | 500 | `{"error": "archive_failed", ...}` | `replace` copy failed. Page unchanged |
 
@@ -161,3 +166,6 @@ Errors: `replace` raises `ArchiveError` before any write if the copy fails.
 6. `append` with a "duplicates" classifier result still writes the clip.
 7. Calibration set: `python backend/calibrate_compare.py` on `calibration_pairs.json`. The number to watch is clips wrongly marked `duplicate`. It must be 0.
 8. Batch approve skips items that need review.
+9. `/approve` with no `resolution` and a `conflict` band returns 409 `needs_review` and writes nothing. A `distinct` band still writes.
+10. Approve-time extraction attaches a report, saves the item back to the queue, and returns 409 for a `conflict` band.
+11. `/ingest-direct` writes a `distinct` clip, queues a `conflict` clip, and does not write a `duplicate` clip.

@@ -239,3 +239,96 @@ def test_exact_repaste_raises_friendly_duplicate_with_page(isolated_vault, monke
     monkeypatch.setattr(main, "_extract_with_sonnet", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("reached extraction")))
     with pytest.raises(RuntimeError):   # page deleted: the ledger no longer blocks, so extraction runs
         main._stage_markdown_clip("# Parallel scan\n\n- one claim here\n- another claim here")
+
+
+# ── ADR 7: no blind approve ──────────────────────────────────────────────────
+
+def _decide(monkeypatch, item, **req):
+    import asyncio
+    written = []
+    monkeypatch.setattr(main.queue_manager, "get_by_id", lambda i: item)
+    monkeypatch.setattr(main.queue_manager, "update", lambda i, it: True)
+    monkeypatch.setattr(main.queue_manager, "remove", lambda i: True)
+    monkeypatch.setattr(main.wiki_writer, "write_approved", lambda it: written.append(it) or "_wiki/cs/x.md")
+    monkeypatch.setattr(main.wiki_writer, "fix_page_wikilinks", lambda p: None)
+    monkeypatch.setattr(main.memory_store, "index_page", lambda p: None)
+    monkeypatch.setattr(main, "_record_processed_clip", lambda it, p: None)
+    try:
+        return asyncio.run(main._decide_queue_item("i1", main.ApproveRequest(approved=True, **req))), written
+    except HTTPException as e:
+        return e, written
+
+
+def _queued(band, target="p"):
+    return {"id": "i1", "title": "T", "summary": ["a claim"], "suggested_page": "p", "tags": [],
+            "conflict_report": {"band": band, "target_page": target, "claims": []}}
+
+
+def test_approve_without_resolution_is_refused_for_conflict(monkeypatch):
+    err, written = _decide(monkeypatch, _queued("conflict"))
+    assert isinstance(err, HTTPException) and err.status_code == 409
+    assert err.detail["error"] == "needs_review" and err.detail["band"] == "conflict"
+    assert written == []
+
+
+def test_approve_without_resolution_still_writes_distinct(monkeypatch):
+    out, written = _decide(monkeypatch, _queued("distinct", target=None))
+    assert out["success"] and len(written) == 1
+
+
+def test_old_items_without_a_report_are_not_blocked(monkeypatch):
+    item = _queued("conflict")
+    del item["conflict_report"]
+    out, written = _decide(monkeypatch, item)
+    assert out["success"] and len(written) == 1
+
+
+def test_late_extraction_compares_and_blocks(monkeypatch):
+    item = {"id": "i1", "url": "https://x.test/a", "title": "u", "summary": ["…"], "pending_extraction": True,
+            "suggested_page": "unprocessed", "tags": []}
+    monkeypatch.setattr(main, "_fetch_url", lambda u: "text")
+    monkeypatch.setattr(main.vault_reader, "list_concept_pages", lambda: [])
+    monkeypatch.setattr(main, "_extract_with_sonnet", lambda *a, **k: {
+        "title": "Late", "key_concepts": [], "summary": ["new claim"], "suggested_page": "p",
+        "suggested_wikilinks": [], "tags": [], "references": [], "diagram": ""})
+    monkeypatch.setattr(main, "_curation_fields", lambda d: {})
+    monkeypatch.setattr(main.capture_compare, "build_report",
+                        lambda it: {"band": "conflict", "target_page": "p", "claims": []})
+    err, written = _decide(monkeypatch, item)
+    assert isinstance(err, HTTPException) and err.detail["error"] == "needs_review"
+    assert written == [] and item["conflict_report"]["band"] == "conflict"
+
+
+def _direct(monkeypatch, band, target="p"):
+    import asyncio
+    queued, written = [], []
+    monkeypatch.setattr(main, "_extract_with_sonnet", lambda *a, **k: {
+        "title": "T", "key_concepts": [], "summary": ["claim"], "suggested_page": "p",
+        "suggested_wikilinks": [], "tags": [], "references": [], "diagram": ""})
+    monkeypatch.setattr(main.vault_reader, "list_concept_pages", lambda: [])
+    monkeypatch.setattr(main, "_curation_fields", lambda d: {})
+    monkeypatch.setattr(main.capture_compare, "build_report",
+                        lambda it: {"band": band, "target_page": target, "claims": [], "reason": "r"})
+    monkeypatch.setattr(main.queue_manager, "enqueue", queued.append)
+    monkeypatch.setattr(main.wiki_writer, "write_approved", lambda it: written.append(it) or "_wiki/cs/p.md")
+    monkeypatch.setattr(main.wiki_writer, "fix_page_wikilinks", lambda p: None)
+    monkeypatch.setattr(main.memory_store, "index_page", lambda p: None)
+    monkeypatch.setattr(main.tag_classifier, "classify_new_tags", lambda *a, **k: None)
+    out = asyncio.run(main.ingest_direct(main.IngestRequest(text="some text", force=True)))
+    return out, queued, written
+
+
+def test_ingest_direct_writes_distinct(monkeypatch):
+    out, queued, written = _direct(monkeypatch, "distinct", target=None)
+    assert out["success"] and len(written) == 1 and queued == []
+
+
+def test_ingest_direct_queues_conflict_instead_of_writing(monkeypatch):
+    out, queued, written = _direct(monkeypatch, "conflict")
+    assert out["needs_review"] and len(queued) == 1 and written == []
+    assert queued[0]["status"] == "pending" and queued[0]["conflict_report"]["band"] == "conflict"
+
+
+def test_ingest_direct_does_not_write_duplicate(monkeypatch):
+    out, queued, written = _direct(monkeypatch, "duplicate")
+    assert out["queued"] is False and out["reason"] == "duplicate" and queued == [] and written == []

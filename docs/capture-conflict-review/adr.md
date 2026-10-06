@@ -168,10 +168,41 @@ Yellow steps are all new.
 
 **Given up.** Fine control. Revisit if you hit this often.
 
+## ADR 7 — The server refuses a blind approve when the band needs a decision
+
+### Visual Level
+
+```mermaid
+flowchart TD
+    A[Approve request arrives] --> B{Still extracting?}
+    B -- yes --> C[Extract and compare now]
+    B -- no --> D{Band needs a decision?}
+    C --> D
+    D -- no --> E[Write as today]
+    D -- yes --> F{Request has a resolution?}
+    F -- yes --> G[Check page is fresh, then write]
+    F -- no --> H[409 needs_review, nothing written]
+    H --> I[Item stays in queue with its report]
+    classDef new fill:#fde68a,stroke:#b45309,color:#000;
+    class C,D,F,H,I new;
+```
+
+Yellow steps are new. Before this ADR, the "no" branch of the resolution question wrote the clip with the old approve-time classifier.
+
+**Context.** ADR 3 says only `duplicate` may act without you. The review screen enforces that in the UI. Three server paths still bypass it. (1) `POST /approve/{id}` with no `resolution` uses the old classifier, which can drop a clip as "duplicates" or blend it into a page. (2) Approving an item that has not finished extracting extracts and writes with no comparison. (3) `/ingest-direct`, used only by the "Save now" button on a Share Sheet item that is still extracting, writes straight to the wiki.
+
+**Options.** (a) Leave them: they need a deliberate click or an API call. (b) Close each path on its own. (c) One server rule: a clip whose band is `duplicate`, `overlap` or `conflict` is never written without a `resolution`. Paths 2 and 3 compare first, so the rule applies to them.
+
+**Choice.** (c). `_decide_queue_item` returns 409 `needs_review` when the item's report needs a decision and the request has no `resolution`. For an item that was still extracting, the comparison runs first and the item is saved back to the queue with its report. `/ingest-direct` compares after extraction. A `distinct` or `unknown` clip is written as before. An `overlap` or `conflict` clip goes to the queue for review and the response says `needs_review`. A `duplicate` clip is not written and the response is the duplicate notice.
+
+**Consequences.** "Save now" still saves in one click for a clip on a new topic. Every other clip waits for you. The 409 body carries the band and target page, so a caller can show a clear message.
+
+**Given up.** "Save now" no longer always saves. Any automation that approved blind through the API gets 409 for clips that overlap or conflict. Items captured before this feature have no report and are not affected.
+
 ## Open questions
 
 1. **Labels to correct.** `calibration_pairs.json` holds 40 pairs with proposed labels (10 each: duplicate, conflict, overlap, distinct). Open it, fix any `label` that is wrong, and set `reviewed` to true. Then run `python backend/calibrate_compare.py`. The 10 conflict pairs are constructed (one number doubled). The 10 overlap pairs are weak labels: they are real clips against a related page, and some may be duplicate or conflict.
-2. **Call sites.** Built: the report is attached in `/ingest`, `/ingest-markdown` (and inbox clip staging), and the `/queue-url` background extraction, through one helper (`_attach_report`). Not hooked: `/ingest-direct` writes straight to the wiki with no review step, and the approve-time extraction for a Share Sheet item that has not finished extracting. Both skip the review screen by design today. Decide if they should go through it. `docs/capture-queue` would reduce the paths to one worker if it is built.
+2. **Call sites.** Built: the report is attached in `/ingest`, `/ingest-markdown` (and inbox clip staging), and the `/queue-url` background extraction, through one helper (`_attach_report`). The two remaining paths (`/ingest-direct` and approve-time extraction) were closed by ADR 7: `/ingest-direct` compares after extraction, and approve-time extraction compares before it writes. `docs/capture-queue` would reduce the paths to one worker if it is built.
 3. **Contradiction with the code.** `wiki_writer._analyze_evolution` can still drop a clip as "duplicates" at approve time, even after you chose `append`. This design passes your resolution into the writer so the writer does not re-judge. Confirm that is the right behavior.
 4. **Explainer ladder.** Level 3 is built. Level 4 (video) is skipped at the owner's request.
 5. **Ledger removal.** Should the ledger be deleted after this ships? Not decided here.

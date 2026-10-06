@@ -92,6 +92,9 @@ extracting -> failed (existing behavior)
 | Resolve | Report stale | 409. UI asks for refresh. No write. |
 | `replace` | Archive copy fails | Stop. Page unchanged. Error shown. |
 | Any write | Exception | Item stays in the queue. Error shown. Same as today. |
+| Approve with no resolution | Band is duplicate, overlap or conflict | 409 `needs_review`. Nothing written. The item stays in the queue. |
+| Approve of an item still extracting | Extraction finishes, band needs review | Item saved back to the queue with its report. 409 `needs_review`. |
+| Save now (`/ingest-direct`) | Band is overlap or conflict | Item queued for review. Nothing written. |
 | Batch approve | Selected item needs review | That item returns `needs_review` and is not written. The rest proceed. |
 | Duplicate notice | User ignores it | Nothing is lost. The clip text is still in the capture box until the user clears it. |
 

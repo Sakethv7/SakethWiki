@@ -552,7 +552,12 @@ function QueueSection({ onApproved, onExtractPreview }) {
       await api(`/approve/${item.id}`, { method: "POST", body: JSON.stringify({ approved: false }) });
       const data = await api("/ingest-direct", { method: "POST", body: JSON.stringify({ url: item.url, force: true }) });
       await loadQueue();
-      setLastAction({ type: "saved", title: data.title || item.url, time: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) });
+      const time = new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+      const title = data.title || item.url;
+      // ADR 7: Save now does not write a clip that needs a decision
+      if (data.queued === false) setLastAction({ type: "duplicate", title: `${title} (already in ${data.page || "your wiki"})`, time });
+      else if (data.needs_review) setLastAction({ type: "review", title, time });
+      else setLastAction({ type: "saved", title, time });
     } catch (e) {
       try { await api("/queue-url", { method: "POST", body: JSON.stringify({ url: item.url, force: true }) }); } catch (_) {}
       await loadQueue();
@@ -595,8 +600,8 @@ function QueueSection({ onApproved, onExtractPreview }) {
             Queue: {loaded ? items.length : "…"}
           </div>
           {lastAction && (
-            <span className={`text-xs ${lastAction.type === "saved" ? "text-emerald-600" : "text-stone-400"}`}>
-              {lastAction.type === "saved" ? "✓ Saved" : "Skipped"} · {lastAction.title.slice(0, 30)}{lastAction.title.length > 30 ? "…" : ""} · {lastAction.time}
+            <span className={`text-xs ${lastAction.type === "saved" ? "text-emerald-600" : lastAction.type === "review" ? "text-amber-600" : "text-stone-400"}`}>
+              {{ saved: "✓ Saved", review: "Needs your review", duplicate: "Not saved" }[lastAction.type] || "Skipped"} · {lastAction.title.slice(0, 30)}{lastAction.title.length > 30 ? "…" : ""} · {lastAction.time}
             </span>
           )}
         </div>
