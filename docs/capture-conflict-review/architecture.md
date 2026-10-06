@@ -31,7 +31,7 @@ Yellow steps are new. Blue steps change an existing screen. Today a clip goes fr
 
 Implemented on branch `capture-conflict-review` (PR 8). The design was approved on 2026-10-06. Changes made during the build are marked in `adr.md` (ADR 2 amendment).
 
-Explainer ladder: [HTML explainer](../visuals/capture-conflict-review-flow.html) and [narrated video](../visuals/capture-conflict-review-flow.mp4). Both play the flow with a "today" lane and a "with this change" lane.
+Explainer: [HTML page](../visuals/capture-conflict-review-flow.html) with a "today" lane and a "with this change" lane. A narrated video was dropped on 2026-10-06 at the owner's request.
 
 ## Complexity tier
 
