@@ -1,9 +1,11 @@
 """
 SakethWiki E2E test suite — runs the app in-process against a temporary vault.
-LLM calls are real. Nothing is written to the real vault.
+LLM calls are real, so tests marked needs_llm skip when no provider is configured.
+Nothing is written to the real vault.
 Run: arch -arm64 venv/bin/python3 -m pytest tests/test_e2e.py -v
 """
 import json
+import os
 import time
 from pathlib import Path
 
@@ -14,6 +16,30 @@ import main
 
 # No `with` block: skips lifespan, so the image watcher and scheduler don't start.
 client = TestClient(main.app)
+
+
+def _provider_ready(provider: str) -> bool:
+    """True when the provider has the settings llm_client needs to call it."""
+    env = os.environ.get
+    if provider == "anthropic":
+        return bool(env("ANTHROPIC_API_KEY"))
+    if provider == "ollama":
+        return True  # local, no key; a stopped server is not a config problem
+    if provider == "qwen":
+        return bool(env("QWEN_API_KEY"))
+    if provider == "gemma":
+        return bool(env("GEMMA_OPENAI_BASE_URL") and (env("GEMMA_API_KEY") or env("GEMINI_API_KEY")))
+    return bool(env("OPENAI_COMPAT_BASE_URL") and env("OPENAI_COMPAT_API_KEY"))
+
+
+def _llm_configured() -> bool:
+    """Every provider the app may route to (default + per-task overrides) is ready."""
+    providers = {os.environ.get("LLM_PROVIDER", "anthropic").strip().lower()}
+    providers |= {v.strip().lower() for k, v in os.environ.items() if k.startswith("LLM_PROVIDER_") and v.strip()}
+    return all(_provider_ready(p) for p in providers)
+
+
+needs_llm = pytest.mark.skipif(not _llm_configured(), reason="no LLM provider configured (set .env vars)")
 
 
 @pytest.fixture(autouse=True, scope="module")
@@ -90,6 +116,7 @@ class TestHealth:
 # ══════════════════════════════════════════════════════════════════════════════
 
 class TestIngestText:
+    @needs_llm
     def test_ingest_short_text(self):
         r = client.post("/ingest", json={
             "text": "LoRA fine-tuning reduces trainable parameters by decomposing weight updates into low-rank matrices, cutting VRAM usage by 10x while retaining 95% of full fine-tune quality."
@@ -105,6 +132,7 @@ class TestIngestText:
         cleanup_queue_item(data["id"])
         print(f"  → title: {dp['title']}, page: {dp['suggested_page']}, bullets: {len(dp['summary'])}")
 
+    @needs_llm
     def test_ingest_long_text_gets_more_bullets(self):
         """Long-form content should produce ≥4 summary bullets."""
         long_text = """
@@ -145,6 +173,7 @@ class TestIngestText:
         cleanup_queue_item(data["id"])
         print(f"  → {bullet_count} bullets for {len(long_text)} char input")
 
+    @needs_llm
     def test_ingest_irrelevant_text_rejected(self):
         """Off-topic content should return 400."""
         r = client.post("/ingest", json={
@@ -223,6 +252,7 @@ class TestQueueApprove:
         assert r.status_code == 200, r.text
         return r.json()
 
+    @needs_llm
     def test_staged_item_appears_in_queue(self):
         data = self._stage_item()
         item_id = data["id"]
@@ -232,6 +262,7 @@ class TestQueueApprove:
         finally:
             cleanup_queue_item(item_id)
 
+    @needs_llm
     def test_reject_removes_from_queue(self):
         data = self._stage_item()
         item_id = data["id"]
@@ -240,6 +271,7 @@ class TestQueueApprove:
         assert r.json()["action"] == "rejected"
         assert item_id not in queue_ids(), "Rejected item should be removed from queue"
 
+    @needs_llm
     def test_approve_writes_to_vault(self, temp_vault):
         """Approving an item should write a file and remove from queue."""
         data = self._stage_item()
@@ -256,6 +288,7 @@ class TestQueueApprove:
         written = temp_vault / result["file_written"]
         assert written.is_file(), f"Approved page missing from vault: {written}"
 
+    @needs_llm
     def test_approve_with_edits(self):
         """Edits passed at approval time should override extracted values."""
         data = self._stage_item()
@@ -315,6 +348,7 @@ class TestPages:
 # ══════════════════════════════════════════════════════════════════════════════
 
 class TestChat:
+    @needs_llm
     def test_chat_basic_query(self):
         r = client.post("/chat", json={"message": "what do I know about LLMs?"})
         assert r.status_code == 200, r.text
@@ -325,6 +359,7 @@ class TestChat:
         print(f"  → answer: {data['answer'][:80]}…")
         print(f"  → pages read: {data['pages_read']}")
 
+    @needs_llm
     def test_chat_with_history(self):
         """Chat should accept conversation history."""
         history = [
@@ -361,6 +396,7 @@ class TestChat:
 # ══════════════════════════════════════════════════════════════════════════════
 
 class TestLint:
+    @needs_llm
     def test_lint_runs_and_returns_score(self):
         r = client.post("/lint", json={"save": False}, timeout=120.0)
         assert r.status_code == 200, r.text
@@ -386,6 +422,7 @@ class TestEdgeCases:
         )
         assert r.status_code == 422
 
+    @needs_llm
     def test_very_long_text_truncated_gracefully(self):
         """50k char text should not crash — truncation happens in backend."""
         big_text = ("Attention mechanisms in transformers allow each token to attend to all others. " * 600)
