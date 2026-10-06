@@ -33,7 +33,7 @@ if _env_path.exists():
         if _line and not _line.startswith("#") and "=" in _line:
             _k, _, _v = _line.partition("=")
             _k, _v = _k.strip(), _v.strip()
-            if _v:  # force-set if .env has a non-empty value (override empty env vars)
+            if _v and not os.environ.get(_k):  # already-set vars win; empty ones are filled from .env
                 os.environ[_k] = _v
 
 import httpx
