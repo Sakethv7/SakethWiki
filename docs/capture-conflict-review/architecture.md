@@ -60,9 +60,9 @@ extraction finishes (4 call sites: /ingest, /ingest-markdown, /queue-url, clip s
   -> capture_compare.build_report(item)              [new module, backend/]
        1. pick target page  (suggested slug via identity.resolve_slug,
                              else best token-overlap page from vault_reader)
-       2. cheap gate        (token overlap >= 0.90 -> duplicate, no LLM call)
-       3. claim diff        (one Haiku call: each clip claim vs page text)
-       4. derive band       (plain rules over claim verdicts, no LLM)
+       2. claim diff        (one Haiku call: each clip claim vs page text;
+                             a number in a "same" claim must be in the quote)
+       3. derive band       (plain rules over claim verdicts, no LLM)
   -> item["conflict_report"] stored in hitl_queue.json
   -> GET /queue returns it
   -> QueueSection shows band badge; ConflictReviewModal shows side-by-side
@@ -98,13 +98,14 @@ Only `duplicate` acts without you, and that action only skips and links. The cli
 
 - **No automatic merge.** A merge changes a page you already trust. Similarity scores cannot tell "same fact" from "same topic, different numbers". See ADR 3.
 - **Claim-level display, page-level decision.** You see each claim's verdict. You pick one action for the whole clip. Per-claim choices need an editor and are out of scope. See ADR 6.
-- **One extra Haiku call per non-trivial clip.** It adds a few seconds to extraction and a small cost. The cheap gate removes the call for obvious duplicates.
+- **One extra Haiku call per clip that has a close page.** It adds a few seconds to extraction and a small cost. There is no cheap shortcut for duplicates. See ADR 2: a token-overlap shortcut hid changed numbers.
 
 ## Failure modes
 
 | Failure | Result |
 |---|---|
 | Haiku call fails or returns bad JSON | Band `unknown`. Clip still queues. Nothing is dropped. |
+| Clip arrives by Share Sheet (`/queue-url`) and is a duplicate | It stays in the queue with the "Already in wiki" badge. Nobody is waiting on a response, so it cannot show the capture notice. |
 | Target page deleted between compare and approve | `resolution` falls back to `keep_both` behavior: write a new page. |
 | Vault has no pages | Band `distinct` for every clip. |
 | Report is old (page edited after compare) | `/approve` re-checks the page hash. If it changed, the UI asks you to refresh the report. |

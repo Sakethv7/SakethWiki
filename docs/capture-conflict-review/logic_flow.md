@@ -28,10 +28,9 @@ Input: an extracted item with `summary`, `key_concepts`, `suggested_page`, `titl
 
 1. Resolve the target. Call `identity.resolve_slug(suggested_page)`. If that page exists, it is the target. If not, score every page by token overlap with the clip text. Take the best page if its score is 0.20 or more. If none, the band is `distinct`. Stop.
 2. Read the target page. Cap the text at 6,000 characters. Strip frontmatter.
-3. Cheap gate. If token overlap between the clip text and the page text is 0.90 or more, the band is `duplicate`. Stop. No LLM call.
-4. Claim diff. Send the clip claims and the page text to Haiku. Ask for JSON: one verdict per clip claim, with a short page quote when the verdict is `same`, `changed`, or `conflicts`.
-5. Validate the JSON. If it fails, retry once through `llm_client`. If it still fails, the band is `unknown`. Stop.
-6. Derive the band with fixed rules.
+3. Claim diff. Send the clip claims and the page text to Haiku. Ask for JSON: one verdict per clip claim, with a short page quote when the verdict is `same`, `changed`, or `conflicts`.
+4. Validate. Keep a page quote only if it appears on the page. A `same` claim with no valid quote becomes `new`. A `same` claim with a number that is not in its quote becomes `changed`. If the JSON is bad, `llm_client` retries once. If it still fails, the band is `unknown`. Stop.
+5. Derive the band with fixed rules.
 
 | Verdicts present | Band |
 |---|---|
@@ -39,7 +38,7 @@ Input: an extracted item with `summary`, `key_concepts`, `suggested_page`, `titl
 | else any `new` | `overlap` |
 | else all `same` | `duplicate` |
 
-7. Store the report on the item with the target's content hash and a timestamp.
+6. Store the report on the item with the target's content hash and a timestamp.
 
 The function never raises to the caller. An unexpected error gives band `unknown` and a logged warning.
 
@@ -69,7 +68,7 @@ Inside `_decide_queue_item`, before the write:
 
 1. If `resolution` is set and the item has a report, compare the target page hash with the report's hash. On a mismatch, return HTTP 409 `report_stale`. The UI offers "Refresh report", which calls `POST /queue/{id}/compare`.
 2. Call the writer with the resolution.
-   - `append`: use the existing `_evolve_page` path. Take `evolution_type` from the report (`extends` for overlap, `refines` or `supersedes` for conflict). Never use `duplicates` here, because you chose to add the clip.
+   - `append`: use the existing `_evolve_page` path. Set `evolution_type` from the report: `extends` if no claim changed, `refines` if a claim changed, `contradicts` if a claim conflicts. Never use `duplicates` here, because you chose to add the clip.
    - `replace`: copy the old page to `_wiki/meta/replaced/<slug>-<timestamp>.md`. If the copy fails, stop and leave the page unchanged. Then write the new page with `_create_page`.
    - `keep_both`: pick `<slug>-2` (then `-3` and so on) until the path is free. Write with `_create_page`. Add a "Related" wikilink in both pages.
 3. Remove the item from the queue, write the trace, and record the clip in the ledger. These steps exist today.
@@ -93,6 +92,7 @@ extracting -> failed (existing behavior)
 | Resolve | Report stale | 409. UI asks for refresh. No write. |
 | `replace` | Archive copy fails | Stop. Page unchanged. Error shown. |
 | Any write | Exception | Item stays in the queue. Error shown. Same as today. |
+| Batch approve | Selected item needs review | That item returns `needs_review` and is not written. The rest proceed. |
 | Duplicate notice | User ignores it | Nothing is lost. The clip text is still in the capture box until the user clears it. |
 
 There is no automatic retry after the first. The user can press "Refresh report" at any time.

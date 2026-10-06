@@ -42,8 +42,8 @@ Stored as `item["conflict_report"]`.
 | `band` | `"duplicate" \| "overlap" \| "conflict" \| "distinct" \| "unknown"` | Result of the rules |
 | `target_page` | `str \| null` | Slug of the closest page. Null when band is `distinct` |
 | `target_hash` | `str` | `page_hash` at compare time |
-| `match_score` | `float` | Token overlap of clip and target, 0 to 1 |
-| `claims` | `list[ClaimVerdict]` | Empty for the cheap-gate duplicate and for `distinct` |
+| `match_score` | `float` | Share of clip terms found on the target page, 0 to 1. Used to pick the target. Never decides a band |
+| `claims` | `list[ClaimVerdict]` | Empty for `distinct` and for `unknown` |
 | `recommended` | `"append" \| "replace" \| "keep_both" \| null` | Hint for the UI. Never applied automatically |
 | `reason` | `str` | One sentence for the UI |
 | `error` | `str \| null` | Set when band is `unknown` |
@@ -80,11 +80,17 @@ New response for the duplicate band (HTTP 200):
 
 For all other bands the response is unchanged, and the queue item carries `conflict_report`.
 
-The old 409 "Clip already processed" stays for exact signature matches (PR 7 rules). Its body adds `"page": "<slug>"` so the UI can link to it.
+The old 409 "Clip already processed" stays for exact signature matches (PR 7 rules). Its body is unchanged.
+
+`/queue-url` does not return a duplicate response. Its extraction runs in the background, so a duplicate stays in the queue with `conflict_report.band == "duplicate"`.
 
 ### `GET /queue`
 
 Each item adds `conflict_report` (ConflictReport or absent for items captured before this change).
+
+### `POST /queue/batch-decision`
+
+An approve for an item whose band is `duplicate`, `overlap` or `conflict` (with a target page) returns that item's result as `{"success": false, "code": "needs_review"}`. Nothing is written for it.
 
 ### `POST /approve/{item_id}`
 
@@ -148,9 +154,10 @@ Errors: `replace` raises `ArchiveError` before any write if the copy fails.
 ## Tests required before merge
 
 1. Rule table: every verdict combination gives the right band.
-2. Cheap gate: identical text gives `duplicate` with zero LLM calls.
+2. Identical text still goes through the claim diff (no shortcut). A `same` claim with a changed number becomes `changed`.
 3. LLM failure gives `unknown` and the item still queues.
 4. `replace` with a failing copy leaves the page byte-identical.
 5. `approve` with a stale hash returns 409 and writes nothing.
 6. `append` with a "duplicates" classifier result still writes the clip.
-7. Calibration set: precision and recall of `duplicate` and `conflict` on labeled pairs (see ADR open question 1).
+7. Calibration set: `python backend/calibrate_compare.py` on `calibration_pairs.json`. The number to watch is clips wrongly marked `duplicate`. It must be 0.
+8. Batch approve skips items that need review.

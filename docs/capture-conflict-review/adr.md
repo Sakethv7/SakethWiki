@@ -35,27 +35,30 @@ Yellow steps are new. The comparison moves ahead of the decision.
 
 ```mermaid
 flowchart TD
-    A[Clip claims and page text] --> B{Token overlap 0.90 or more?}
-    B -- yes --> C[Band: duplicate, no LLM]
-    B -- no --> D[Haiku labels each claim]
+    A[Clip claims and page text] --> D[Haiku labels each claim]
     D --> E{Valid JSON?}
     E -- no --> F[Band: unknown]
-    E -- yes --> G[Rules turn labels into a band]
+    E -- yes --> H{Same claim has a number not in its quote?}
+    H -- yes --> I[Relabel it: changed]
+    H -- no --> G[Rules turn labels into a band]
+    I --> G
     classDef new fill:#fde68a,stroke:#b45309,color:#000;
-    class B,C,D,E,F,G new;
+    class D,E,F,G,H,I new;
 ```
 
-Yellow steps are all new. The LLM only labels claims. Code picks the band.
+Yellow steps are all new. The LLM only labels claims. Code checks the numbers and picks the band.
 
 **Context.** A similarity score cannot find a conflict. Two clips on parallel scans score high even when one says 204 s and the other says 90 s. `consolidation.py` scores page pairs this way, and that is right for finding merge candidates. It is not right for judging a new fact.
 
 **Options.** (a) Score only: jaccard plus slug similarity. (b) Ask the LLM for a band directly. (c) Ask the LLM for a label per claim, then derive the band with fixed rules.
 
-**Choice.** (c). Per-claim labels are `same`, `new`, `changed`, `conflicts`. Rules: any `changed` or `conflicts` gives `conflict`. Else any `new` gives `overlap`. Else all `same` gives `duplicate`. This is easy to test and the UI can show the labels as evidence. A token-overlap gate at 0.90 skips the LLM for near-identical text.
+**Choice.** (c). Per-claim labels are `same`, `new`, `changed`, `conflicts`. Rules: any `changed` or `conflicts` gives `conflict`. Else any `new` gives `overlap`. Else all `same` gives `duplicate`. This is easy to test and the UI can show the labels as evidence. Two code checks guard the labels. A `same` claim needs an exact quote from the page, or it becomes `new`. A `same` claim whose numbers are not all in that quote becomes `changed`.
 
-**Consequences.** The band is explainable: you can point at the claim that caused it. The thresholds (0.90 gate, 0.20 minimum for a candidate page) are starting values. Calibrate them on a labeled set before release (see Open questions).
+**Amendment after calibration (2026-10-06).** The first draft of this ADR had a token-overlap gate: if 90% of the clip's terms were on the page, call it `duplicate` with no LLM call. The calibration run showed that this marks a clip with one doubled number as a duplicate. 10 of 10 constructed conflicts were skipped. That is the exact failure this feature must prevent. The gate is removed. Token overlap now only picks the target page. The cost is one Haiku call for clips that really are duplicates.
 
-**Given up.** An extra Haiku call. Claim extraction can split or merge claims differently from run to run, so the same pair may get a different count of claims.
+**Consequences.** The band is explainable: you can point at the claim that caused it. The one threshold left is the 0.35 minimum overlap for a target page that the extractor did not name. The gate-only run puts 10 distinct pairs at 0.19 to 0.29 and 10 overlap pairs at 0.56 to 0.75, so 0.35 sits in the gap.
+
+**Given up.** An extra Haiku call on every clip with a close page. Claim extraction can split or merge claims differently from run to run, so the same pair may get a different count of claims.
 
 ## ADR 3 — No automatic merge. Only `duplicate` acts alone, and only to skip
 
@@ -165,7 +168,7 @@ Yellow steps are all new.
 
 ## Open questions
 
-1. **Thresholds.** The 0.90 duplicate gate and the 0.20 candidate floor are guesses. Proposal: build a labeled set of about 40 clip/page pairs from your vault (76 processed clips exist) and measure before release. Do you want to label them, or should I propose labels for you to correct?
+1. **Labels to correct.** `calibration_pairs.json` holds 40 pairs with proposed labels (10 each: duplicate, conflict, overlap, distinct). Open it, fix any `label` that is wrong, and set `reviewed` to true. Then run `python backend/calibrate_compare.py`. The 10 conflict pairs are constructed (one number doubled). The 10 overlap pairs are weak labels: they are real clips against a related page, and some may be duplicate or conflict.
 2. **Call sites.** There are 4 extraction paths (`/ingest`, `/ingest-markdown`, `/queue-url`, clip staging). `docs/capture-queue` proposes one worker that would reduce this to 1. That document is still "Proposed". Should this change wait for it, or hook into all 4 now? I recommend hooking into all 4 through one helper.
 3. **Contradiction with the code.** `wiki_writer._analyze_evolution` can still drop a clip as "duplicates" at approve time, even after you chose `append`. This design passes your resolution into the writer so the writer does not re-judge. Confirm that is the right behavior.
 4. **Explainer ladder levels 3 and 4** (HTML explainer and narrated video) are not built yet. They show a flow over time, so they are required. I plan to build them after you approve this design, so I do not rebuild them if the design changes. Say if you want them first.
