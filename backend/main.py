@@ -46,6 +46,7 @@ import active_review
 import revision
 import consolidation
 import capture_compare
+import diagram_fit
 import identity
 import llm_client
 import memory_store
@@ -509,7 +510,7 @@ def _stage_markdown_clip(markdown: str, source_url: str = "", clip_title: str = 
     existing_pages = [p["name"] for p in vault_reader.list_concept_pages()]
     extraction = _extract_with_sonnet(text, [], source_url or f"clip://{title_hint}", existing_pages)
     # Preserve raw markdown visuals deterministically when present
-    md_diagram = _extract_markdown_mermaid(text)
+    md_diagram = _normalize_mermaid(_extract_markdown_mermaid(text))
     if md_diagram and not extraction.get("diagram"):
         extraction["diagram"] = md_diagram
     md_images = _extract_markdown_image_links(text)
@@ -648,7 +649,7 @@ def _regen_item(item: dict, mode: str = "full") -> dict:
     src_url = updated.get("url", "")
     if raw_md:
         extraction = _extract_with_sonnet(raw_md, [], src_url or "clip://regenerate", existing_pages)
-        md_diagram = _extract_markdown_mermaid(raw_md)
+        md_diagram = _normalize_mermaid(_extract_markdown_mermaid(raw_md))
         if md_diagram and not extraction.get("diagram"):
             extraction["diagram"] = md_diagram
         md_images = _extract_markdown_image_links(raw_md)
@@ -1369,7 +1370,7 @@ def _normalize_mermaid(diagram: str) -> str:
     if _re.search(r":::\s*accent\b", text) and not _re.search(r"classDef\s+accent\b", text):
         text = text.rstrip() + "\n    classDef accent fill:#c4573a,color:#fff\n"
 
-    return text
+    return diagram_fit.fit(text)
 
 
 def _normalize_extraction_contract(data: dict, depth: str) -> dict:

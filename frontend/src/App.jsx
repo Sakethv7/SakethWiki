@@ -63,10 +63,50 @@ async function validateMermaidRender(chart) {
   }
 }
 
+// Wide diagrams are never shrunk below this share of their natural size. They scroll instead.
+const DIAGRAM_MIN_SCALE = 0.75;
+
+function svgNaturalWidth(svg) {
+  const m = svg.match(/viewBox="[\d.\-]+\s+[\d.\-]+\s+([\d.]+)\s+[\d.]+"/);
+  return m ? parseFloat(m[1]) : 0;
+}
+
+function DiagramModal({ svg, natural, onClose }) {
+  const [zoom, setZoom] = useState(1);
+  const fit = () => setZoom(Math.max(0.2, Math.min(3, (window.innerWidth - 96) / natural)));
+  useEffect(() => {
+    function onKey(e) { if (e.key === "Escape") onClose(); }
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
+  const btn = "px-2.5 py-1 border border-stone-300 rounded-lg text-xs text-stone-700 hover:bg-stone-100";
+  return (
+    <div className="fixed inset-0 z-50 bg-black/50 flex items-center justify-center p-4" onClick={onClose}>
+      <div role="dialog" aria-label="Diagram" className="bg-white rounded-2xl shadow-xl w-full max-w-[95vw] max-h-[92vh] flex flex-col" onClick={e => e.stopPropagation()}>
+        <div className="flex items-center gap-2 px-4 py-2.5 border-b border-stone-100">
+          <button className={btn} onClick={() => setZoom(z => Math.max(0.2, +(z - 0.25).toFixed(2)))} aria-label="Zoom out">−</button>
+          <span className="text-xs text-stone-500 w-12 text-center">{Math.round(zoom * 100)}%</span>
+          <button className={btn} onClick={() => setZoom(z => Math.min(3, +(z + 0.25).toFixed(2)))} aria-label="Zoom in">+</button>
+          <button className={btn} onClick={() => setZoom(1)}>100%</button>
+          <button className={btn} onClick={fit}>Fit width</button>
+          <span className="flex-1" />
+          <button onClick={onClose} aria-label="Close" className="text-stone-400 hover:text-stone-700 text-xl leading-none">×</button>
+        </div>
+        <div className="overflow-auto p-4">
+          <div style={{ width: natural * zoom }} className="[&_svg]:w-full [&_svg]:h-auto [&_svg]:!max-w-none" dangerouslySetInnerHTML={{ __html: svg }} />
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function MermaidDiagram({ chart }) {
   const uid = useRef(`md-${Math.random().toString(36).slice(2)}`);
+  const boxRef = useRef(null);
   const [svg, setSvg] = useState("");
   const [rawFallback, setRawFallback] = useState(false);
+  const [boxW, setBoxW] = useState(0);
+  const [expanded, setExpanded] = useState(false);
 
   useEffect(() => {
     if (!chart) return;
@@ -82,14 +122,39 @@ function MermaidDiagram({ chart }) {
       .finally(() => { try { document.body.removeChild(tmp); } catch {} });
   }, [chart]);
 
+  useEffect(() => {
+    const el = boxRef.current;
+    if (!el || typeof ResizeObserver === "undefined") return;
+    const ro = new ResizeObserver(() => setBoxW(el.clientWidth));
+    ro.observe(el);
+    setBoxW(el.clientWidth);
+    return () => ro.disconnect();
+  }, [svg]);
+
   if (!chart) return null;
   if (rawFallback) return (
     <pre className="text-xs text-stone-500 bg-stone-50 border border-stone-200 rounded-xl p-3 overflow-x-auto whitespace-pre-wrap">{chart}</pre>
   );
   if (!svg) return <div className="text-xs text-stone-400 py-2">Rendering diagram…</div>;
+
+  const natural = svgNaturalWidth(svg);
+  const inner = Math.max(boxW - 32, 0);                       // box padding
+  const shown = natural && inner ? Math.max(Math.min(natural, inner), natural * DIAGRAM_MIN_SCALE) : 0;
+  const wide = natural && inner && natural > inner;
   return (
-    <div className="w-full overflow-x-auto rounded-xl bg-stone-50 border border-stone-100 p-4 [&_svg]:max-w-full [&_svg]:h-auto"
-      dangerouslySetInnerHTML={{ __html: svg }} />
+    <div className="relative">
+      <div ref={boxRef} className="w-full overflow-x-auto rounded-xl bg-stone-50 border border-stone-100 p-4">
+        <div style={shown ? { width: shown } : undefined} className="[&_svg]:w-full [&_svg]:h-auto [&_svg]:!max-w-none"
+          dangerouslySetInnerHTML={{ __html: svg }} />
+      </div>
+      {wide && (
+        <button onClick={() => setExpanded(true)} aria-label="Expand diagram"
+          className="absolute top-2 right-2 px-2 py-1 bg-white/90 border border-stone-200 rounded-lg text-[11px] text-stone-600 hover:bg-white shadow-sm">
+          Expand
+        </button>
+      )}
+      {expanded && <DiagramModal svg={svg} natural={natural} onClose={() => setExpanded(false)} />}
+    </div>
   );
 }
 
