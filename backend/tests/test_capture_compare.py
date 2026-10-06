@@ -214,3 +214,28 @@ def test_batch_approve_blocks_items_that_need_review(monkeypatch):
     out = asyncio.run(main.batch_queue_decision(main.BatchDecisionRequest(item_ids=["a"], approved=True)))
     assert out["results"][0]["code"] == "needs_review"
     assert decided == []
+
+
+def test_conflict_flag_with_unrelated_quote_is_demoted(isolated_vault, monkeypatch):
+    _page(isolated_vault, "parallel-scan")
+    _llm(monkeypatch, [{"verdict": "conflicts", "page_quote": "Each segment reads its own key range independently."}])
+    report = cc.build_report(_item(["Hot partitions throttle writes when one key receives most traffic."]))
+    assert report["claims"][0]["verdict"] == "new"
+    assert report["claims"][0]["page_quote"] is None
+
+
+def test_exact_repaste_raises_friendly_duplicate_with_page(isolated_vault, monkeypatch):
+    monkeypatch.setattr(main.queue_manager, "get_all", lambda: [])
+    page = _page(isolated_vault, "parallel-scan")
+    sig = main._clip_signature("# Parallel scan\n\n- one claim here\n- another claim here", "", "")
+    idx = isolated_vault / "_wiki" / "meta" / "processed_clips.jsonl"
+    idx.write_text(json.dumps({"clip_signature": sig, "file_written": "_wiki/cs/parallel-scan.md"}) + "\n")
+    monkeypatch.setattr(main, "_extract_with_sonnet", lambda *a, **k: pytest.fail("must not extract"))
+    with pytest.raises(main.DuplicateClip) as dup:
+        main._stage_markdown_clip("# Parallel scan\n\n- one claim here\n- another claim here")
+    assert dup.value.page == "parallel-scan"
+    assert "already in 'parallel-scan'" in dup.value.report["reason"]
+    page.unlink()
+    monkeypatch.setattr(main, "_extract_with_sonnet", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("reached extraction")))
+    with pytest.raises(RuntimeError):   # page deleted: the ledger no longer blocks, so extraction runs
+        main._stage_markdown_clip("# Parallel scan\n\n- one claim here\n- another claim here")

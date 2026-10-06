@@ -31,6 +31,7 @@ logger = logging.getLogger(__name__)
 CANDIDATE_FLOOR = 0.35         # min containment for a page the extractor did not name
 PAGE_CHAR_CAP = 6000
 SAME_SUPPORT_MIN = 0.45        # share of a "same" claim's terms that its page quote must contain
+FLAG_SUPPORT_MIN = 0.15        # a changed/conflicts flag needs a quote that is about the same point
 
 VERDICTS = ("same", "new", "changed", "conflicts")
 _MODEL = "claude-haiku-4-5-20251001"
@@ -186,6 +187,8 @@ def _diff_claims(claims: list[str], page_body: str) -> list[dict]:
         if verdict == "same" and _containment(_tokens(claim), _tokens(quote or "")) < SAME_SUPPORT_MIN:
             verdict = "new"  # the quote does not support the claim (model picked an unrelated line)
             quote = None
+        if verdict in ("changed", "conflicts") and _containment(_tokens(claim), _tokens(quote or "")) < FLAG_SUPPORT_MIN:
+            verdict, quote = "new", None  # quote is about something else: no evidence for the flag
         if verdict == "same" and not _numbers(claim) <= _numbers(quote):
             verdict = "changed"  # a number in the claim is not in the page text it matched
         if verdict == "new":

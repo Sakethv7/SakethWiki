@@ -397,15 +397,14 @@ def _clip_signature(markdown: str, source_url: str = "", clip_title: str = "") -
     return hashlib.sha256(seed.encode("utf-8")).hexdigest()
 
 
-def _is_clip_processed(sig: str) -> bool:
-    # Check queue first
+def _processed_clip_match(sig: str) -> Optional[dict]:
+    """Where an identical clip already lives: {"where": "queue"} or {"where": "wiki", "page": slug}."""
     for item in queue_manager.get_all():
         if item.get("clip_signature") == sig:
-            return True
-    # Then check historical index
+            return {"where": "queue", "page": None}
     idx = _processed_clips_index_path()
     if not idx.exists():
-        return False
+        return None
     for line in idx.read_text(encoding="utf-8").splitlines():
         if not line.strip():
             continue
@@ -414,8 +413,13 @@ def _is_clip_processed(sig: str) -> bool:
         except Exception:
             continue
         if rec.get("clip_signature") == sig and _ledger_page_exists(rec):
-            return True
-    return False
+            written = (rec.get("file_written") or "").split(" [")[0].strip()
+            return {"where": "wiki", "page": Path(written).stem if written else None}
+    return None
+
+
+def _is_clip_processed(sig: str) -> bool:
+    return _processed_clip_match(sig) is not None
 
 
 def _ledger_page_exists(rec: dict) -> bool:
@@ -487,8 +491,13 @@ def _stage_markdown_clip(markdown: str, source_url: str = "", clip_title: str = 
     if not text:
         raise HTTPException(400, "Markdown is empty")
     sig = _clip_signature(text, source_url, clip_title)
-    if not force and _is_clip_processed(sig):
-        raise HTTPException(409, "Clip already processed")
+    match = None if force else _processed_clip_match(sig)
+    if match:
+        where = "your queue" if match["where"] == "queue" else f"'{match['page']}'" if match["page"] else "your wiki"
+        raise DuplicateClip({
+            "band": "duplicate", "target_page": match["page"], "claims": [],
+            "reason": f"This exact clip is already in {where}.",
+        })
 
     title_hint = clip_title.strip() if clip_title else _extract_markdown_title(text)
     existing_pages = [p["name"] for p in vault_reader.list_concept_pages()]
