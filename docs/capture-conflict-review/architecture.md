@@ -29,7 +29,9 @@ Yellow steps are new. Blue steps change an existing screen. Today a clip goes fr
 
 ## Status
 
-Proposed. No implementation code until you approve these four documents.
+Implemented on branch `capture-conflict-review` (PR 8). The design was approved on 2026-10-06. Changes made during the build are marked in `adr.md` (ADR 2 amendment).
+
+Explainer ladder: [HTML explainer](../visuals/capture-conflict-review-flow.html) and [narrated video](../visuals/capture-conflict-review-flow.mp4). Both play the flow with a "today" lane and a "with this change" lane.
 
 ## Complexity tier
 

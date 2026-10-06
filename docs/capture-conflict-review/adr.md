@@ -6,6 +6,8 @@ Each ADR lists what was given up. A decision with no downside is not finished.
 
 ### Visual Level
 
+Levels 3 and 4 for this change: [HTML explainer](../visuals/capture-conflict-review-flow.html) and [narrated video](../visuals/capture-conflict-review-flow.mp4). They cover the whole feature, so the other ADRs do not repeat them.
+
 ```mermaid
 flowchart TD
     A[Clip extracted] --> B{When do we compare?}
@@ -169,7 +171,8 @@ Yellow steps are all new.
 ## Open questions
 
 1. **Labels to correct.** `calibration_pairs.json` holds 40 pairs with proposed labels (10 each: duplicate, conflict, overlap, distinct). Open it, fix any `label` that is wrong, and set `reviewed` to true. Then run `python backend/calibrate_compare.py`. The 10 conflict pairs are constructed (one number doubled). The 10 overlap pairs are weak labels: they are real clips against a related page, and some may be duplicate or conflict.
-2. **Call sites.** There are 4 extraction paths (`/ingest`, `/ingest-markdown`, `/queue-url`, clip staging). `docs/capture-queue` proposes one worker that would reduce this to 1. That document is still "Proposed". Should this change wait for it, or hook into all 4 now? I recommend hooking into all 4 through one helper.
+2. **Call sites.** Built: the report is attached in `/ingest`, `/ingest-markdown` (and inbox clip staging), and the `/queue-url` background extraction, through one helper (`_attach_report`). Not hooked: `/ingest-direct` writes straight to the wiki with no review step, and the approve-time extraction for a Share Sheet item that has not finished extracting. Both skip the review screen by design today. Decide if they should go through it. `docs/capture-queue` would reduce the paths to one worker if it is built.
 3. **Contradiction with the code.** `wiki_writer._analyze_evolution` can still drop a clip as "duplicates" at approve time, even after you chose `append`. This design passes your resolution into the writer so the writer does not re-judge. Confirm that is the right behavior.
-4. **Explainer ladder levels 3 and 4** (HTML explainer and narrated video) are not built yet. They show a flow over time, so they are required. I plan to build them after you approve this design, so I do not rebuild them if the design changes. Say if you want them first.
+4. **Explainer ladder levels 3 and 4** are built: `docs/visuals/capture-conflict-review-flow.html` and `.mp4`, with `make_video.py` next to them. The video is 53 s at 12 fps.
 5. **Ledger removal.** Should the ledger be deleted after this ships? Not decided here.
+6. **Hazards found during the build (not changed here).** `wiki_writer.py` reloads `.env` at import and overwrites a `VAULT_PATH` that is already set. A test or script that sets its own vault path can still write to the real vault. Also `test_e2e.py` leaves items in the real `hitl_queue.json`. Both are outside this change. They need their own fix.
