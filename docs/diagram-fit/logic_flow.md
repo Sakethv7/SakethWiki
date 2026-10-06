@@ -7,7 +7,7 @@ flowchart TD
     A[Diagram text in] --> B[Repair syntax]
     B --> C{Mermaid flowchart or graph?}
     C -- no --> G[Return repaired text]
-    C -- yes --> D{Left to right, no subgraph, 4 or more nodes?}
+    C -- yes --> D{Left to right, no subgraph, 4+ nodes, no node with 3+ outgoing edges?}
     D -- yes --> E[Set direction to TD]
     D -- no --> F[Keep direction]
     E --> H[Wrap labels over 28 characters]
@@ -25,11 +25,12 @@ Yellow steps are all new. The failure path is the empty-result check: the origin
 
 Input: the text inside a `mermaid` fence. Output: text. The function never raises.
 
-1. **Repair.** Remove spaces between a closing bracket and `:::`. `D["a"] :::accent` becomes `D["a"]:::accent`. Handles `]`, `)`, `}` and a closing quote.
+1. **Repair.** Remove spaces between a node and `:::`. `D["a"] :::accent` becomes `D["a"]:::accent`. `A :::accent` becomes `A:::accent`.
 2. **Type check.** Read the first non-blank, non-comment line. If it does not start with `flowchart` or `graph`, return the repaired text. Mind maps, sequence diagrams and others stop here.
 3. **Direction rule.** Switch `LR` or `RL` to `TD` only when all three hold:
    - the diagram has no `subgraph` line,
    - it has at least 4 distinct nodes,
+   - no node has more than 2 outgoing edges,
    - the first line is not `TD` or `TB` already.
    Count nodes as distinct ids that appear before a bracket, an arrow, or a pipe, outside quoted text.
 4. **Label wrap.** For each quoted node label (`["..."]`) that has no `<br`, and is longer than 28 characters, break at the space nearest 24 characters, and repeat for the rest. Join with `<br/>`. Edge labels are not changed.
@@ -62,7 +63,8 @@ Only the text between the opening ` ```mermaid ` line and the closing ` ``` ` ch
 1. Collect all mermaid blocks from the vault, or from a backup folder and the live vault as a pair.
 2. Open a local HTML page in headless Chrome with the app's Mermaid library. Parse and render each block.
 3. Print: failures, natural width, share below 75% and 50% at a 700 px pane.
-4. With `--pair <timestamp>`: for every page, compare the backup width with the live width. Print pages that fail to parse or got wider. These are the pages to restore.
+4. With `--pair <timestamp>`: for every diagram, compare the backup width with the live width. Print diagrams that fail to parse or got wider. With `--revert`, put those diagrams back to their backed-up text.
+5. With `--mark-wide`: render the live vault. For each flowchart wider than 700 px, add `%%{init: {"flowchart": {"useMaxWidth": false}}}%%` as its first line (backed up first). A second run changes nothing.
 
 ## Path 5 — Display
 

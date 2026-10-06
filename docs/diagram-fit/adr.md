@@ -49,7 +49,9 @@ Yellow steps are all new.
 
 **Choice.** (c). On the vault it switches 81 diagrams. 71 get narrower and 10 do not (88%). Node count alone did not predict anything: a threshold of 3 to 6 nodes got 70 to 75 right and 30 to 31 wrong. Option (d) would be exact but needs a browser inside the server. The offline check (`measure_diagrams.py`) gives exact numbers for the migration and for tuning the rule.
 
-**Consequences.** For the vault migration, the check restores any page where the result is wider, so the 12% miss does not apply there. For new diagrams, about 1 in 8 switched diagrams may get wider. The scroll and Expand view handles those.
+**Amendment after the first vault run.** The first version of the rule (no subgraph, at least 4 nodes) made 9 of the 122 changed pages wider. I looked for a feature that predicts those. The largest number of edges leaving one node does: in top-to-bottom, the children of a node with 3 or more outgoing edges sit side by side. The rule now also requires that no node has more than 2 outgoing edges (`MAX_FANOUT_FOR_TD = 2`). On the 81 candidates: 62 are switched, 58 get narrower and 3 get wider (95%). It gives up 13 of the 71 wins. After the vault run with this rule, 3 diagrams were still wider and were reverted by block (ADR 4).
+
+**Consequences.** For the vault migration, the check reverts any diagram where the result is wider, so the miss rate does not apply there. For new diagrams, about 1 in 8 switched diagrams may get wider. The scroll and Expand view handles those.
 
 **Given up.** Exactness at ingest time. A diagram with subgraphs that is too wide stays too wide.
 
@@ -104,7 +106,9 @@ Yellow steps are all new.
 
 **Options.** (a) Rewrite in place. (b) Rewrite with a backup. (c) Write fitted copies next to the originals.
 
-**Choice.** (b). `--dry-run` is the default and writes nothing. It lists each page and the planned change. `--apply` copies each page to `_wiki/meta/diagram-backup/<timestamp>/` before it changes it. `--restore <timestamp>` puts the backed-up pages back. Only text inside a fenced `mermaid` block can change.
+**Choice.** (b). `--dry-run` is the default and writes nothing. It lists each page and the planned change. `--apply` copies each page to `_wiki/meta/diagram-backup/<timestamp>/` before it changes it. `--restore <timestamp>` puts the backed-up pages back. Only text inside a fenced `mermaid` block can change. `_wiki/inbox` (raw captured clips) and `_wiki/meta` (generated reports) are skipped.
+
+**Amendment.** Undo is also available per diagram: `measure_diagrams.py --pair <timestamp> --revert` restores only the diagrams that failed to parse or got wider. A page with two diagrams can keep one fitted diagram and revert the other.
 
 **Consequences.** Backups stay until you delete them.
 
@@ -153,17 +157,22 @@ Yellow steps are all new.
 
 **Context.** Even after the fit, about 34 diagrams stay below 75% size in every layout I tried. Obsidian shrinks them like the app did.
 
-**Choice.** Add `.obsidian/snippets/wide-mermaid.css` and list it in `enabledCssSnippets` in `.obsidian/appearance.json`. The snippet removes the `max-width` on diagram SVGs and lets the diagram box scroll sideways.
+**Amendment: the snippet alone cannot work.** Mermaid writes `<svg width="100%" style="max-width: Npx">`. The diagram always refills the pane, and CSS cannot read N. I checked with the real library: with `%%{init: {"flowchart": {"useMaxWidth": false}}}%%` as the first line, Mermaid writes `<svg width="N">` with a fixed pixel width and no `max-width`. So two things are needed:
+
+1. Diagrams that are still wider than 700 px after the fit get that init line (`measure_diagrams.py --mark-wide`, backed up like any rewrite).
+2. The snippet `.mermaid { overflow-x: auto; }` lets that fixed width scroll.
+
+**Choice.** Add `.obsidian/snippets/wide-mermaid.css` and list it in `enabledCssSnippets` in `.obsidian/appearance.json`. The init line is added by `--mark-wide`, only to flowcharts wider than the pane.
 
 **Consequences.** Reversible: turn the snippet off in Obsidian, or delete the file.
 
-**Given up.** It changes your Obsidian settings. **I cannot run Obsidian here, so I cannot test it.** The CSS selectors match Obsidian's published structure and may differ in your version. Treat the snippet as unverified until you look at a wide diagram in Obsidian.
+**Given up.** It changes your Obsidian settings, and wide pages gain one visible line (`%%{init: ...}%%`) in their diagram source. **I cannot run Obsidian here, so I cannot test the display.** I verified the Mermaid output (a fixed `width`), not Obsidian's container. If Obsidian clips the diagram instead of scrolling, the `.mermaid` selector needs changing: send a screenshot. New diagrams are not marked automatically: run `--mark-wide` again.
 
 ## Open questions
 
-1. **Hand-written diagrams.** The 165 pages include notes you may have written in Obsidian. Should the rewrite touch only pages the app wrote (those with `source_type`, `concept_page`, or a `sources/` link in frontmatter), or all of them? I recommend all, because `--dry-run` lists every page first, and the backup makes it reversible.
-2. **Pasted diagrams.** Today a diagram inside a pasted clip is kept exactly as pasted. With this change it is fitted. You see the fitted version in the preview and can edit it. Is that acceptable, or should pasted diagrams stay untouched unless you press a "Fit diagram" button?
-3. **Intake points.** `_normalize_mermaid` is called at 3 places (`main.py` lines 588, 636, 1402). The pasted-clip path does not call it. `wiki_writer.py` also writes diagrams at lines 406 and 683. I will confirm during build that every write goes through `fit()`.
-4. **Obsidian snippet.** Unverified in Obsidian (ADR 6). If it does not work in your version, I need a screenshot of a wide diagram in Obsidian to adjust the selectors.
-5. **Thresholds.** The 4-node minimum, the 28-character wrap trigger, and the 75% display floor are starting values. I will check them against `measure_diagrams.py` after the build.
+1. **Hand-written diagrams.** The rewrite touched all pages outside `_wiki/inbox` and `_wiki/meta` (my recommendation, taken because the question was not answered). It can be undone with `--restore`.
+2. **Pasted diagrams.** Built as proposed: a pasted diagram is fitted, and you see the fitted version in the preview and can edit it. No button.
+3. **Intake points.** Built: `_normalize_mermaid` now ends with `fit()`, and the pasted-clip path (`_stage_markdown_clip`) and the regenerate path now call it. `wiki_writer.py` writes diagrams at two places and does not call `fit()` again. A diagram you edit by hand in the preview is written as you typed it.
+4. **Obsidian display.** Unverified in Obsidian (ADR 6). I need a screenshot of a wide diagram in Obsidian to confirm.
+5. **Thresholds.** The 4-node minimum, the fan-out limit of 2, the 28-character wrap trigger and the 75% display floor are measured on this vault. Re-run `measure_diagrams.py` if the diagram style changes.
 6. **Mind maps and sequence diagrams** (9 in the vault) are only syntax-repaired. They rendered at acceptable widths in the measurement.

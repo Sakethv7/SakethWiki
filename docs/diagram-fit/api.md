@@ -29,7 +29,7 @@ def repair(src: str) -> str:
     """Syntax repair only (space before :::). Used by fit() and callable alone."""
 ```
 
-Constants, module level: `MIN_NODES_FOR_TD = 4`, `WRAP_TRIGGER = 28`, `WRAP_AT = 24`.
+Constants, module level: `MIN_NODES_FOR_TD = 4`, `MAX_FANOUT_FOR_TD = 2`, `WRAP_TRIGGER = 28`, `WRAP_AT = 24`.
 
 Contract:
 
@@ -37,7 +37,8 @@ Contract:
 |---|---|
 | Empty or whitespace text | Same text |
 | Not `flowchart` or `graph` | `repair(src)` only |
-| `flowchart LR`, no subgraph, 4 or more nodes | First line becomes `flowchart TD`. Labels wrapped |
+| `flowchart LR`, no subgraph, 4 or more nodes, no node with 3+ outgoing edges | First line becomes `flowchart TD`. Labels wrapped |
+| `flowchart LR` where one node has 3+ outgoing edges | Direction kept. Labels wrapped |
 | `flowchart LR` with `subgraph` | Direction kept. Labels wrapped |
 | Already `TD` or `TB` | Direction kept. Labels wrapped |
 | Any case where the result is empty | The original `src` |
@@ -77,6 +78,8 @@ Backup layout: `_wiki/meta/diagram-backup/<YYYYMMDD-HHMMSS>/<path relative to _w
 ```text
 python backend/measure_diagrams.py                     # measure the live vault
 python backend/measure_diagrams.py --pair <timestamp>  # compare backup vs live, list regressions
+python backend/measure_diagrams.py --pair <timestamp> --revert   # also revert those diagrams
+python backend/measure_diagrams.py --mark-wide         # add useMaxWidth:false to flowcharts wider than 700 px (backed up)
 ```
 
 Output (stdout, one section each): counts of diagrams, failures with file and message, median natural width, share below 75% and 50% at 700 px, and with `--pair` the list of pages that failed or got wider. Requires Google Chrome and `frontend/node_modules/mermaid`.
@@ -95,9 +98,10 @@ Output (stdout, one section each): counts of diagrams, failures with file and me
 `.obsidian/snippets/wide-mermaid.css`:
 
 ```css
-.markdown-rendered .mermaid { overflow-x: auto; }
-.markdown-rendered .mermaid svg { max-width: none !important; }
+.mermaid { overflow-x: auto; }
 ```
+
+A diagram that is still wider than 700 px after the fit also gets `%%{init: {"flowchart": {"useMaxWidth": false}}}%%` as its first line (`--mark-wide`). Without it, Mermaid writes `width="100%"` and CSS cannot give the diagram its real width.
 
 `.obsidian/appearance.json` gains `"enabledCssSnippets": ["wide-mermaid"]`. Unverified in Obsidian (ADR 6).
 

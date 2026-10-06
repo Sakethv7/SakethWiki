@@ -7,7 +7,7 @@ flowchart TD
     A[Diagram arrives: generated or pasted] --> B[Repair syntax]
     B --> C{Flowchart going left to right?}
     C -- no --> F[Wrap long labels]
-    C -- yes --> D{Has subgraphs, or fewer than 4 nodes?}
+    C -- yes --> D{Has subgraphs, fewer than 4 nodes, or a node with 3+ outgoing edges?}
     D -- yes --> F
     D -- no --> E[Switch to top to bottom]
     E --> F
@@ -24,7 +24,7 @@ Yellow steps are new. Blue steps are display changes. Today a diagram goes from 
 
 ## Status
 
-Proposed. No implementation code until you approve these four documents.
+Implemented on branch `diagram-fit` (PR 14). Design approved 2026-10-06. Changes made during the build are marked "Amendment" in `adr.md`.
 
 ## Complexity tier
 
@@ -110,7 +110,7 @@ The vault stays the source of truth. `fit()` is a pure function: text in, text o
 
 ## Out of scope
 
-Mind maps and sequence diagrams (9 in the vault) are only syntax-repaired, not re-laid out. No change to what the LLM is asked to produce. No change to the diagram-regeneration flow beyond passing through `_normalize_mermaid`. No Obsidian plugin.
+Mind maps and sequence diagrams (9 in the vault) are only syntax-repaired, not re-laid out. Raw captured clips (`_wiki/inbox`) and generated reports (`_wiki/meta`) are not rewritten. No change to what the LLM is asked to produce. No change to the diagram-regeneration flow beyond passing through `_normalize_mermaid`. No Obsidian plugin.
 
 ## Open questions
 
