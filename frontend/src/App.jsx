@@ -115,7 +115,10 @@ async function api(path, opts = {}) {
       : detail?.message ? detail.message
       : detail ? JSON.stringify(detail)
       : res.statusText;
-    throw new Error(message);
+    const failure = new Error(message);
+    failure.status = res.status;
+    failure.detail = detail;
+    throw failure;
   }
   if (res.status === 204) return null;
   return res.json();
@@ -202,6 +205,217 @@ const CHAT_NOTE_TYPES = [
 
 // ── INGEST TAB ────────────────────────────────────────────────────────────────
 
+// ── Conflict review (capture-time comparison with the closest existing page) ──
+
+const BAND_META = {
+  duplicate: { label: "Already in wiki", chip: "bg-stone-100 text-stone-600 border-stone-200", bar: "bg-stone-50 border-stone-200 text-stone-700" },
+  overlap:   { label: "Adds to a page", chip: "bg-sky-50 text-sky-700 border-sky-200", bar: "bg-sky-50 border-sky-200 text-sky-800" },
+  conflict:  { label: "Conflicts with a page", chip: "bg-amber-50 text-amber-700 border-amber-200", bar: "bg-amber-50 border-amber-300 text-amber-900" },
+  distinct:  { label: "New topic", chip: "bg-emerald-50 text-emerald-700 border-emerald-200", bar: "bg-emerald-50 border-emerald-200 text-emerald-800" },
+  unknown:   { label: "Not compared", chip: "bg-stone-100 text-stone-500 border-stone-200", bar: "bg-stone-50 border-stone-200 text-stone-600" },
+};
+const VERDICT_META = {
+  same:      { label: "same", cls: "bg-stone-100 text-stone-600 border-stone-200" },
+  new:       { label: "new", cls: "bg-sky-50 text-sky-700 border-sky-200" },
+  changed:   { label: "changed", cls: "bg-amber-50 text-amber-700 border-amber-300" },
+  conflicts: { label: "conflicts", cls: "bg-red-50 text-red-700 border-red-300" },
+};
+// Bands that need a human decision before the clip touches a page.
+function needsReview(report) {
+  return !!report && ["duplicate", "overlap", "conflict"].includes(report.band) && !!report.target_page;
+}
+
+function BandBadge({ report }) {
+  if (!report || !BAND_META[report.band] || report.band === "distinct") return null;
+  const meta = BAND_META[report.band];
+  return (
+    <span title={report.reason} className={`text-[10px] font-medium px-1.5 py-0.5 rounded border ${meta.chip}`}>
+      {meta.label}{report.target_page && report.band !== "unknown" ? ` · ${report.target_page}` : ""}
+    </span>
+  );
+}
+
+function ConflictBanner({ report, onReview }) {
+  if (!report || report.band === "distinct") return null;
+  const meta = BAND_META[report.band] || BAND_META.unknown;
+  return (
+    <div className={`rounded-xl border px-3 py-2.5 flex items-start gap-3 ${meta.bar}`}>
+      <div className="flex-1 min-w-0">
+        <div className="text-xs font-semibold">{meta.label}</div>
+        <div className="text-xs mt-0.5 opacity-90">{report.reason}</div>
+      </div>
+      {needsReview(report) && onReview && (
+        <button onClick={onReview} className="shrink-0 px-3 py-1.5 bg-white border border-current rounded-lg text-xs font-semibold hover:bg-white/70">
+          Review side-by-side
+        </button>
+      )}
+    </div>
+  );
+}
+
+function ConflictReviewModal({ item, extraBody, onClose, onResolved }) {
+  const [report, setReport] = useState(item.conflict_report);
+  const [busy, setBusy] = useState("");          // "" | action name | "refresh"
+  const [error, setError] = useState("");
+  const [stale, setStale] = useState(false);
+  const [confirmReplace, setConfirmReplace] = useState(false);
+  const [showPage, setShowPage] = useState(false);
+  const [pageText, setPageText] = useState(null);
+  const claims = report.claims || [];
+  const counts = claims.reduce((acc, c) => ({ ...acc, [c.verdict]: (acc[c.verdict] || 0) + 1 }), {});
+  const meta = BAND_META[report.band] || BAND_META.unknown;
+
+  useEffect(() => {
+    if (!showPage || pageText !== null) return;
+    api(`/page/${report.target_page}`)
+      .then(d => setPageText(d.content || ""))
+      .catch(e => setPageText(`Could not load page: ${e.message}`));
+  }, [showPage]);
+
+  async function resolve(action) {
+    setBusy(action); setError("");
+    try {
+      if (action === "skip") {
+        await api(`/approve/${item.id}`, { method: "POST", body: JSON.stringify({ approved: false }) });
+      } else {
+        await api(`/approve/${item.id}`, { method: "POST", body: JSON.stringify({ ...extraBody, approved: true, resolution: action }) });
+      }
+      onResolved(action);
+    } catch (e) {
+      if (e.status === 409 && e.detail?.error === "report_stale") setStale(true);
+      else setError(e.message || "Action failed");
+      setBusy(""); setConfirmReplace(false);
+    }
+  }
+
+  async function refresh() {
+    setBusy("refresh"); setError("");
+    try {
+      const data = await api(`/queue/${item.id}/compare`, { method: "POST" });
+      setReport(data.conflict_report); setStale(false); setPageText(null);
+    } catch (e) { setError(e.message || "Refresh failed"); }
+    setBusy("");
+  }
+
+  useEffect(() => {
+    function onKey(e) {
+      if (e.target.closest?.("input, textarea")) return;
+      if (e.key === "Escape") onClose();
+    }
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
+
+  const rec = report.recommended;
+  const actions = [
+    { id: "append", label: "Add to page", hint: "Adds a new section. Updates the page summary." },
+    { id: "keep_both", label: "Keep both", hint: "Saves the clip as a new page and links the two." },
+    { id: "replace", label: "Replace page", hint: "Old page is archived first (meta/replaced)." },
+    { id: "skip", label: "Skip clip", hint: "Rejects the clip. Nothing is written." },
+  ];
+
+  return (
+    <div className="fixed inset-0 z-50 bg-black/40 flex items-center justify-center p-4" onClick={onClose}>
+      <div role="dialog" aria-label="Review clip against existing page"
+        className="bg-white rounded-2xl shadow-xl w-full max-w-5xl max-h-[90vh] flex flex-col" onClick={e => e.stopPropagation()}>
+        <div className="px-5 pt-4 pb-3 border-b border-stone-100 flex items-start gap-3">
+          <div className="flex-1 min-w-0">
+            <div className="flex items-center gap-2 flex-wrap">
+              <span className={`text-[11px] font-semibold px-2 py-0.5 rounded border ${meta.chip}`}>{meta.label}</span>
+              <span className="text-sm font-semibold text-stone-900 truncate">{item.title}</span>
+            </div>
+            <p className="text-xs text-stone-500 mt-1">{report.reason}</p>
+            <div className="flex flex-wrap gap-1.5 mt-2">
+              {Object.entries(counts).map(([v, n]) => (
+                <span key={v} className={`text-[10px] px-1.5 py-0.5 rounded border ${VERDICT_META[v]?.cls || ""}`}>{n} {VERDICT_META[v]?.label || v}</span>
+              ))}
+            </div>
+          </div>
+          <button onClick={onClose} aria-label="Close" className="text-stone-400 hover:text-stone-700 text-xl leading-none">×</button>
+        </div>
+
+        <div className="flex-1 overflow-y-auto px-5 py-4 space-y-3">
+          {stale && (
+            <div className="rounded-xl border border-amber-300 bg-amber-50 px-3 py-2 text-xs text-amber-900 flex items-center gap-3">
+              <span className="flex-1">The page changed after this was compared. Refresh so you decide on current text.</span>
+              <button onClick={refresh} disabled={busy === "refresh"} className="px-3 py-1.5 bg-white border border-amber-400 rounded-lg font-semibold hover:bg-amber-100 disabled:opacity-50">
+                {busy === "refresh" ? "Comparing…" : "Refresh comparison"}
+              </button>
+            </div>
+          )}
+
+          <div className="hidden md:grid grid-cols-[1fr_72px_1fr] gap-3 text-[10px] uppercase tracking-wide text-stone-400 px-1">
+            <span>On the page · <span className="font-mono normal-case">{report.target_page}</span></span>
+            <span className="text-center">Result</span>
+            <span>New clip</span>
+          </div>
+
+          {claims.length === 0 ? (
+            <p className="text-sm text-stone-600">
+              {report.band === "duplicate"
+                ? "Almost every term in this clip is already on the page, so it was not compared claim by claim."
+                : "No claim-level detail for this comparison."}
+            </p>
+          ) : claims.map((c, i) => {
+            const v = VERDICT_META[c.verdict] || VERDICT_META.new;
+            const hot = c.verdict === "changed" || c.verdict === "conflicts";
+            return (
+              <div key={i} className={`grid grid-cols-1 md:grid-cols-[1fr_72px_1fr] gap-2 md:gap-3 rounded-xl border p-3 ${hot ? "border-amber-300 bg-amber-50/40" : "border-stone-200"}`}>
+                <div className="text-xs text-stone-600 min-w-0">
+                  {c.page_quote ? <q className="not-italic border-l-2 border-stone-300 pl-2 block">{c.page_quote}</q>
+                    : <span className="text-stone-300">Not on the page</span>}
+                </div>
+                <div className="md:text-center">
+                  <span className={`inline-block text-[10px] font-medium px-1.5 py-0.5 rounded border ${v.cls}`}>{v.label}</span>
+                </div>
+                <div className="text-xs text-stone-900 min-w-0">{c.claim}</div>
+              </div>
+            );
+          })}
+
+          <button onClick={() => setShowPage(v => !v)} className="text-xs text-orange-600 hover:underline">
+            {showPage ? "Hide full page" : "Read full page"}
+          </button>
+          {showPage && (
+            <pre className="text-[11px] leading-relaxed whitespace-pre-wrap bg-stone-50 border border-stone-200 rounded-xl p-3 max-h-64 overflow-y-auto text-stone-700">
+              {pageText === null ? "Loading…" : pageText}
+            </pre>
+          )}
+        </div>
+
+        <div className="px-5 py-3 border-t border-stone-100 space-y-2">
+          {error && <p className="text-xs text-red-600">{error}</p>}
+          {confirmReplace && (
+            <p className="text-xs text-amber-800 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2">
+              This overwrites <span className="font-mono">{report.target_page}</span>. The old page is copied to <span className="font-mono">_wiki/meta/replaced/</span> first. Press Replace again to confirm.
+            </p>
+          )}
+          <div className="flex flex-wrap gap-2 justify-end">
+            {actions.map(a => {
+              const isRec = a.id === rec || (report.band === "duplicate" && a.id === "skip");
+              const isReplace = a.id === "replace";
+              const base = "px-3.5 py-2 rounded-xl text-sm font-medium disabled:opacity-40 ";
+              const tone = isRec ? "bg-stone-900 text-white hover:bg-stone-800"
+                : a.id === "skip" ? "border border-red-200 text-red-600 hover:bg-red-50"
+                : isReplace && confirmReplace ? "bg-amber-500 text-white hover:bg-amber-600"
+                : "border border-stone-300 text-stone-800 hover:bg-stone-100";
+              return (
+                <button key={a.id} title={a.hint} disabled={!!busy || stale}
+                  onClick={() => isReplace && !confirmReplace ? setConfirmReplace(true) : resolve(a.id)}
+                  className={base + tone}>
+                  {busy === a.id ? "Working…" : isReplace && confirmReplace ? "Confirm replace" : a.label}
+                  {isRec && busy !== a.id && <span className="ml-1.5 text-[10px] opacity-70">suggested</span>}
+                </button>
+              );
+            })}
+          </div>
+          <p className="text-[10px] text-stone-400 text-right">Nothing is written until you pick an action. Esc closes.</p>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function QueueSection({ onApproved, onExtractPreview }) {
   const [items, setItems] = useState([]);
   const [loaded, setLoaded] = useState(false);
@@ -214,6 +428,7 @@ function QueueSection({ onApproved, onExtractPreview }) {
   const [batchResult, setBatchResult] = useState(null);
   const [extractError, setExtractError] = useState(null); // { id, message }
   const [lastAction, setLastAction] = useState(null); // { type: 'saved'|'skipped', title, time }
+  const [reviewItem, setReviewItem] = useState(null);     // item open in ConflictReviewModal
 
   async function loadQueue() {
     try {
@@ -264,7 +479,9 @@ function QueueSection({ onApproved, onExtractPreview }) {
   }
 
   async function handleApprove(id) {
-    const title = items.find(i => i.id === id)?.title || "item";
+    const queued = items.find(i => i.id === id);
+    if (needsReview(queued?.conflict_report)) { setReviewItem(queued); return; }
+    const title = queued?.title || "item";
     setApprovingId(id);
     setActionError("");
     try {
@@ -295,6 +512,10 @@ function QueueSection({ onApproved, onExtractPreview }) {
     const selectedItems = items.filter(item => selectedIds.has(item.id));
     if (approved && selectedItems.some(item => item.pending_extraction || item.extraction_error)) {
       setActionError("Pending or failed extractions cannot be approved. Remove them from the selection or reject them.");
+      return;
+    }
+    if (approved && selectedItems.some(item => needsReview(item.conflict_report))) {
+      setActionError("Some selected clips overlap or conflict with an existing page. Open each one with Review and choose an action.");
       return;
     }
     const verb = approved ? "approve" : "reject";
@@ -331,7 +552,12 @@ function QueueSection({ onApproved, onExtractPreview }) {
       await api(`/approve/${item.id}`, { method: "POST", body: JSON.stringify({ approved: false }) });
       const data = await api("/ingest-direct", { method: "POST", body: JSON.stringify({ url: item.url, force: true }) });
       await loadQueue();
-      setLastAction({ type: "saved", title: data.title || item.url, time: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) });
+      const time = new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+      const title = data.title || item.url;
+      // ADR 7: Save now does not write a clip that needs a decision
+      if (data.queued === false) setLastAction({ type: "duplicate", title: `${title} (already in ${data.page || "your wiki"})`, time });
+      else if (data.needs_review) setLastAction({ type: "review", title, time });
+      else setLastAction({ type: "saved", title, time });
     } catch (e) {
       try { await api("/queue-url", { method: "POST", body: JSON.stringify({ url: item.url, force: true }) }); } catch (_) {}
       await loadQueue();
@@ -374,8 +600,8 @@ function QueueSection({ onApproved, onExtractPreview }) {
             Queue: {loaded ? items.length : "…"}
           </div>
           {lastAction && (
-            <span className={`text-xs ${lastAction.type === "saved" ? "text-emerald-600" : "text-stone-400"}`}>
-              {lastAction.type === "saved" ? "✓ Saved" : "Skipped"} · {lastAction.title.slice(0, 30)}{lastAction.title.length > 30 ? "…" : ""} · {lastAction.time}
+            <span className={`text-xs ${lastAction.type === "saved" ? "text-emerald-600" : lastAction.type === "review" ? "text-amber-600" : "text-stone-400"}`}>
+              {{ saved: "✓ Saved", review: "Needs your review", duplicate: "Not saved" }[lastAction.type] || "Skipped"} · {lastAction.title.slice(0, 30)}{lastAction.title.length > 30 ? "…" : ""} · {lastAction.time}
             </span>
           )}
         </div>
@@ -448,13 +674,14 @@ function QueueSection({ onApproved, onExtractPreview }) {
                     <span className="text-[10px] font-medium px-1.5 py-0.5 rounded bg-red-100 text-red-600">Fetch failed</span>
                   )}
                   <span className="text-sm font-medium text-stone-800 truncate">{title}</span>
+                  <BandBadge report={item.conflict_report} />
                 </div>
                 {page && page !== "unprocessed" && <span className="text-xs font-mono text-stone-400">/{page}</span>}
               </div>
               {!isPending && !item.extraction_error && (
                 <button onClick={(event) => { event.stopPropagation(); handleApprove(item.id); }} disabled={isBusy || batchBusy}
                   className="shrink-0 px-2.5 py-1.5 bg-stone-900 text-white rounded-lg text-[11px] font-semibold hover:bg-stone-800 disabled:opacity-40">
-                  {approvingId === item.id ? "Saving…" : "Approve"}
+                  {approvingId === item.id ? "Saving…" : needsReview(item.conflict_report) ? "Resolve" : "Approve"}
                 </button>
               )}
               <button onClick={(event) => { event.stopPropagation(); handleReject(item.id); }} disabled={isBusy || batchBusy}
@@ -466,6 +693,9 @@ function QueueSection({ onApproved, onExtractPreview }) {
 
             {isExpanded && (
               <div className="border-t border-stone-100">
+                {!isPending && item.conflict_report && item.conflict_report.band !== "distinct" && (
+                  <div className="px-4 pt-3"><ConflictBanner report={item.conflict_report} onReview={() => setReviewItem(item)} /></div>
+                )}
                 {isPending ? (
                   <div className="px-4 py-3 text-xs text-stone-500">
                     <span className="font-mono text-stone-400 break-all">{item.url}</span>
@@ -545,6 +775,19 @@ function QueueSection({ onApproved, onExtractPreview }) {
           </div>
         );
       })}
+      {reviewItem && (
+        <ConflictReviewModal
+          item={reviewItem}
+          onClose={() => setReviewItem(null)}
+          onResolved={async (action) => {
+            const done = reviewItem;
+            setReviewItem(null);
+            await loadQueue();
+            if (action !== "skip") onApproved?.();
+            setLastAction({ type: action === "skip" ? "skipped" : "saved", title: done.title || "item", time: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) });
+          }}
+        />
+      )}
     </div>
   );
 }
@@ -639,6 +882,8 @@ function IngestTab({ onApproved, onSwitchToChat, onOpenPage }) {
   const [error, setError] = useState("");
   const [approving, setApproving] = useState(false);
   const [done, setDone] = useState(null);
+  const [duplicate, setDuplicate] = useState(null);   // capture skipped: already in the wiki
+  const [reviewOpen, setReviewOpen] = useState(false);
   const [openThread, setOpenThread] = useState(false);
   const [questionNudge, setQuestionNudge] = useState(false);
   const fileRef = useRef();
@@ -742,9 +987,9 @@ function IngestTab({ onApproved, onSwitchToChat, onOpenPage }) {
 
   function removeImage(idx) { setImages(prev => prev.filter((_, i) => i !== idx)); }
 
-  async function handleProcess() {
+  async function handleProcess(force = false) {
     if (!input.trim() && !images.length) return;
-    setError(""); setPreview(null); setDone(null); setQuestionNudge(false);
+    setError(""); setPreview(null); setDone(null); setDuplicate(null); setQuestionNudge(false);
 
     // Intercept question-like text — don't waste an ingest call on it
     if (!images.length && looksLikeQuestion(input)) {
@@ -767,7 +1012,7 @@ function IngestTab({ onApproved, onSwitchToChat, onOpenPage }) {
       if (!images.length && looksLikeMarkdownClip(trimmed)) {
         const timed = await timedApi("ingest_markdown", "/ingest-markdown", {
           method: "POST",
-          body: JSON.stringify({ markdown: trimmed }),
+          body: JSON.stringify({ markdown: trimmed, force }),
         });
         data = timed.result;
         data.client_latency = {
@@ -777,6 +1022,7 @@ function IngestTab({ onApproved, onSwitchToChat, onOpenPage }) {
       } else {
         if (firstLine.startsWith("http://") || firstLine.startsWith("https://")) body.url = firstLine;
         else if (trimmed) body.text = trimmed;
+        if (force) body.force = true;
 
         if (images.length) {
           body.images = images.map(({ data, mediaType }) => ({ data, mediaType }));
@@ -813,6 +1059,7 @@ function IngestTab({ onApproved, onSwitchToChat, onOpenPage }) {
           };
         }
       }
+      if (data.queued === false) { setDuplicate(data); return; }
       setPreview(data); setEdits(null);
     } catch (e) { setError(e.message); }
     finally { setLoading(false); }
@@ -844,6 +1091,7 @@ function IngestTab({ onApproved, onSwitchToChat, onOpenPage }) {
 
   async function handleApprove(approved) {
     if (!preview) return;
+    if (approved && needsReview(preview.conflict_report)) { setReviewOpen(true); return; }
     setApproving(true); setError("");
     try {
       const body = { approved, open_thread: approved && openThread };
@@ -875,6 +1123,14 @@ function IngestTab({ onApproved, onSwitchToChat, onOpenPage }) {
       setQueueKey(k => k + 1);
     } catch (e) { setError(e.message); }
     finally { setApproving(false); }
+  }
+
+  function handlePreviewResolved(action) {
+    setReviewOpen(false);
+    setDone(action === "skip" ? "Skipped." : `Saved (${{ append: "added to page", replace: "page replaced, old copy archived", keep_both: "kept as a new page" }[action]})`);
+    setPreview(null); setEdits(null); setInput(""); setImages([]); setUserNotes(""); setOpenThread(false);
+    if (action !== "skip") onApproved?.();
+    setQueueKey(k => k + 1);
   }
 
   function startEditing() {
@@ -1123,7 +1379,7 @@ function IngestTab({ onApproved, onSwitchToChat, onOpenPage }) {
                 ) : "Save image"}
               </button>
             )}
-            <button onClick={handleProcess} disabled={loading || (!input.trim() && !images.length)}
+            <button onClick={() => handleProcess()} disabled={loading || (!input.trim() && !images.length)}
               className="px-5 py-2 bg-orange-500 text-white rounded-xl text-sm font-medium hover:bg-orange-600 disabled:opacity-40 disabled:cursor-not-allowed transition-colors shadow-sm">
               {loading ? (
                 <span className="flex items-center gap-2">
@@ -1191,6 +1447,36 @@ function IngestTab({ onApproved, onSwitchToChat, onOpenPage }) {
         </div>
       )}
 
+      {duplicate && (
+        <div className="bg-stone-50 border border-stone-200 rounded-2xl px-4 py-3 space-y-2">
+          <div className="flex items-start gap-3">
+            <div className="flex-1 min-w-0">
+              <div className="text-sm font-semibold text-stone-800">Already in your wiki</div>
+              <p className="text-xs text-stone-600 mt-0.5">{duplicate.message}</p>
+            </div>
+            <button onClick={() => setDuplicate(null)} aria-label="Dismiss" className="text-stone-400 hover:text-stone-700 text-lg leading-none">×</button>
+          </div>
+          {(duplicate.matches || []).slice(0, 3).map((m, i) => (
+            <div key={i} className="grid md:grid-cols-2 gap-2 text-xs">
+              <div className="text-stone-900">{m.claim}</div>
+              {m.page_quote && <q className="not-italic border-l-2 border-stone-300 pl-2 text-stone-500">{m.page_quote}</q>}
+            </div>
+          ))}
+          <div className="flex gap-2 justify-end">
+            {duplicate.page && onOpenPage && (
+              <button onClick={() => onOpenPage(duplicate.page)} className="px-3 py-1.5 border border-stone-300 rounded-lg text-xs text-stone-800 hover:bg-stone-100">
+                Open {duplicate.page}
+              </button>
+            )}
+            <button onClick={() => handleProcess(true)} disabled={loading}
+              className="px-3 py-1.5 bg-stone-900 text-white rounded-lg text-xs font-semibold hover:bg-stone-800 disabled:opacity-40">
+              {loading ? "Processing…" : "Add anyway"}
+            </button>
+          </div>
+          <p className="text-[10px] text-stone-400 text-right">Your text is still in the box. Nothing was dropped.</p>
+        </div>
+      )}
+
       {inboxStatus && (
         <div className="bg-stone-50 border border-stone-200 rounded-xl px-3 py-2.5 text-xs text-stone-600">
           <div className="flex flex-wrap gap-x-3 gap-y-1">
@@ -1226,6 +1512,18 @@ function IngestTab({ onApproved, onSwitchToChat, onOpenPage }) {
                 </p>
               </div>
             </div>
+          )}
+
+          {preview.conflict_report && preview.conflict_report.band !== "distinct" && (
+            <div className="px-5 pt-4"><ConflictBanner report={preview.conflict_report} onReview={() => setReviewOpen(true)} /></div>
+          )}
+          {reviewOpen && (
+            <ConflictReviewModal
+              item={{ id: preview.id, title: display.title, conflict_report: preview.conflict_report }}
+              extraBody={{ open_thread: openThread, ...(edits ? { edits } : {}) }}
+              onClose={() => setReviewOpen(false)}
+              onResolved={handlePreviewResolved}
+            />
           )}
 
           {/* Share Sheet badge — only shown if background extraction hasn't finished yet */}

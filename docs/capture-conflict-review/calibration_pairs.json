@@ -1,0 +1,749 @@
+{
+ "readme": "Proposed labels for threshold calibration. Edit `label` to correct, set `reviewed` true. Bands: duplicate, overlap, conflict, distinct. `hide_pages` are removed from the vault copy before comparing so the clip's own page cannot match itself. `proposed_label` is the original guess. `label` is my best judgement after the first run. Pairs p08, p10, p22, p26, p27 changed. Please check every pair, not only those.",
+ "pairs": [
+  {
+   "id": "p01",
+   "how_built": "duplicate: real source summary vs the page it was written to",
+   "clip_title": "Attention Residuals (MoonshotAI)",
+   "clip_claims": [
+    "MoonshotAI proposes 'Attention Residuals,' a modification to standard transformer attention that introduces residual-style connections within or around the attention computation to improve training dynamics.",
+    "Residual connections applied specifically to the attention sublayer can improve gradient flow and model expressivity without fundamentally changing the transformer block structure.",
+    "This technique is relevant to large-scale LLM training, with potential benefits in stability and performance for models at the scale Moonshot operates."
+   ],
+   "suggested_page": "attention-residuals",
+   "hide_pages": [],
+   "proposed_label": "duplicate",
+   "label": "duplicate",
+   "reviewed": false,
+   "note": "own-page containment 1.00",
+   "source_file": "2026-04-07-attention-residuals-moonshotai.md"
+  },
+  {
+   "id": "p02",
+   "how_built": "duplicate: real source summary vs the page it was written to",
+   "clip_title": "Vision Language Models: Multimodal AI Systems",
+   "clip_claims": [
+    "VLMs combine a Vision Encoder with an LLM backbone, enabling the processing of images and videos alongside text. This dual-stream architecture facilitates visual reasoning capabilities.",
+    "I discovered VLMs extend beyond image description into document understanding and robotics control, making them practical for extracting structured data from PDFs, charts, and screen-based agent navigation.",
+    "Popular VLM implementations such as GPT-4o, LLaVA, and CLIP employ varying architectural approaches. CLIP focuses on text-image association for embedding generation, while GPT-4o and LLaVA enable generative tasks including visual question answering and image captioning."
+   ],
+   "suggested_page": "vision-language-models",
+   "hide_pages": [],
+   "proposed_label": "duplicate",
+   "label": "duplicate",
+   "reviewed": false,
+   "note": "own-page containment 1.00",
+   "source_file": "2026-04-18-vision-language-models-multimodal-ai-systems.md"
+  },
+  {
+   "id": "p03",
+   "how_built": "duplicate: real source summary vs the page it was written to",
+   "clip_title": "World Models: Building Internal Representations for Embodied AI",
+   "clip_claims": [
+    "World models differ fundamentally from LLMs—they predict physical outcomes by training on video and sensor data rather than text, enabling agents to simulate and reason about the environment.",
+    "World models allow agents to 'think ahead' by imagining consequences of actions before execution, similar to chess planning, which makes them safer and more efficient for robotics and autonomous driving.",
+    "World models are considered essential for AGI because they enable common sense reasoning about what's physically possible—a capability that pure text-based models lack.",
+    "World models serve as surrogate training grounds, allowing AI systems to learn in simulation before costly or dangerous real-world deployment."
+   ],
+   "suggested_page": "world-models",
+   "hide_pages": [],
+   "proposed_label": "duplicate",
+   "label": "duplicate",
+   "reviewed": false,
+   "note": "own-page containment 1.00",
+   "source_file": "2026-04-18-world-models-building-internal-representations-for-embodied-.md"
+  },
+  {
+   "id": "p04",
+   "how_built": "duplicate: real source summary vs the page it was written to",
+   "clip_title": "JEPA: Joint-Embedding Predictive Architecture",
+   "clip_claims": [
+    "JEPA predicts changes in abstract embedding space rather than pixel-by-pixel, making it fundamentally different from generative models and more efficient at capturing semantic relationships.",
+    "I discovered the key advantage: JEPA ignores noisy low-level details (texture, lighting) and focuses on high-level invariants (object motion, relationships), resulting in more robust world understanding.",
+    "I understood the architecture uses dual encoders (context and target) that map inputs into a shared latent space, enabling self-supervised learning without explicit label requirements."
+   ],
+   "suggested_page": "jepa-joint-embedding-predictive-architecture",
+   "hide_pages": [],
+   "proposed_label": "duplicate",
+   "label": "duplicate",
+   "reviewed": false,
+   "note": "own-page containment 1.00",
+   "source_file": "2026-04-20-jepa-joint-embedding-predictive-architecture.md"
+  },
+  {
+   "id": "p05",
+   "how_built": "duplicate: real source summary vs the page it was written to",
+   "clip_title": "Hands-On Learning Path for IoT Development",
+   "clip_claims": [
+    "I learn IoT fastest through building real projects incrementally, starting simple (sensors, smart home) and increasing complexity to develop troubleshooting skills.",
+    "I need to master three pillars: hardware (microcontrollers), programming languages (Python for rapid iteration, C for efficiency), and networking protocols for device connectivity.",
+    "I should embed security practices from day one—encryption, authentication, secure coding—rather than adding it as an afterthought, and document everything on GitHub to build a portfolio."
+   ],
+   "suggested_page": "iot-hands-on-learning",
+   "hide_pages": [],
+   "proposed_label": "duplicate",
+   "label": "duplicate",
+   "reviewed": false,
+   "note": "own-page containment 1.00",
+   "source_file": "2026-04-25-hands-on-learning-path-for-iot-development.md"
+  },
+  {
+   "id": "p06",
+   "how_built": "duplicate: real source summary vs the page it was written to",
+   "clip_title": "Raspberry Pi: Low-Cost Single-Board Computer for Education & Projects",
+   "clip_claims": [
+    "Raspberry Pi is a credit-card-sized computer priced $5-$55+, designed to democratize computing education through low cost and accessibility.",
+    "I discovered GPIO pins unlock hardware integration—I can connect sensors, motors, and components directly for robotics, smart home, and IoT projects.",
+    "Raspberry Pi occupies a position between microcontrollers (like ESP32 Pico) and full PCs—it runs Linux natively, making it ideal for media centers, retro gaming, and automation without sacrificing ease of use."
+   ],
+   "suggested_page": "raspberry-pi-single-board-computer",
+   "hide_pages": [],
+   "proposed_label": "duplicate",
+   "label": "duplicate",
+   "reviewed": false,
+   "note": "own-page containment 1.00",
+   "source_file": "2026-04-25-raspberry-pi-low-cost-single-board-computer-for-education-pr.md"
+  },
+  {
+   "id": "p07",
+   "how_built": "duplicate: real source summary vs the page it was written to",
+   "clip_title": "Load Balancer: Traffic Distribution and High Availability",
+   "clip_claims": [
+    "A load balancer sits between users and web servers, exposing only a public IP to the outside world while routing traffic to servers via private IPs. Web servers are never directly reachable from the internet, which improves security.",
+    "Private IPs are only reachable within the same internal network. Even if an attacker knows a server's private IP, it cannot be reached over the public internet.",
+    "Load balancers solve the single-point-of-failure problem: if one server goes offline, all traffic automatically reroutes to remaining servers, keeping the site live while a replacement server is provisioned.",
+    "Horizontal scaling becomes seamless with a load balancer. Adding more servers to the pool is sufficient, and the load balancer automatically begins distributing requests to new nodes without any DNS or client-side changes.",
+    "Solving the web tier with a load balancer exposes the next bottleneck: the database tier still has no failover or redundancy, which is why database replication becomes the logical next step in scaling architecture."
+   ],
+   "suggested_page": "load-balancer-fundamentals",
+   "hide_pages": [],
+   "proposed_label": "duplicate",
+   "label": "duplicate",
+   "reviewed": false,
+   "note": "own-page containment 1.00",
+   "source_file": "2026-05-11-load-balancer-traffic-distribution-and-high-availability.md"
+  },
+  {
+   "id": "p08",
+   "how_built": "duplicate: real source summary vs the page it was written to",
+   "clip_title": "Relational vs Non-Relational Databases in System Design",
+   "clip_claims": [
+    "Separating the web/mobile traffic server (web tier) from the database server (data tier) allows each to be scaled independently, a foundational system design pattern.",
+    "Relational databases (RDBMS/SQL) like MySQL and PostgreSQL store data in tables and rows, and support JOIN operations across tables, making them ideal for structured, relational data.",
+    "NoSQL databases like Cassandra, DynamoDB, and Neo4j fall into four categories: key-value stores, graph stores, column stores, and document stores, each optimized for different access patterns.",
+    "DNS resolves a domain like www.mysite.com to an IP address, and the web server then handles both browser and mobile API traffic before reading/writing to a separate database server.",
+    "Non-relational databases are preferred when join operations are not needed, and when horizontal scaling, flexible schemas, or very high throughput are priorities."
+   ],
+   "suggested_page": "relational-vs-nosql-databases",
+   "hide_pages": [],
+   "proposed_label": "duplicate",
+   "label": "overlap",
+   "reviewed": false,
+   "note": "own-page containment 1.00 | Corrected after the first run: 4 of 5 claims are not on the page now (the page was edited after this clip). Was: duplicate.",
+   "source_file": "2026-05-11-relational-vs-non-relational-databases-in-system-design.md"
+  },
+  {
+   "id": "p09",
+   "how_built": "duplicate: real source summary vs the page it was written to",
+   "clip_title": "What is Prompt Caching?",
+   "clip_claims": [
+    "Prompt caching avoids reprocessing identical prompt prefixes by storing the model's intermediate computation, reducing both API cost and latency — unlike conventional caching which stores deterministic data outputs.",
+    "Two distinct caching strategies exist: exact-match caching (requires identical prompt + parameters) and semantic caching (uses embeddings to find similar prompts), each with different tradeoffs in precision vs. flexibility.",
+    "Cache invalidation represents a critical weakness — cached responses can go stale when underlying data changes, model versions update, or context shifts in multi-turn conversations, making it unreliable for dynamic or real-time queries.",
+    "Prompt caching delivers compounding benefits at scale: fewer API calls, lower token counts (both input and output), reduced server load, and consistent responses across identical queries — making it especially valuable for high-traffic chatbots and RAG pipelines.",
+    "Implementation via LangChain integrates caching with other LLM components (memory, retrieval, tool use) rather than treating it as a standalone layer, which simplifies building production-grade cached LLM applications."
+   ],
+   "suggested_page": "prompt-caching",
+   "hide_pages": [],
+   "proposed_label": "duplicate",
+   "label": "duplicate",
+   "reviewed": false,
+   "note": "own-page containment 1.00",
+   "source_file": "2026-05-14-what-is-prompt-caching.md"
+  },
+  {
+   "id": "p10",
+   "how_built": "duplicate: real source summary vs the page it was written to",
+   "clip_title": "Defining Prompts in MCP Servers",
+   "clip_claims": [
+    "MCP prompts are curated instruction templates that MCP servers expose to clients, allowing users to benefit from expert-crafted, tested prompts rather than writing their own from scratch.",
+    "Prompts in MCP use a decorator pattern similar to tools, returning a list of Message objects (UserMessage, AssistantMessage) that get sent directly to Claude, enabling multi-turn conversation flows.",
+    "The MCP Inspector tool enables testing and validation of prompts before deployment, displaying exactly how variables interpolate and how messages will be presented to Claude.",
+    "Well-designed domain-specific prompts provide consistency, encode expertise, and enable reusability across multiple client applications while centralizing maintenance in one place."
+   ],
+   "suggested_page": "mcp-prompts-and-templates",
+   "hide_pages": [],
+   "proposed_label": "duplicate",
+   "label": "overlap",
+   "reviewed": false,
+   "note": "own-page containment 1.00 | Corrected after the first run: the MCP Inspector claim is not on the page. 3 of 4 claims are same. Was: duplicate.",
+   "source_file": "2026-05-16-defining-prompts-in-mcp-servers.md"
+  },
+  {
+   "id": "p11",
+   "how_built": "conflict: real summary with one number doubled (or negated) vs its page",
+   "clip_title": "AI-Native Databases: Converged Storage for Enterprise AI and Agentic Workflows",
+   "clip_claims": [
+    "AI-native databases (e.g., Oracle AI Database 52ai) embed vector search, ML inference, and relational queries in a single engine, eliminating the need for separate vector stores and reducing latency and security overhead.",
+    "Select AI and similar NL-to-SQL features allow business users to query enterprise data in plain English, abstracting SQL complexity while maintaining explainability and transactional integrity.",
+    "Converged platforms (Oracle, PostgreSQL + pgvector, Azure SQL, AlloyDB) balance unified security governance with specialized alternatives (Pinecone, Milvus) that optimize for pure vector/embedding workloads at massive scale.",
+    "Private agent factories enable secure, data-resident agentic AI workflows without third-party data movement, critical for regulated enterprises building autonomous systems over proprietary datasets."
+   ],
+   "suggested_page": "ai-native-databases-for-agentic-workflows",
+   "hide_pages": [],
+   "proposed_label": "conflict",
+   "label": "conflict",
+   "reviewed": false,
+   "note": "constructed. Original bullets are on the page, one claim now disagrees",
+   "source_file": "2026-05-25-ai-native-databases-converged-storage-for-enterprise-ai-and-.md"
+  },
+  {
+   "id": "p12",
+   "how_built": "conflict: real summary with one number doubled (or negated) vs its page",
+   "clip_title": "Computational requirements and hardware for training large language models",
+   "clip_claims": [
+    "Training large generative models requires enormous computational budgets measured in FLOPs — PaLM-4 required 10^22 FLOPs, which would take a single H100 GPU approximately 5.5 years to complete.",
+    "Specialized hardware like Nvidia GPUs (H100, A100, A10) and TPUs deliver peak performance in TFLOP/S, with the H100 reaching 60 TFLOP/S, but training state-of-the-art models still costs tens to hundreds of millions of dollars.",
+    "Distributed training across thousands of machines in parallel is essential to make large-scale model training feasible, spreading computational workload and reducing wall-clock training time.",
+    "Recent advances in GenAI capability have been driven primarily by hardware improvements and distributed training techniques rather than algorithmic breakthroughs, enabling training of models with billions of parameters."
+   ],
+   "suggested_page": "gpu-tpu-compute-for-genai-training",
+   "hide_pages": [],
+   "proposed_label": "conflict",
+   "label": "conflict",
+   "reviewed": false,
+   "note": "constructed. Original bullets are on the page, one claim now disagrees",
+   "source_file": "2026-05-25-computational-requirements-and-hardware-for-training-large-l.md"
+  },
+  {
+   "id": "p13",
+   "how_built": "conflict: real summary with one number doubled (or negated) vs its page",
+   "clip_title": "Evolution from Pre-training Scaling to Inference-Time Scaling Laws",
+   "clip_claims": [
+    "The industry has shifted the scaling bottleneck from pre-training compute (model size and training data) to inference compute (time spent reasoning at test-time). Models like o2/o3 and DeepSeek-R1 demonstrate that more test-time compute scales performance linearly or exponentially on complex tasks, even with smaller base models.",
+    "System 2 reasoning (recursive chains-of-thought, self-correction, solution-tree exploration) replaces System 1 token prediction as the primary mechanism for capability gains. This enables models to 'think longer' rather than requiring larger parameter counts.",
+    "Small Language Models (under 15B parameters) achieve frontier performance through deliberate over-training on synthetic, high-quality data generated by larger models (knowledge distillation), breaking Chinchilla's compute-optimal scaling law to achieve commercially viable inference costs.",
+    "Sparse Mixture-of-Experts architectures (e.g., DeepSeek V3 with 671B total parameters but 37B active per token) decouple model capacity from computational cost by selectively activating expert submodules, combining large-model capacity with small-model inference efficiency."
+   ],
+   "suggested_page": "inference-scaling-laws",
+   "hide_pages": [],
+   "proposed_label": "conflict",
+   "label": "conflict",
+   "reviewed": false,
+   "note": "constructed. Original bullets are on the page, one claim now disagrees",
+   "source_file": "2026-05-25-evolution-from-pre-training-scaling-to-inference-time-scalin.md"
+  },
+  {
+   "id": "p14",
+   "how_built": "conflict: real summary with one number doubled (or negated) vs its page",
+   "clip_title": "Small Language Models and Sparse MoE: The 2026 Scaling Paradigm Shift",
+   "clip_claims": [
+    "Chinchilla's compute-optimal training rules (14B params ≈ 140B tokens) are deliberately violated in practice: models like Llama and Mistral are trained on 3–5 trillion tokens instead, increasing upfront cost but dramatically improving downstream performance and inference efficiency.",
+    "Knowledge distillation from frontier models (GPT-4) into SLM training data enables sub-15B parameter models to retain capabilities previously requiring 100B+ parameters, accelerating learning on synthetic high-quality text rather than raw internet data.",
+    "Sparse Mixture-of-Experts architectures (e.g., DeepSeek V3's 671B total / 37B active parameters per token) decouple model capacity from runtime cost by conditionally activating expert subnetworks, functioning as specialist routing rather than dense computation.",
+    "2026 scaling paradigm prioritizes inference-time and test-time compute (reasoning tokens, chain-of-thought generation) over pre-training scale, contrasting sharply with 2022's emphasis on bigger models and raw data volume."
+   ],
+   "suggested_page": "slm-and-moe-scaling-paradigm-shift",
+   "hide_pages": [],
+   "proposed_label": "conflict",
+   "label": "conflict",
+   "reviewed": false,
+   "note": "constructed. Original bullets are on the page, one claim now disagrees",
+   "source_file": "2026-05-25-small-language-models-and-sparse-moe-the-2026-scaling-paradi.md"
+  },
+  {
+   "id": "p15",
+   "how_built": "conflict: real summary with one number doubled (or negated) vs its page",
+   "clip_title": "Data Collection and Augmentation for GenAI Models",
+   "clip_claims": [
+    "GenAI models require vast training datasets (e.g., Llama 6 trained on 15 trillion tokens / 50TB) to learn complex patterns due to their parameter scale; collection involves scraping diverse sources including websites, social media, and forums.",
+    "Synthetic data generation using existing models to augment training datasets offers scalability and improved diversity but introduces risks: quality degradation, representation gaps, and divergence from real-world distributions.",
+    "Data preparation in GenAI shifts focus from traditional feature engineering to three pillars: collecting massive raw datasets, ensuring quality and safety through cleaning, and implementing efficient storage/retrieval systems for scale."
+   ],
+   "suggested_page": "data-preparation-for-genai",
+   "hide_pages": [],
+   "proposed_label": "conflict",
+   "label": "conflict",
+   "reviewed": false,
+   "note": "constructed. Original bullets are on the page, one claim now disagrees",
+   "source_file": "2026-05-26-data-collection-and-augmentation-for-genai-models.md"
+  },
+  {
+   "id": "p16",
+   "how_built": "conflict: real summary with one number doubled (or negated) vs its page",
+   "clip_title": "Data Efficiency: Storage and Retrieval Techniques",
+   "clip_claims": [
+    "Distributed storage systems (HDFS, S6) and columnar formats (Parquet, ORC) enable cost-effective storage and fast analytics on massive datasets across multiple machines.",
+    "Data retrieval efficiency during ML training relies on sharding for parallel access, indexing (Lucene, Elasticsearch) for fast lookups, and caching to minimize I/O latency.",
+    "Storage optimization requires matching the tool to data shape: distributed systems for unstructured data at scale, columnar formats for structured analytics workloads."
+   ],
+   "suggested_page": "data-efficiency-storage-and-retrieval",
+   "hide_pages": [],
+   "proposed_label": "conflict",
+   "label": "conflict",
+   "reviewed": false,
+   "note": "constructed. Original bullets are on the page, one claim now disagrees",
+   "source_file": "2026-05-26-data-efficiency-storage-and-retrieval-techniques.md"
+  },
+  {
+   "id": "p17",
+   "how_built": "conflict: real summary with one number doubled (or negated) vs its page",
+   "clip_title": "Optimization Techniques for Large-Scale Model Training",
+   "clip_claims": [
+    "Gradient checkpointing reduces GPU memory usage during training by storing only a subset of activations and recomputing missing ones during backpropagation, enabling training of larger models on memory-constrained hardware.",
+    "Mixed precision training combines 32-bit and 32-bit floating point operations to accelerate computation and reduce memory footprint while maintaining training accuracy; AMP automatically optimizes precision selection across operations.",
+    "Distributed training across multiple machines becomes necessary for models exceeding single-GPU capacity; parallelization strategies (data parallelism, model parallelism, pipeline parallelism) enable efficient scaling of training workloads.",
+    "Task-specific optimization like latent diffusion and parallelization techniques address resource constraints in computationally demanding domains such as video generation without sacrificing model quality."
+   ],
+   "suggested_page": "optimization-techniques-for-large-scale-model-training",
+   "hide_pages": [],
+   "proposed_label": "conflict",
+   "label": "conflict",
+   "reviewed": false,
+   "note": "constructed. Original bullets are on the page, one claim now disagrees",
+   "source_file": "2026-05-27-optimization-techniques-for-large-scale-model-training.md"
+  },
+  {
+   "id": "p18",
+   "how_built": "conflict: real summary with one number doubled (or negated) vs its page",
+   "clip_title": "Agent Looping: Three Tiers of Autonomy",
+   "clip_claims": [
+    "Agent looping is an autonomous cycle where the model drives iteration without per-step prompting: discovery → planning → execution → verification → iteration, looping until a terminal condition is met.",
+    "Tier 2 (normal GenAI) is one stateless API call; Tier 2 (agentic) gives the model tool-calling ability while you own the harness loop and decide stop conditions; Tier 3 (true agent loop) delegates goal definition and iteration strategy to the model with only the terminal condition specified.",
+    "Tier 2 iteration depends on response.stop_reason (end_turn, tool_use, max_tokens) and response.content blocks to decide whether to halt or execute tools and feed results back into the conversation.",
+    "Tier 3 applies to tasks with measurable termination conditions that cannot be evaluated in a single pass—queue processing, iterative testing, multi-step problem solving—where the model autonomously selects next steps."
+   ],
+   "suggested_page": "agent-looping-autonomy-tiers",
+   "hide_pages": [],
+   "proposed_label": "conflict",
+   "label": "conflict",
+   "reviewed": false,
+   "note": "constructed. Original bullets are on the page, one claim now disagrees",
+   "source_file": "2026-06-09-agent-looping-three-tiers-of-autonomy.md"
+  },
+  {
+   "id": "p19",
+   "how_built": "conflict: real summary with one number doubled (or negated) vs its page",
+   "clip_title": "Closed Loop vs Open Loop in Agentic AI Systems",
+   "clip_claims": [
+    "Closed-loop systems define deterministic stop conditions (pytest passes, queue empty, PR merged) and constrain the model's search space within a designed framework; they are repeatable and cheap because the eval gate prevents drift.",
+    "Open-loop systems grant the model full autonomy to discover paths and explore unknown search spaces, but lack objective success criteria and incur massive token costs; only viable when exploration value exceeds budget constraints.",
+    "Fleet-loop architecture parallelizes work across specialized agent hierarchies (orchestrator + specialists + subagents) to reduce wall-clock time and leverage domain expertise; cost multiplies by fleet size and only justifies itself when sequential execution is genuinely infeasible.",
+    "System selection hinges on task structure: fixed outputs map to Tier 2, bounded events to Tier 2, measurable conditions with unknown steps to closed-loop Tier 3, and exploratory research to open-loop Tier 3; misclassification causes token burn or vague prompt failure modes."
+   ],
+   "suggested_page": "closed-loop-vs-open-loop-agent-control",
+   "hide_pages": [],
+   "proposed_label": "conflict",
+   "label": "conflict",
+   "reviewed": false,
+   "note": "constructed. Original bullets are on the page, one claim now disagrees",
+   "source_file": "2026-06-09-closed-loop-vs-open-loop-in-agentic-ai-systems.md"
+  },
+  {
+   "id": "p20",
+   "how_built": "conflict: real summary with one number doubled (or negated) vs its page",
+   "clip_title": "DynamoDB: Schema-less vs Unstructured vs Relational",
+   "clip_claims": [
+    "DynamoDB is schema-less (flexible per-record structure) but structured (JSON with consistent fields), distinct from both unstructured storage and relational databases with enforced schemas.",
+    "DynamoDB excels for high-throughput transactional workloads (millions of writes/sec, single-digit ms reads) and evolving application payloads, making it suitable for chatbot backends where interaction schemas change frequently.",
+    "BI tools (Power BI, Tableau) cannot query DynamoDB directly due to lack of ODBC/JDBC drivers; analytics require manual ETL extraction and flattening.",
+    "Standard production pattern: DynamoDB → incremental Python ETL → data warehouse (Redshift, Snowflake, S6+Athena) → BI, replacing fragile CSV-based chains with a proper analytics layer."
+   ],
+   "suggested_page": "dynamodb-schema-less-architecture",
+   "hide_pages": [],
+   "proposed_label": "conflict",
+   "label": "conflict",
+   "reviewed": false,
+   "note": "constructed. Original bullets are on the page, one claim now disagrees",
+   "source_file": "2026-06-10-dynamodb-schema-less-vs-unstructured-vs-relational.md"
+  },
+  {
+   "id": "p21",
+   "how_built": "overlap: real summary vs the closest OTHER page (own page hidden)",
+   "clip_title": "Model Parallelism: Pipeline and Tensor Parallelism for Large-Scale Training",
+   "clip_claims": [
+    "Model parallelism splits a single model across multiple devices to handle models too large for single-device memory, addressing memory constraints fundamental to training very large models.",
+    "Pipeline parallelism (PP) distributes model layers across devices with pipelined forward/backward passes, maximizing device concurrency and reducing idle time in deep models.",
+    "Tensor parallelism (TP) splits operations within individual layers (via column-wise or row-wise matrix chunking), enabling intra-layer parallelization when single layers exceed memory capacity.",
+    "Hybrid parallelism combines data and model parallelism with optimizations like ZeRO and FSDP to reduce redundancy, improve communication efficiency, and scale training across hundreds of devices."
+   ],
+   "suggested_page": "optimization-techniques-for-large-scale-model-training",
+   "hide_pages": [
+    "model-parallelism-pipeline-tensor"
+   ],
+   "proposed_label": "overlap",
+   "label": "overlap",
+   "reviewed": false,
+   "note": "containment vs optimization-techniques-for-large-scale-model-training 0.75. Same topic, different content: check it",
+   "source_file": "2026-05-28-model-parallelism-pipeline-and-tensor-parallelism-for-large-.md"
+  },
+  {
+   "id": "p22",
+   "how_built": "overlap: real summary vs the closest OTHER page (own page hidden)",
+   "clip_title": "Model Training Fundamentals and Methodologies",
+   "clip_claims": [
+    "Model training adjusts weights to minimize loss; distinct architectures require tailored methodologies—diffusion models denoise iteratively, GANs use adversarial competition between generator and discriminator.",
+    "LLMs follow a three-stage pipeline: pretraining on large corpora for general patterns, supervised finetuning for task adaptation, and alignment to human values or intended behaviors.",
+    "Training methodology, data quality, loss function definition, and task-specific mitigations are interdependent levers that determine model performance and generalization."
+   ],
+   "suggested_page": "model-training-fundamentals",
+   "hide_pages": [
+    "model-training-methodology"
+   ],
+   "proposed_label": "overlap",
+   "label": "duplicate",
+   "reviewed": false,
+   "note": "containment vs model-training-fundamentals 0.74. Same topic, different content: check it | Corrected after the first run: all 3 claims restate the page in other words (weights/parameters). Was: overlap. Your call.",
+   "source_file": "2026-05-27-model-training-fundamentals-and-methodologies.md"
+  },
+  {
+   "id": "p23",
+   "how_built": "overlap: real summary vs the closest OTHER page (own page hidden)",
+   "clip_title": "Training Data and ML Objectives",
+   "clip_claims": [
+    "Training data varies by application and training stage—pretraining uses large public datasets (e.g., Common Crawl) while alignment uses expert-curated data, requiring explicit sourcing and size estimation.",
+    "The ML objective defines what the model optimizes for (e.g., next-token prediction in LLMs, image reconstruction in VAEs), while the loss function quantifies prediction error and guides parameter updates.",
+    "Loss function selection is critical but often uses existing functions rather than designing custom ones; it directly determines how well the optimization algorithm can improve model performance."
+   ],
+   "suggested_page": "loss-functions-and-ml-objectives",
+   "hide_pages": [
+    "training-data-and-loss-function-selection"
+   ],
+   "proposed_label": "overlap",
+   "label": "overlap",
+   "reviewed": false,
+   "note": "containment vs loss-functions-and-ml-objectives 0.67. Same topic, different content: check it",
+   "source_file": "2026-05-27-training-data-and-ml-objectives.md"
+  },
+  {
+   "id": "p24",
+   "how_built": "overlap: real summary vs the closest OTHER page (own page hidden)",
+   "clip_title": "RAG Evaluation: Stage-Level Quality Scoring and Right First Time",
+   "clip_claims": [
+    "RAG quality assessment disaggregates into retrieval stage (recall@k, context precision) and generation stage (faithfulness, answer relevance), enabling localized failure diagnosis.",
+    "Right First Time (RFT) quantifies rework burden: the gap between task success and RFT reveals the fraction of requests requiring retry, re-ask, or correction.",
+    "Stage-score patterns diagnose root cause: when faithfulness degrades while retrieval metrics hold steady, the fault lies in prompt engineering or model capability; when both degrade together, the retriever or index is the bottleneck."
+   ],
+   "suggested_page": "ai-observability-span-level-quality-scoring",
+   "hide_pages": [
+    "rag-evaluation-quality-scores"
+   ],
+   "proposed_label": "overlap",
+   "label": "overlap",
+   "reviewed": false,
+   "note": "containment vs ai-observability-span-level-quality-scoring 0.67. Same topic, different content: check it",
+   "source_file": "2026-09-28-rag-evaluation-stage-level-quality-scoring-and-right-first-t.md"
+  },
+  {
+   "id": "p25",
+   "how_built": "overlap: real summary vs the closest OTHER page (own page hidden)",
+   "clip_title": "Limited Direct Execution (LDE) Protocol in OS Kernels",
+   "clip_claims": [
+    "LDE kernel initialization at boot establishes trap table location via privileged instruction; CPU caches this address to route subsequent user-mode interrupts.",
+    "Process execution follows two-phase protocol: kernel sets up memory and process state, then uses return-from-trap to switch CPU to user mode; subsequent system calls trap back to kernel and return control symmetrically.",
+    "Process exit (explicit exit() or return from main) triggers kernel cleanup; trap mechanism ensures all transitions between user and kernel mode maintain CPU privilege boundaries."
+   ],
+   "suggested_page": "process-privilege-modes-and-system-calls",
+   "hide_pages": [
+    "limited-direct-execution"
+   ],
+   "proposed_label": "overlap",
+   "label": "overlap",
+   "reviewed": false,
+   "note": "containment vs process-privilege-modes-and-system-calls 0.65. Same topic, different content: check it",
+   "source_file": "2026-09-11-limited-direct-execution-lde-protocol-in-os-kernels.md"
+  },
+  {
+   "id": "p26",
+   "how_built": "overlap: real summary vs the closest OTHER page (own page hidden)",
+   "clip_title": "Self-Attention Mechanism in Transformers",
+   "clip_claims": [
+    "Self-attention converts input embeddings into three learnable vector projections—query (Q), key (K), and value (V)—using weight matrices W_Q, W_K, W_V to enable tokens to attend to all positions in a sequence.",
+    "Attention scores are computed via dot product QK^T, scaled by 1/√d_k to prevent gradient saturation, then normalized with softmax to produce weights for a weighted sum of value vectors.",
+    "The scaling factor 1/√d_k is critical: it prevents dot-product magnitudes from growing too large during backpropagation, which would otherwise compress gradients near zero in the softmax tail.",
+    "Self-attention addresses RNN/LSTM limitations by capturing long-range dependencies directly without sequential processing, enabling parallelization and better gradient flow across long sequences.",
+    "Q=XW_q, K=XW_k,  V=XW_v"
+   ],
+   "suggested_page": "phase-3-attention-and-transformers",
+   "hide_pages": [
+    "attention-mechanisms-in-transformer-architecture"
+   ],
+   "proposed_label": "overlap",
+   "label": "conflict",
+   "reviewed": false,
+   "note": "containment vs phase-3-attention-and-transformers 0.64. Same topic, different content: check it | Corrected after the first run: the clip explains the sqrt(d_k) scale as softmax saturation, the page says vanishing gradients. Was: overlap. Your call.",
+   "source_file": "2026-05-26-self-attention-mechanism-in-transformers.md"
+  },
+  {
+   "id": "p27",
+   "how_built": "overlap: real summary vs the closest OTHER page (own page hidden)",
+   "clip_title": "Agent Memory Core: Database as Primary Infrastructure",
+   "clip_claims": [
+    "Agent systems distribute memory across three layers: parametric memory in the LLM, semantic memory in embedding models, and persistent storage in databases.",
+    "The database functions as the agent memory core—the primary infrastructure handling the majority of data traffic, storage, retrieval, and optimization in agentic systems.",
+    "External memory backed by databases becomes the bottleneck and architectural center for multi-turn agent interactions, distinct from model-internal parametric knowledge."
+   ],
+   "suggested_page": "langgraph-react-agents",
+   "hide_pages": [
+    "agent-memory-core"
+   ],
+   "proposed_label": "overlap",
+   "label": "overlap",
+   "reviewed": false,
+   "note": "containment vs langgraph-react-agents 0.62. Same topic, different content: check it | Unsure: the page lists different memory tiers than the clip. Could be conflict. Left as overlap. Your call.",
+   "source_file": "2026-05-25-agent-memory-core-database-as-primary-infrastructure.md"
+  },
+  {
+   "id": "p28",
+   "how_built": "overlap: real summary vs the closest OTHER page (own page hidden)",
+   "clip_title": "Span-Level Quality Scoring in LLM Observability",
+   "clip_claims": [
+    "Unified traces across API and AI layers provide the substrate for quality scoring; metrics attach to individual spans rather than aggregating at request level.",
+    "Specific metrics (retrieval recall, faithfulness, tool success, RFT) enable diagnostic isolation: a low score maps to one execution stage, not the entire pipeline.",
+    "Span-level attribution replaces black-box request-level scoring, shifting observability from outcome measurement to causal debugging."
+   ],
+   "suggested_page": "ai-observability-span-level-quality-scoring",
+   "hide_pages": [
+    "llm-observability"
+   ],
+   "proposed_label": "overlap",
+   "label": "overlap",
+   "reviewed": false,
+   "note": "containment vs ai-observability-span-level-quality-scoring 0.60. Same topic, different content: check it",
+   "source_file": "2026-09-28-span-level-quality-scoring-in-llm-observability.md"
+  },
+  {
+   "id": "p29",
+   "how_built": "overlap: real summary vs the closest OTHER page (own page hidden)",
+   "clip_title": "MCP Resources: Direct Context Injection in Agentic Systems",
+   "clip_claims": [
+    "MCP Resources allow servers to expose information directly in prompts without requiring tool calls, making context delivery more efficient than triggering separate function invocations.",
+    "The `read_resource()` implementation involves making a ReadResourceRequest to the MCP server and parsing the response based on MIME type — JSON gets deserialized while plain text returns raw content.",
+    "Resource access through '@' syntax in the CLI provides autocomplete discovery and seamless prompt injection, eliminating the latency and complexity of sequential tool calls for document retrieval."
+   ],
+   "suggested_page": "mcp-server-implementation-with-python-sdk",
+   "hide_pages": [
+    "mcp-resources-and-context-injection"
+   ],
+   "proposed_label": "overlap",
+   "label": "overlap",
+   "reviewed": false,
+   "note": "containment vs mcp-server-implementation-with-python-sdk 0.59. Same topic, different content: check it",
+   "source_file": "2026-05-16-mcp-resources-direct-context-injection-in-agentic-systems.md"
+  },
+  {
+   "id": "p30",
+   "how_built": "overlap: real summary vs the closest OTHER page (own page hidden)",
+   "clip_title": "Multi-stage Training Pipeline for LLMs",
+   "clip_claims": [
+    "LLMs follow a three-stage training progression: pretraining on large datasets captures general linguistic patterns, supervised finetuning adapts the model to specific downstream tasks, and alignment ensures outputs respect human values and intended behaviors.",
+    "This staged approach enables models to generalize across diverse applications while maintaining safety and task performance constraints."
+   ],
+   "suggested_page": "model-training-fundamentals",
+   "hide_pages": [
+    "llm-multi-stage-training-pipeline"
+   ],
+   "proposed_label": "overlap",
+   "label": "overlap",
+   "reviewed": false,
+   "note": "containment vs model-training-fundamentals 0.56. Same topic, different content: check it",
+   "source_file": "2026-05-27-multi-stage-training-pipeline-for-llms.md"
+  },
+  {
+   "id": "p31",
+   "how_built": "distinct: real summary, own page hidden, nothing close left",
+   "clip_title": "Hip Flexor Dominance and Pelvic Alignment in Lower Back Pain",
+   "clip_claims": [
+    "Shortened hip flexors (psoas, iliacus, rectus femoris) pull the pelvis into anterior tilt, forcing lumbar extension to maintain upright posture.",
+    "This compensatory extension overloads posterior spinal structures (facet joints, erector spinae) and contributes to chronic lower back pain.",
+    "Targeted stretching and mobility work restore hip flexor length, allowing the pelvis to return to neutral and reducing aberrant lumbar loading."
+   ],
+   "suggested_page": "",
+   "hide_pages": [
+    "hip-flexor-tightness-and-pelvic-alignment"
+   ],
+   "proposed_label": "distinct",
+   "label": "distinct",
+   "reviewed": false,
+   "note": "best other containment 0.19 on langgraph-react-agents",
+   "source_file": "2026-08-18-hip-flexor-dominance-and-pelvic-alignment-in-lower-back-pain.md"
+  },
+  {
+   "id": "p32",
+   "how_built": "distinct: real summary, own page hidden, nothing close left",
+   "clip_title": "Carbon-free ferrocene analog: Os(η5-B5H10)2 synthesis and structure",
+   "clip_claims": [
+    "Researchers synthesized [Os(η5-B5H10)2], a carbon-free ferrocene analog where two boron pentagonal rings sandwich an osmium center, achieving a long-standing goal in inorganic chemistry.",
+    "The B5H10 ligand features pentagonal boron rings with bridging B-H-B hydrogens and terminal B-Ht bonds, creating stronger metal-ring bonding than ferrocene due to π orbital rehybridization.",
+    "The complex exhibits an unusually short ring-ring separation of 3.071 angstroms and staggered conformation, differing structurally from the analogous carbon-based ferrocene.",
+    "An isomeric variant [Os(η5-B5H10)(η3-B5H10)] was isolated featuring a coordination mode unknown in ferrocene chemistry, expanding the structural diversity of sandwich complexes.",
+    "Ruthenium analogs under identical conditions yielded only the mixed-valence isomer [Ru(η5-B5H10)(η3-B5H10)], demonstrating metal-dependent reactivity and selectivity in boron ring coordination."
+   ],
+   "suggested_page": "",
+   "hide_pages": [
+    "boron-sandwich-complexes-synthesis-and-bonding"
+   ],
+   "proposed_label": "distinct",
+   "label": "distinct",
+   "reviewed": false,
+   "note": "best other containment 0.19 on phase-4-agentic-ai",
+   "source_file": "2026-05-28-carbon-free-ferrocene-analog-osη5-b5h102-synthesis-and-struc.md"
+  },
+  {
+   "id": "p33",
+   "how_built": "distinct: real summary, own page hidden, nothing close left",
+   "clip_title": "Interest Rate Arbitrage Strategy",
+   "clip_claims": [
+    "Carry trade exploits interest rate differentials by borrowing in low-rate currency and investing in high-rate currency; profit margin equals rate spread minus transaction costs.",
+    "Strategy requires stable exchange rates to be viable; currency appreciation/depreciation and interest rate changes directly erode or amplify returns.",
+    "Practical application assumes significant, sustained rate differential; small spreads or volatile FX regimes make carry trades uneconomical."
+   ],
+   "suggested_page": "",
+   "hide_pages": [
+    "carry-trade-arbitrage"
+   ],
+   "proposed_label": "distinct",
+   "label": "distinct",
+   "reviewed": false,
+   "note": "best other containment 0.23 on phase-1-deep-learning",
+   "source_file": "2026-09-26-interest-rate-arbitrage-strategy.md"
+  },
+  {
+   "id": "p34",
+   "how_built": "distinct: real summary, own page hidden, nothing close left",
+   "clip_title": "Carbon Neutralization Framework",
+   "clip_claims": [
+    "Carbon neutrality achieved through offsetting (renewable energy, material efficiency, carbon removal) rather than absolute emission elimination.",
+    "Organizational implementation requires balancing investment costs against operational efficiency constraints and regulatory compliance timelines.",
+    "Carbon accounting and offsetting strategy selection depends on sectoral emissions profile and target timeline."
+   ],
+   "suggested_page": "",
+   "hide_pages": [
+    "carbon-neutralization-strategy"
+   ],
+   "proposed_label": "distinct",
+   "label": "distinct",
+   "reviewed": false,
+   "note": "best other containment 0.25 on word-embeddings-and-text-vectorization-techniques",
+   "source_file": "2026-09-26-carbon-neutralization-framework.md"
+  },
+  {
+   "id": "p35",
+   "how_built": "distinct: real summary, own page hidden, nothing close left",
+   "clip_title": "Audio Fingerprinting and Shazam's Song Identification Mechanism",
+   "clip_claims": [
+    "Shazam uses audio fingerprinting—extraction of constellation maps (anchor point pairs from spectrogram peaks)—rather than full audio storage or traditional hashing, enabling sub-second identification despite compression, noise, or playback variations.",
+    "The signal pipeline digitizes sound via sampling (capturing discrete time-domain values) and quantization (bit-depth encoding), then applies Discrete/Fast Fourier Transform to convert time-domain waveforms into frequency-domain spectrograms revealing dominant tones.",
+    "Spectrogram peaks are filtered using psychoacoustic models: human ears perceive frequency-dependent loudness non-linearly, so peaks in perceptually loud ranges become more robust anchors than raw amplitude peaks across all frequencies.",
+    "Fingerprints store relative frequencies and time delays between peak pairs (constellations) rather than absolute frequencies, making matches resilient to tempo shifts, compression artifacts, and background noise—a fundamental constraint of lossy real-world audio."
+   ],
+   "suggested_page": "",
+   "hide_pages": [
+    "audio-fingerprinting"
+   ],
+   "proposed_label": "distinct",
+   "label": "distinct",
+   "reviewed": false,
+   "note": "best other containment 0.26 on langgraph-react-agents",
+   "source_file": "2026-10-06-audio-fingerprinting-and-shazams-song-identification-mechani.md"
+  },
+  {
+   "id": "p36",
+   "how_built": "distinct: real summary, own page hidden, nothing close left",
+   "clip_title": "Security Vulnerability Triage with Prioritization",
+   "clip_claims": [
+    "Vulnerability triage operates as a severity-based filtering mechanism: high-impact issues bypass queue delays and enter remediation immediately, while lower-severity findings enter a managed backlog with scheduled follow-up.",
+    "Effective prioritization depends on explicit severity criteria and distributed awareness—unclear or siloed prioritization decisions create coordination failures and deferred remediation debt.",
+    "Resource constraints require tiered response: critical vulnerabilities demand team mobilization; medium-severity issues allow planned sprints; low-severity findings tolerate longer timelines with documented acceptance decisions."
+   ],
+   "suggested_page": "",
+   "hide_pages": [
+    "vulnerability-triage-and-prioritization"
+   ],
+   "proposed_label": "distinct",
+   "label": "distinct",
+   "reviewed": false,
+   "note": "best other containment 0.26 on phase-4-agentic-ai",
+   "source_file": "2026-08-18-security-vulnerability-triage-with-prioritization.md"
+  },
+  {
+   "id": "p37",
+   "how_built": "distinct: real summary, own page hidden, nothing close left",
+   "clip_title": "ESP32: Low-Power IoT Microcontroller",
+   "clip_claims": [
+    "The ESP32 is a cost-effective microcontroller featuring dual wireless protocols (Wi-Fi + BLE) built-in, making it suitable for connected IoT projects without external modules.",
+    "I discovered it supports multiple programming environments (Arduino IDE, MicroPython, ESP-IDF), so I can choose based on project constraints—bare metal performance or rapid prototyping.",
+    "The rich peripheral set (ADC, DAC, I2C, SPI, UART, PWM) combined with low-power modes makes the ESP32 viable for battery-operated wearables and industrial sensors."
+   ],
+   "suggested_page": "",
+   "hide_pages": [
+    "esp32-microcontroller"
+   ],
+   "proposed_label": "distinct",
+   "label": "distinct",
+   "reviewed": false,
+   "note": "best other containment 0.27 on world-models",
+   "source_file": "2026-04-25-esp32-low-power-iot-microcontroller.md"
+  },
+  {
+   "id": "p38",
+   "how_built": "distinct: real summary, own page hidden, nothing close left",
+   "clip_title": "React Native to Native: LLM-Enabled Platform Migration",
+   "clip_claims": [
+    "LLM-assisted implementation and translation reduce the marginal cost of maintaining two native codebases; duplication is now cheaper than abstraction when platforms diverge in capability or design patterns.",
+    "Framework abstraction (React Native, 2020) was optimal under developer-scarcity and feature-parity constraints; native platforms became economically preferable once LLM translation capability matured enough to handle cross-platform code synthesis and review.",
+    "Native codebases provide fewer dependency layers, reduced supply-chain attack surface, and tighter coupling to platform-native tooling and capability—advantages that compound when LLM velocity offsets duplication costs.",
+    "Greenfield rebuilds become realistic when LLMs automate enough of implementation, translation, testing, and code review to compress multi-year projects into quarters, shifting risk from duration to automation quality."
+   ],
+   "suggested_page": "",
+   "hide_pages": [
+    "llm-assisted-cross-platform-development-economics"
+   ],
+   "proposed_label": "distinct",
+   "label": "distinct",
+   "reviewed": false,
+   "note": "best other containment 0.27 on phase-4-agentic-ai",
+   "source_file": "2026-09-10-react-native-to-native-llm-enabled-platform-migration.md"
+  },
+  {
+   "id": "p39",
+   "how_built": "distinct: real summary, own page hidden, nothing close left",
+   "clip_title": "Escalating Technical Issues to the Right Team",
+   "clip_claims": [
+    "Escalation routes unresolved technical issues from initial responder to the team with actual ownership/expertise, trading communication overhead for scope correctness.",
+    "Escalation trigger: issue persists beyond initial team's capability or falls outside their defined responsibility scope.",
+    "Effective escalation requires identifying the correct owner before handoff; unclear ownership creates cascading delays."
+   ],
+   "suggested_page": "",
+   "hide_pages": [
+    "issue-escalation-in-technical-support"
+   ],
+   "proposed_label": "distinct",
+   "label": "distinct",
+   "reviewed": false,
+   "note": "best other containment 0.29 on reflection-and-external-feedback-in-agentic-ai",
+   "source_file": "2026-08-18-escalating-technical-issues-to-the-right-team.md"
+  },
+  {
+   "id": "p40",
+   "how_built": "distinct: real summary, own page hidden, nothing close left",
+   "clip_title": "AlphaEvolve: Gemini-Powered Evolutionary Coding Agent",
+   "clip_claims": [
+    "AlphaEvolve employs an ensemble of two Gemini models — Flash for breadth of idea exploration and Pro for depth — to propose, evaluate, and iteratively evolve entire codebases, extending beyond single functions as in its predecessor FunSearch.",
+    "AlphaEvolve's evolutionary loop depends on automated evaluators that score programs objectively, limiting applicability to domains where correctness and quality can be measured programmatically, such as mathematics, computer science, and hardware design.",
+    "AlphaEvolve achieved a 32.5% speedup on the FlashAttention kernel by optimizing low-level GPU instructions, a domain typically inaccessible to human engineers due to existing compiler optimizations.",
+    "AlphaEvolve discovered a 4×4 complex-valued matrix multiplication algorithm requiring only 48 scalar multiplications, surpassing Strassen's 1969 algorithm, which remained the best known result for over 50 years.",
+    "AlphaEvolve's data center scheduling heuristic has operated in Google's Borg system in production for over a year, consistently recovering 0.7% of worldwide compute, with human-readable code enabling interpretability and debuggability unlike black-box machine learning solutions."
+   ],
+   "suggested_page": "",
+   "hide_pages": [
+    "alphaevolve-evolutionary-coding-agent"
+   ],
+   "proposed_label": "distinct",
+   "label": "distinct",
+   "reviewed": false,
+   "note": "best other containment 0.29 on optimization-algorithms-and-sentence-embeddings",
+   "source_file": "2026-05-11-alphaevolve-gemini-powered-evolutionary-coding-agent.md"
+  }
+ ]
+}

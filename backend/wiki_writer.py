@@ -29,6 +29,7 @@ if _env_path.exists():
                 if not os.environ.get(_k):  # already-set vars win
                     os.environ[_k] = _v
 
+import capture_compare
 import identity
 import llm_client
 
@@ -46,6 +47,51 @@ def _domain_folder(item: dict) -> str:
     if tags & _SCIENCE_TAGS:
         return "science"
     return "cs"
+
+
+class ArchiveError(Exception):
+    """The old page could not be copied to meta/replaced. Nothing was written."""
+
+
+def _archive_page(page_path: Path, vault: Path) -> Path:
+    """Copy a page to _wiki/meta/replaced/<slug>-<timestamp>.md before it is replaced."""
+    dest_dir = vault / "_wiki" / "meta" / "replaced"
+    dest = dest_dir / f"{page_path.stem}-{datetime.now().strftime('%Y%m%d-%H%M%S')}.md"
+    try:
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(page_path.read_bytes())
+    except OSError as e:
+        raise ArchiveError(str(e)) from e
+    return dest
+
+
+def _free_slug(base: str) -> str:
+    """base-2, base-3, ... until no page uses the slug."""
+    n = 2
+    while capture_compare.find_page_path(f"{base}-{n}"):
+        n += 1
+    return f"{base}-{n}"
+
+
+def _add_related_link(page_path: Path, other_slug: str) -> None:
+    """Additive only: append a Related line to a page."""
+    text = page_path.read_text(encoding="utf-8")
+    line = f"- Related: [[{other_slug}]]"
+    if line in text:
+        return
+    sep = "" if text.endswith("\n") else "\n"
+    head = "" if "\n## Related\n" in text else "\n## Related\n"
+    _atomic_write(page_path, f"{text}{sep}{head}{line}\n")
+
+
+def _forced_evolution_type(report: dict) -> str:
+    """Evolution type for an append the user chose. Never 'duplicates'."""
+    verdicts = {c.get("verdict") for c in report.get("claims", [])}
+    if "conflicts" in verdicts:
+        return "contradicts"
+    if "changed" in verdicts:
+        return "refines"
+    return "extends"
 
 
 # ── public API ────────────────────────────────────────────────────────────────
@@ -71,11 +117,42 @@ def write_approved(item: dict) -> str:
             page_path = candidate
             break
 
-    section = _format_section(item)
+    # A resolution the user chose in the conflict review overrides the default routing.
+    resolution = item.get("resolution")
+    report = item.get("conflict_report") or {}
+    target = report.get("target_page")
+    target_path = capture_compare.find_page_path(target) if target else None
+    forced_type = None
+    related_target = None
+    if resolution in ("append", "replace") and target_path:
+        page_name, page_path = target_path.stem, target_path
+        if resolution == "append":
+            forced_type = _forced_evolution_type(report)
+    elif resolution == "keep_both" and (target_path or page_path.exists()):
+        related_target = target_path or page_path
+        if capture_compare.find_page_path(page_name):  # suffix only if the name is taken
+            page_name = _free_slug(page_name)
+        page_path = domain_dir / f"{page_name}.md"
+    elif resolution == "replace":
+        resolution = None  # target vanished: fall back to a normal write
 
-    if page_path.exists():
+    section = _format_section(item)
+    # New pages are titled from their own slug (matters for keep_both's "x-2")
+    page_item = {**item, "suggested_page": page_name} if resolution in ("keep_both", "replace") else item
+
+    if resolution == "replace":
+        item["_archived"] = str(_archive_page(page_path, vault).relative_to(vault))
+        evolution = {
+            "evolution_type": "supersedes",
+            "evolution_reason": "page replaced by user",
+            "updated_understanding": _distill_insight(item.get("summary", [])),
+        }
+        new_content = _create_page(page_name, page_item, section, evolution)
+    elif page_path.exists():
         existing = page_path.read_text(encoding="utf-8")
         evolution = _analyze_evolution(existing, item)
+        if forced_type:
+            evolution["evolution_type"] = forced_type
         evo_type = evolution.get("evolution_type", "extends")
 
         if evo_type == "duplicates":
@@ -86,9 +163,16 @@ def write_approved(item: dict) -> str:
         new_content = _evolve_page(existing, section, item, evolution)
     else:
         evolution = {"evolution_type": "extends", "evolution_reason": "initial entry", "updated_understanding": _distill_insight(item.get("summary", []))}
-        new_content = _create_page(page_name, item, section, evolution)
+        new_content = _create_page(page_name, page_item, section, evolution)
 
     _atomic_write(page_path, new_content)
+
+    if related_target:
+        try:
+            _add_related_link(related_target, page_name)
+            _add_related_link(page_path, related_target.stem)
+        except OSError:
+            pass
 
     # Auxiliary writes
     try:

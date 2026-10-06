@@ -21,7 +21,7 @@ import time
 import uuid
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import Optional
+from typing import Literal, Optional
 
 logger = logging.getLogger("sakethwiki")
 
@@ -45,6 +45,7 @@ from pydantic import BaseModel
 import active_review
 import revision
 import consolidation
+import capture_compare
 import identity
 import llm_client
 import memory_store
@@ -228,6 +229,8 @@ class ApproveRequest(BaseModel):
     # Optional human edits — overrides the extracted values before vault write
     edits: Optional[dict] = None
     open_thread: bool = False  # if True, add deep-dive tag to the concept page
+    # Chosen in the conflict review. None keeps the approve-time classifier (items with no report).
+    resolution: Optional[Literal["append", "replace", "keep_both"]] = None
 
 
 class BatchDecisionRequest(BaseModel):
@@ -394,15 +397,14 @@ def _clip_signature(markdown: str, source_url: str = "", clip_title: str = "") -
     return hashlib.sha256(seed.encode("utf-8")).hexdigest()
 
 
-def _is_clip_processed(sig: str) -> bool:
-    # Check queue first
+def _processed_clip_match(sig: str) -> Optional[dict]:
+    """Where an identical clip already lives: {"where": "queue"} or {"where": "wiki", "page": slug}."""
     for item in queue_manager.get_all():
         if item.get("clip_signature") == sig:
-            return True
-    # Then check historical index
+            return {"where": "queue", "page": None}
     idx = _processed_clips_index_path()
     if not idx.exists():
-        return False
+        return None
     for line in idx.read_text(encoding="utf-8").splitlines():
         if not line.strip():
             continue
@@ -410,9 +412,23 @@ def _is_clip_processed(sig: str) -> bool:
             rec = json.loads(line)
         except Exception:
             continue
-        if rec.get("clip_signature") == sig:
-            return True
-    return False
+        if rec.get("clip_signature") == sig and _ledger_page_exists(rec):
+            written = (rec.get("file_written") or "").split(" [")[0].strip()
+            return {"where": "wiki", "page": Path(written).stem if written else None}
+    return None
+
+
+def _is_clip_processed(sig: str) -> bool:
+    return _processed_clip_match(sig) is not None
+
+
+def _ledger_page_exists(rec: dict) -> bool:
+    """A ledger entry blocks re-processing only while its page still exists."""
+    written = (rec.get("file_written") or "").split(" [")[0].strip()
+    if not written:
+        return True  # no page recorded (e.g. skipped duplicate): keep the block
+    path = Path(written)
+    return (path if path.is_absolute() else _vault_path() / path).exists()
 
 
 def _record_processed_clip(item: dict, file_written: str) -> None:
@@ -444,13 +460,50 @@ def _record_processed_clip(item: dict, file_written: str) -> None:
             shutil.move(str(src), str(dst))
 
 
+class DuplicateClip(Exception):
+    """The clip adds nothing: every claim is already on `page`."""
+
+    def __init__(self, report: dict):
+        self.report = report
+        self.page = report.get("target_page")
+
+
+def _attach_report(item: dict) -> dict:
+    item["conflict_report"] = capture_compare.build_report(item)
+    return item
+
+
+def _needs_review(report: Optional[dict]) -> bool:
+    """A decision is needed before this clip touches a page (ADR 7)."""
+    report = report or {}
+    return report.get("band") in ("duplicate", "overlap", "conflict") and bool(report.get("target_page"))
+
+
+def _duplicate_body(report: dict) -> dict:
+    return {
+        "queued": False,
+        "reason": "duplicate",
+        "page": report.get("target_page"),
+        "message": report.get("reason", ""),
+        "matches": [
+            {"claim": c["claim"], "page_quote": c.get("page_quote")}
+            for c in report.get("claims", []) if c.get("verdict") == "same"
+        ],
+    }
+
+
 def _stage_markdown_clip(markdown: str, source_url: str = "", clip_title: str = "", inbox_file: str = "", force: bool = False) -> dict:
     text = markdown.strip()
     if not text:
         raise HTTPException(400, "Markdown is empty")
     sig = _clip_signature(text, source_url, clip_title)
-    if not force and _is_clip_processed(sig):
-        raise HTTPException(409, "Clip already processed")
+    match = None if force else _processed_clip_match(sig)
+    if match:
+        where = "your queue" if match["where"] == "queue" else f"'{match['page']}'" if match["page"] else "your wiki"
+        raise DuplicateClip({
+            "band": "duplicate", "target_page": match["page"], "claims": [],
+            "reason": f"This exact clip is already in {where}.",
+        })
 
     title_hint = clip_title.strip() if clip_title else _extract_markdown_title(text)
     existing_pages = [p["name"] for p in vault_reader.list_concept_pages()]
@@ -486,6 +539,9 @@ def _stage_markdown_clip(markdown: str, source_url: str = "", clip_title: str = 
         "staged_at": datetime.now().isoformat(),
         "status": "pending",
     }
+    _attach_report(item)
+    if item["conflict_report"]["band"] == "duplicate" and not force:
+        raise DuplicateClip(item["conflict_report"])
     queue_manager.enqueue(item)
     return item
 
@@ -748,6 +804,7 @@ async def ingest(req: IngestRequest, request: Request):
     # Step 3: stage all slices to queue
     started = time.perf_counter()
     items = []
+    skipped_duplicates = []
     for extraction in extractions:
         item_id = str(uuid.uuid4())
         item = {
@@ -770,10 +827,16 @@ async def ingest(req: IngestRequest, request: Request):
             "staged_at": datetime.now().isoformat(),
             "status": "pending",
         }
+        await loop.run_in_executor(None, _attach_report, item)
+        if item["conflict_report"]["band"] == "duplicate" and not req.force:
+            skipped_duplicates.append(item["conflict_report"])
+            continue
         queue_manager.enqueue(item)
         items.append(item)
     _mark_stage("queue_stage", started)
 
+    if not items:
+        return _duplicate_body(skipped_duplicates[0])
     first = items[0]
     total_ms = round((time.perf_counter() - request_started) * 1000, 1)
     latency = {
@@ -792,6 +855,8 @@ async def ingest(req: IngestRequest, request: Request):
         "sliced": len(items) > 1,
         "slice_count": len(items),
         "slice_titles": [it["title"] for it in items[1:]],
+        "skipped_duplicates": [r.get("target_page") for r in skipped_duplicates],
+        "conflict_report": first["conflict_report"],
         "latency": latency,
         "diff_preview": {
             "title": first["title"],
@@ -813,17 +878,21 @@ async def ingest(req: IngestRequest, request: Request):
 @app.post("/ingest-markdown")
 async def ingest_markdown(req: MarkdownIngestRequest):
     loop = asyncio.get_running_loop()
-    item = await loop.run_in_executor(
-        None,
-        lambda: _stage_markdown_clip(
-            markdown=req.markdown,
-            source_url=req.source_url or "",
-            clip_title=req.clip_title or "",
-            force=req.force,
-        ),
-    )
+    try:
+        item = await loop.run_in_executor(
+            None,
+            lambda: _stage_markdown_clip(
+                markdown=req.markdown,
+                source_url=req.source_url or "",
+                clip_title=req.clip_title or "",
+                force=req.force,
+            ),
+        )
+    except DuplicateClip as dup:
+        return _duplicate_body(dup.report)
     return {
         "id": item["id"],
+        "conflict_report": item["conflict_report"],
         "diff_preview": {
             "title": item["title"],
             "summary": item["summary"],
@@ -876,6 +945,15 @@ async def process_inbox(req: InboxProcessRequest):
                     force=force,
                 )
                 queued.append({"file": md_path.name, "id": item["id"], "suggested_page": item["suggested_page"]})
+            except DuplicateClip as dup:
+                skipped.append({"file": md_path.name, "reason": f"duplicate of {dup.page}"})
+                try:
+                    dst = _processed_inbox_path() / md_path.name
+                    if dst.exists():
+                        dst = _processed_inbox_path() / f"{md_path.stem}-{int(datetime.now().timestamp())}.md"
+                    shutil.move(str(md_path), str(dst))
+                except Exception:
+                    pass
             except HTTPException as e:
                 if e.status_code == 409:
                     skipped.append({"file": md_path.name, "reason": "already processed"})
@@ -2035,6 +2113,7 @@ async def _background_extract(item_id: str, url: str) -> None:
                 "extraction_error": None,
                 "extracted_at": datetime.now().isoformat(),
             })
+            await loop.run_in_executor(None, _attach_report, item)
             queue_manager.update(item_id, item)
     except Exception as e:
         # Mark as failed so the UI shows a retry option instead of spinning forever
@@ -2142,6 +2221,17 @@ async def ingest_direct(req: IngestRequest):
         "staged_at": datetime.now().isoformat(),
         "status": "approved",
     }
+
+    await loop.run_in_executor(None, _attach_report, item)
+    report = item["conflict_report"]
+    if report["band"] == "duplicate":
+        return _duplicate_body(report)
+    if _needs_review(report):
+        # ADR 7: no direct write. Queue it so the review screen can decide.
+        item["status"] = "pending"
+        queue_manager.enqueue(item)
+        return {"queued": True, "needs_review": True, "id": item["id"], "title": item["title"],
+                "conflict_report": report}
 
     try:
         file_path = wiki_writer.write_approved(item)
@@ -2380,6 +2470,7 @@ async def _decide_queue_item(item_id: str, req: ApproveRequest):
         return {"success": True, "action": "rejected", "file_written": None}
 
     # If queued via Share Sheet (pending_extraction=True), run extraction now
+    extracted_now = False
     if item.get("pending_extraction") and item.get("url"):
         try:
             _approve_loop = asyncio.get_running_loop()
@@ -2400,8 +2491,18 @@ async def _decide_queue_item(item_id: str, req: ApproveRequest):
                 **_curation_fields(extraction),
                 "pending_extraction": False,
             })
+            extracted_now = True
         except Exception as _e:
             logger.warning("background extraction failed for item %s: %s", item_id, _e)
+
+    # ADR 7: a clip that overlaps, conflicts or repeats a page is never written without a chosen resolution.
+    if req.approved and not req.resolution:
+        if extracted_now:  # extracted just now, so there is no report yet
+            await asyncio.get_running_loop().run_in_executor(None, _attach_report, item)
+            queue_manager.update(item_id, item)
+        if _needs_review(item.get("conflict_report")):
+            report = item["conflict_report"]
+            raise HTTPException(409, {"error": "needs_review", "band": report["band"], "target_page": report["target_page"]})
 
     # Snapshot original values before edits (for trace logging)
     item["_original_suggested_page"] = item.get("suggested_page", "")
@@ -2423,11 +2524,23 @@ async def _decide_queue_item(item_id: str, req: ApproveRequest):
         identity.resolve_slug(link) for link in item.get("suggested_wikilinks", [])
     ]
 
+    report = item.get("conflict_report") or {}
+    if req.resolution:
+        item["resolution"] = req.resolution
+        target = report.get("target_page")
+        if target and capture_compare.page_hash(target) != report.get("target_hash"):
+            raise HTTPException(409, {"error": "report_stale", "target_page": target})
+
     # Write to vault (atomic — either fully succeeds or raises, queue untouched)
     try:
         file_path = wiki_writer.write_approved(item)
+    except wiki_writer.ArchiveError as e:
+        raise HTTPException(500, {"error": "archive_failed", "detail": str(e)})
     except Exception as e:
         raise HTTPException(500, f"Vault write failed: {e}")
+
+    if req.resolution == "keep_both":
+        item["suggested_page"] = Path(file_path).stem  # trace records the page actually written
 
     # Only remove from queue after successful vault write
     queue_manager.remove(item_id)
@@ -2501,8 +2614,22 @@ async def _decide_queue_item(item_id: str, req: ApproveRequest):
         "file_written": file_path,
         "evolution_type": evolution.get("evolution_type", "extends"),
         "evolution_reason": evolution.get("evolution_reason", ""),
+        **({"resolution": req.resolution} if req.resolution else {}),
+        **({"archived": item["_archived"]} if item.get("_archived") else {}),
         **({"deep_dive_tagged": True} if deep_dive_tagged else {}),
     }
+
+
+@app.post("/queue/{item_id}/compare")
+async def recompare_queue_item(item_id: str):
+    """Rebuild the conflict report for one queued item (after a page changed)."""
+    item = queue_manager.get_by_id(item_id)
+    if not item:
+        raise HTTPException(404, f"Item {item_id} not found in queue")
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(None, _attach_report, item)
+    queue_manager.update(item_id, item)
+    return {"conflict_report": item["conflict_report"]}
 
 
 @app.post("/approve/{item_id}")
@@ -2529,6 +2656,15 @@ async def batch_queue_decision(req: BatchDecisionRequest):
                 "success": False,
                 "code": "not_ready",
                 "message": f"Item {item_id} is not ready for approval",
+            })
+            continue
+        if req.approved and item and (item.get("conflict_report") or {}).get("band") in ("duplicate", "overlap", "conflict") \
+                and (item.get("conflict_report") or {}).get("target_page"):
+            results.append({
+                "item_id": item_id,
+                "success": False,
+                "code": "needs_review",
+                "message": f"'{item.get('title', item_id)}' overlaps or conflicts with an existing page. Review it, then choose an action.",
             })
             continue
         try:
