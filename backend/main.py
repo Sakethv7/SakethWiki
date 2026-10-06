@@ -410,9 +410,18 @@ def _is_clip_processed(sig: str) -> bool:
             rec = json.loads(line)
         except Exception:
             continue
-        if rec.get("clip_signature") == sig:
+        if rec.get("clip_signature") == sig and _ledger_page_exists(rec):
             return True
     return False
+
+
+def _ledger_page_exists(rec: dict) -> bool:
+    """A ledger entry blocks re-processing only while its page still exists."""
+    written = (rec.get("file_written") or "").split(" [")[0].strip()
+    if not written:
+        return True  # no page recorded (e.g. skipped duplicate): keep the block
+    path = Path(written)
+    return (path if path.is_absolute() else _vault_path() / path).exists()
 
 
 def _record_processed_clip(item: dict, file_written: str) -> None:
