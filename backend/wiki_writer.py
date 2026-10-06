@@ -26,7 +26,8 @@ if _env_path.exists():
             _k, _, _v = _line.partition("=")
             _k, _v = _k.strip(), _v.strip()
             if _v:
-                os.environ[_k] = _v
+                if not os.environ.get(_k):  # already-set vars win
+                    os.environ[_k] = _v
 
 import identity
 import llm_client
