@@ -2,7 +2,7 @@
 SakethWiki E2E test suite — runs the app in-process against a temporary vault.
 LLM calls are real, so tests marked needs_llm skip when no provider is configured.
 Nothing is written to the real vault.
-Run: arch -arm64 venv/bin/python3 -m pytest tests/test_e2e.py -v
+Skipped by default (see pytest.ini). Run: venv/bin/python3 -m pytest backend/tests -m e2e -v
 """
 import json
 import os
@@ -13,6 +13,8 @@ import pytest
 from fastapi.testclient import TestClient
 
 import main
+
+pytestmark = pytest.mark.e2e
 
 # No `with` block: skips lifespan, so the image watcher and scheduler don't start.
 client = TestClient(main.app)
