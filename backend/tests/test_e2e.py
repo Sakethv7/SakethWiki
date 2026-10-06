@@ -42,12 +42,17 @@ def _llm_configured() -> bool:
 needs_llm = pytest.mark.skipif(not _llm_configured(), reason="no LLM provider configured (set .env vars)")
 
 
-@pytest.fixture(autouse=True, scope="module")
-def temp_vault(tmp_path_factory):
-    vault = tmp_path_factory.mktemp("vault")
+@pytest.fixture(autouse=True)
+def temp_vault(isolated_vault):
+    """Seed the vault that conftest's isolated_vault already points VAULT_PATH at.
+
+    A separate module-scoped vault is overridden by that function-scoped
+    fixture, so the app wrote to an empty vault while tests checked this one.
+    """
+    vault = isolated_vault
     wiki = vault / "_wiki"
     for folder in ("cs", "sources", "insights", "open-threads", "meta"):
-        (wiki / folder).mkdir(parents=True)
+        (wiki / folder).mkdir(parents=True, exist_ok=True)
     (wiki / "index.md").write_text("# Index\n", encoding="utf-8")
     (wiki / "cs" / "attention.md").write_text(
         "---\ntitle: \"Attention\"\ndate: 2026-01-01\ntags: [LLM]\nsources: []\n---\n\n"
@@ -59,10 +64,7 @@ def temp_vault(tmp_path_factory):
         "# Attention Is All You Need\n",
         encoding="utf-8",
     )
-    mp = pytest.MonkeyPatch()
-    mp.setenv("VAULT_PATH", str(vault))
-    yield vault
-    mp.undo()
+    return vault
 
 # ── helpers ───────────────────────────────────────────────────────────────────
 
