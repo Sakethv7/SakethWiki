@@ -17,11 +17,13 @@ import os
 import random
 import re as _re
 import shutil
+import subprocess
 import time
 import uuid
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Literal, Optional
+from urllib.parse import quote
 
 logger = logging.getLogger("sakethwiki")
 
@@ -3070,7 +3072,69 @@ async def get_page(page_name: str):
     parsed = vault_reader.parse_concept_page(page_name)
     backlinks_index = vault_reader.build_backlinks_index()
     backlinks = backlinks_index.get(page_name, [])
-    return {"name": page_name, "content": content, "parsed": parsed, "backlinks": backlinks}
+    return {"name": page_name, "content": content, "parsed": parsed, "backlinks": backlinks,
+            "path": vault_reader.page_path(page_name)}
+
+
+# ── /open-in-app ──────────────────────────────────────────────────────────────
+
+_OPEN_APP_BUNDLES = {"obsidian": ("Obsidian", "Obsidian.app"), "vscode": ("VS Code", "Visual Studio Code.app")}
+_LOOPBACK_HOSTS = {"127.0.0.1", "::1", "localhost"}
+
+
+def _require_loopback(request: Request) -> None:
+    """The route launches apps, so only this Mac may call it (CORS is open for the LAN upload page)."""
+    if not request.client or request.client.host not in _LOOPBACK_HOSTS:
+        raise HTTPException(403, "local requests only")
+
+
+def _app_installed(key: str) -> bool:
+    bundle = _OPEN_APP_BUNDLES[key][1]
+    return any((Path(base) / bundle).exists() for base in ("/Applications", Path.home() / "Applications"))
+
+
+@app.get("/open-in-app/apps")
+async def open_in_app_apps(request: Request):
+    _require_loopback(request)
+    apps = [{"key": k, "label": v[0]} for k, v in _OPEN_APP_BUNDLES.items() if _app_installed(k)]
+    return {"apps": apps + [{"key": "default", "label": "Default app"}]}
+
+
+class OpenInAppRequest(BaseModel):
+    path: str
+    app: str
+
+
+@app.post("/open-in-app")
+async def open_in_app(body: OpenInAppRequest, request: Request):
+    """Open a vault file in an external app. Never writes; no shell; app chosen from a fixed list."""
+    _require_loopback(request)
+    if body.app != "default" and body.app not in _OPEN_APP_BUNDLES:
+        raise HTTPException(400, "unknown app")
+    vault = Path(os.environ.get("VAULT_PATH", "/Users/sakethv7/SakethVault")).resolve()
+    target = (vault / body.path).resolve()
+    if not target.is_relative_to(vault):
+        raise HTTPException(400, "path outside the vault")
+    if not target.is_file():
+        raise HTTPException(404, "file not found")
+    if body.app == "obsidian":
+        file_ref = target.relative_to(vault).as_posix()
+        if target.suffix == ".md":
+            file_ref = file_ref[:-3]
+        cmd = ["open", f"obsidian://open?vault={quote(vault.name)}&file={quote(file_ref)}"]
+    elif body.app == "vscode":
+        cmd = ["open", "-a", "Visual Studio Code", str(target)]
+    else:
+        cmd = ["open", str(target)]
+    if body.app != "default" and not _app_installed(body.app):
+        raise HTTPException(409, "app not installed")
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+    except subprocess.TimeoutExpired:
+        raise HTTPException(500, "open timed out")
+    if result.returncode != 0:
+        raise HTTPException(500, (result.stderr.strip().splitlines() or ["open failed"])[0])
+    return {"opened": True, "app": body.app}
 
 
 # ── /page-history/{page_name} ─────────────────────────────────────────────────

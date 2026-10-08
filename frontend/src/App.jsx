@@ -3659,7 +3659,7 @@ function BrowseTab({ openTarget, active = true }) {
     try {
       const data = await api(`/page/${name}`);
       setPageContent(data.content);
-      const parsed = data.parsed ? { ...data.parsed, backlinks: data.backlinks || [], pageName: name } : null;
+      const parsed = data.parsed ? { ...data.parsed, backlinks: data.backlinks || [], pageName: name, path: data.path } : null;
       setParsedPage(parsed);
       setSelected(name);
     } catch { setPageContent("Failed to load page."); setParsedPage(null); setSelected(name); }
@@ -3785,6 +3785,7 @@ function BrowseTab({ openTarget, active = true }) {
           <span className="text-stone-300 mx-1">/</span>
           <span className="text-sm font-medium text-stone-700 flex-1 truncate">{selected}</span>
           <div className="flex items-center gap-1">
+            <OpenInMenu path={parsedPage?.path} />
             {["cs", "science", "humanities"].includes(folder) && (
               <>
                 {parsedPage?.tags?.some(t => t.toLowerCase() === "deep-dive") && (
@@ -4256,6 +4257,47 @@ function NeedsAttentionSection({ onMerge, onOpenPage, refreshKey }) {
   );
 }
 
+let _openAppsCache = null;
+
+function OpenInMenu({ path }) {
+  const [open, setOpen] = useState(false);
+  const [apps, setApps] = useState(_openAppsCache || [{ key: "default", label: "Default app" }]);
+  const [error, setError] = useState("");
+
+  async function toggle() {
+    setError("");
+    setOpen(o => !o);
+    if (!_openAppsCache) {
+      try { _openAppsCache = (await api("/open-in-app/apps")).apps; setApps(_openAppsCache); } catch {}
+    }
+  }
+
+  async function pick(key) {
+    try {
+      await api("/open-in-app", { method: "POST", body: JSON.stringify({ path, app: key }) });
+      setOpen(false);
+    } catch (e) { setError(e.message || "Open failed"); }
+  }
+
+  return (
+    <div className="relative">
+      <button onClick={toggle} disabled={!path}
+        className="text-xs px-2.5 py-1 border border-stone-200 text-stone-500 rounded-lg hover:bg-stone-50 disabled:opacity-40 transition-colors">
+        Open in…
+      </button>
+      {open && (
+        <div className="absolute right-0 mt-1 z-50 w-40 bg-white border border-stone-200 rounded-lg shadow-lg py-1">
+          {apps.map(a => (
+            <button key={a.key} onClick={() => pick(a.key)}
+              className="block w-full text-left text-xs px-3 py-1.5 text-stone-600 hover:bg-stone-50">{a.label}</button>
+          ))}
+          {error && <p className="text-xs text-red-500 px-3 py-1">{error}</p>}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function PageReaderModal({ name, onClose, onOpenPage }) {
   const [current, setCurrent] = useState(name);
   const [data, setData] = useState(null);
@@ -4277,6 +4319,7 @@ function PageReaderModal({ name, onClose, onOpenPage }) {
       <div className="bg-white rounded-2xl shadow-xl border border-stone-200 p-5 w-full max-w-3xl max-h-[90vh] overflow-y-auto space-y-4">
         <div className="flex items-center justify-between">
           <h3 className="font-semibold text-stone-900 truncate">{current}</h3>
+          <OpenInMenu path={data?.path} />
           <button onClick={onClose} className="w-6 h-6 flex items-center justify-center text-stone-400 hover:text-stone-600 rounded-lg hover:bg-stone-100 text-xs">✕</button>
         </div>
         {!data ? <p className="text-xs text-stone-400">Loading…</p>
