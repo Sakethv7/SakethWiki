@@ -139,3 +139,11 @@ flowchart TD
 **Consequences.** This change stays small. The route works for any vault file, so the first explainer can be opened on day one. Nothing blocks the later work.
 
 **Given up.** Without the static route, an HTML explainer opens in the browser outside SakethWiki. It does not show inside the reader. You also still have no size or backup rule for video. The vault has no git history, so a deleted video is gone. Decide this before you save the first MP4.
+
+## Amendment to ADR-3 (2026-10-08) — the loopback check now covers every route
+
+**Context.** The backend listens on `0.0.0.0:8001`, so the check on the two new routes left the other 65 routes open to the LAN. The phone needs only `GET /mobile` and `POST /ingest`.
+
+**Choice.** One HTTP middleware (`loopback_only` in `backend/main.py`) refuses any non-loopback caller with 403, except those two method-and-path pairs. It sits inside the CORS layer, so the refusal still carries CORS headers. `_require_loopback` stays on the open-in-app routes as a second check.
+
+**Given up.** The phone can no longer use `/qr-code`, `/queue-url` or any other route. A new route that the phone should reach must be added to `_LAN_ALLOWED`. The desktop app, the Mac wrapper and the Vite dev server all call from 127.0.0.1, so they are not affected. A tool on another machine (for example curl from a laptop) is now refused.
