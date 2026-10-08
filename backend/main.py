@@ -104,6 +104,21 @@ def _schedule_memory_sync() -> None:
 
 app = FastAPI(title="SakethWiki API", version="1.0.0", lifespan=lifespan)
 
+# The backend listens on 0.0.0.0 so a phone can reach the upload page. Every
+# other route is for the desktop app and the Mac only. Registered before CORS
+# so the refusal still carries CORS headers.
+_LOOPBACK_HOSTS = {"127.0.0.1", "::1", "localhost"}
+_LAN_ALLOWED = {("GET", "/mobile"), ("POST", "/ingest")}
+
+
+@app.middleware("http")
+async def loopback_only(request: Request, call_next):
+    host = request.client.host if request.client else None
+    if host not in _LOOPBACK_HOSTS and (request.method, request.url.path) not in _LAN_ALLOWED:
+        return Response('{"detail":"local requests only"}', status_code=403, media_type="application/json")
+    return await call_next(request)
+
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],   # LAN access needed for mobile upload page
@@ -3079,7 +3094,6 @@ async def get_page(page_name: str):
 # ── /open-in-app ──────────────────────────────────────────────────────────────
 
 _OPEN_APP_BUNDLES = {"obsidian": ("Obsidian", "Obsidian.app"), "vscode": ("VS Code", "Visual Studio Code.app")}
-_LOOPBACK_HOSTS = {"127.0.0.1", "::1", "localhost"}
 
 
 def _require_loopback(request: Request) -> None:

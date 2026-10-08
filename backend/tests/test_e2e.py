@@ -17,7 +17,7 @@ import main
 pytestmark = pytest.mark.e2e
 
 # No `with` block: skips lifespan, so the image watcher and scheduler don't start.
-client = TestClient(main.app)
+client = TestClient(main.app, client=("127.0.0.1", 50000))
 
 
 def _provider_ready(provider: str) -> bool:
