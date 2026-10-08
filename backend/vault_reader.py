@@ -214,8 +214,7 @@ def build_graph() -> dict:
     return {"nodes": nodes, "edges": edges}
 
 
-def read_page(page_name: str) -> Optional[str]:
-    """Return full content of a page, searching all vault folders."""
+def _find_page_file(page_name: str) -> Optional[Path]:
     candidates = list(dict.fromkeys([identity.resolve_slug(page_name), identity.slugify(page_name)]))
     for candidate_name in candidates:
         for folder_dir in _dirs().values():
@@ -223,8 +222,20 @@ def read_page(page_name: str) -> Optional[str]:
                 continue
             for md_file in folder_dir.glob("*.md"):
                 if md_file.stem.lower() == candidate_name.lower():
-                    return md_file.read_text(encoding="utf-8")
+                    return md_file
     return None
+
+
+def read_page(page_name: str) -> Optional[str]:
+    """Return full content of a page, searching all vault folders."""
+    md_file = _find_page_file(page_name)
+    return md_file.read_text(encoding="utf-8") if md_file else None
+
+
+def page_path(page_name: str) -> Optional[str]:
+    """Vault-relative path of the file read_page() reads, or None."""
+    md_file = _find_page_file(page_name)
+    return md_file.relative_to(_vault()).as_posix() if md_file else None
 
 
 def parse_concept_page(page_name: str) -> Optional[dict]:
