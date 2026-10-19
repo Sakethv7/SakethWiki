@@ -265,6 +265,12 @@ def _fallback_enabled(task: str) -> bool:
     return key in CRITICAL_TASKS
 
 
+# Structured-extraction tasks need the whole output budget for the JSON.
+# Haiku 5.5 thinks by default, and the thinking can use the full budget and
+# leave no text, so these tasks turn it off.
+NO_THINKING_TASKS = {"INGEST_EXTRACT", "SLICE_CONTENT"}
+
+
 def _contract_repair_enabled(task: str) -> bool:
     """Allow an immediate operational rollback of structured-output repair."""
     key = _task_key(task)
@@ -452,6 +458,7 @@ def _anthropic_complete(
     messages: list[dict[str, Any]],
     system: Optional[Any],
     api_key: Optional[str],
+    disable_thinking: bool = False,
 ) -> CompletionResult:
     import anthropic
 
@@ -483,6 +490,8 @@ def _anthropic_complete(
     }
     if system_param:
         kwargs["system"] = system_param
+    if disable_thinking:
+        kwargs["thinking"] = {"type": "disabled"}
     resp = client.messages.create(**kwargs)
     text_parts: list[str] = []
     for block in getattr(resp, "content", []):
@@ -668,6 +677,7 @@ def complete(
                     messages=messages,
                     system=system,
                     api_key=api_key,
+                    disable_thinking=key in NO_THINKING_TASKS,
                 ),
                 provider=provider,
                 model=resolved_model,
@@ -726,6 +736,7 @@ def complete(
                         messages=repair_messages,
                         system=system,
                         api_key=api_key,
+                        disable_thinking=key in NO_THINKING_TASKS,
                     ),
                     provider=provider,
                     model=resolved_model,
@@ -771,6 +782,7 @@ def complete(
                 messages=messages,
                 system=system,
                 api_key=api_key,
+                disable_thinking=key in NO_THINKING_TASKS,
             ),
             provider="anthropic",
             model=fallback_model,

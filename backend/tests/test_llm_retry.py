@@ -238,3 +238,20 @@ def test_slice_contract_failure_gets_one_compact_repair(monkeypatch):
     assert result.startswith("[")
     assert len(calls) == 2
     assert calls[1]["max_tokens"] == 1000
+
+
+def test_extraction_tasks_disable_anthropic_thinking(monkeypatch):
+    _configure_fast_retry(monkeypatch, attempts="1")
+    monkeypatch.setenv("LLM_PROVIDER", "anthropic")
+    flags = []
+
+    def fake(**kwargs):
+        flags.append(kwargs.get("disable_thinking"))
+        return llm_client.CompletionResult("ok")
+
+    monkeypatch.setattr(llm_client, "_anthropic_complete", fake)
+    messages = [{"role": "user", "content": "x"}]
+    llm_client.complete(task="ingest_extract", model=None, max_tokens=10, messages=messages)
+    llm_client.complete(task="lint_scan", model=None, max_tokens=10, messages=messages)
+
+    assert flags == [True, False]
