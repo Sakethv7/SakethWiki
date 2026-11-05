@@ -290,6 +290,20 @@ function needsReview(report) {
   return !!report && ["duplicate", "overlap", "conflict"].includes(report.band) && !!report.target_page;
 }
 
+// Riskiest claims first, so a reviewer sees what changes before what repeats.
+const VERDICT_ORDER = { conflicts: 0, changed: 1, new: 2, same: 3 };
+function sortClaims(claims) {
+  return [...claims].sort((a, b) => (VERDICT_ORDER[a.verdict] ?? 4) - (VERDICT_ORDER[b.verdict] ?? 4));
+}
+function summaryLine(claims) {
+  const n = claims.filter(c => c.verdict === "new").length;
+  const hot = claims.filter(c => c.verdict === "changed" || c.verdict === "conflicts").length;
+  const same = claims.filter(c => c.verdict === "same").length;
+  const parts = [`${n} new claim${n === 1 ? "" : "s"}`, `${hot} change${hot === 1 ? "s" : ""} or conflict${hot === 1 ? "s" : ""} with the page`];
+  if (same) parts.push(`${same} already on the page`);
+  return parts.join(". ") + ".";
+}
+
 function BandBadge({ report }) {
   if (!report || !BAND_META[report.band] || report.band === "distinct") return null;
   const meta = BAND_META[report.band];
@@ -318,7 +332,8 @@ function ConflictBanner({ report, onReview }) {
   );
 }
 
-function ConflictReviewModal({ item, extraBody, onClose, onResolved }) {
+// progress, onLater and autoRefresh are set only by ResolveWalkthrough.
+function ConflictReviewModal({ item, extraBody, onClose, onResolved, progress, onLater, autoRefresh }) {
   const [report, setReport] = useState(item.conflict_report);
   const [busy, setBusy] = useState("");          // "" | action name | "refresh"
   const [error, setError] = useState("");
@@ -362,6 +377,11 @@ function ConflictReviewModal({ item, extraBody, onClose, onResolved }) {
     setBusy("");
   }
 
+  // An earlier clip in the walkthrough may have changed this clip's page. Refresh without a click.
+  useEffect(() => {
+    if (stale && autoRefresh) refresh();
+  }, [stale]);
+
   useEffect(() => {
     function onKey(e) {
       if (e.target.closest?.("input, textarea")) return;
@@ -386,10 +406,12 @@ function ConflictReviewModal({ item, extraBody, onClose, onResolved }) {
         <div className="px-5 pt-4 pb-3 border-b border-stone-100 flex items-start gap-3">
           <div className="flex-1 min-w-0">
             <div className="flex items-center gap-2 flex-wrap">
+              {progress && <span className="text-[11px] font-semibold text-stone-500">Clip {progress.n} of {progress.total}</span>}
               <span className={`text-[11px] font-semibold px-2 py-0.5 rounded border ${meta.chip}`}>{meta.label}</span>
               <span className="text-sm font-semibold text-stone-900 truncate">{item.title}</span>
             </div>
             <p className="text-xs text-stone-500 mt-1">{report.reason}</p>
+            {claims.length > 0 && <p className="text-xs font-medium text-stone-800 mt-1">{summaryLine(claims)}</p>}
             <div className="flex flex-wrap gap-1.5 mt-2">
               {Object.entries(counts).map(([v, n]) => (
                 <span key={v} className={`text-[10px] px-1.5 py-0.5 rounded border ${VERDICT_META[v]?.cls || ""}`}>{n} {VERDICT_META[v]?.label || v}</span>
@@ -421,7 +443,7 @@ function ConflictReviewModal({ item, extraBody, onClose, onResolved }) {
                 ? "Almost every term in this clip is already on the page, so it was not compared claim by claim."
                 : "No claim-level detail for this comparison."}
             </p>
-          ) : claims.map((c, i) => {
+          ) : sortClaims(claims).map((c, i) => {
             const v = VERDICT_META[c.verdict] || VERDICT_META.new;
             const hot = c.verdict === "changed" || c.verdict === "conflicts";
             return (
@@ -456,6 +478,13 @@ function ConflictReviewModal({ item, extraBody, onClose, onResolved }) {
             </p>
           )}
           <div className="flex flex-wrap gap-2 justify-end">
+            {onLater && (
+              <button onClick={onLater} disabled={!!busy}
+                title="Leaves the clip in the queue. Nothing is written."
+                className="px-3.5 py-2 rounded-xl text-sm font-medium text-stone-500 hover:bg-stone-100 disabled:opacity-40 mr-auto">
+                Decide later
+              </button>
+            )}
             {actions.map(a => {
               const isRec = a.id === rec || (report.band === "duplicate" && a.id === "skip");
               const isReplace = a.id === "replace";
@@ -481,6 +510,52 @@ function ConflictReviewModal({ item, extraBody, onClose, onResolved }) {
   );
 }
 
+// Steps through clips that need review, one per screen. Writes go through the
+// same /approve route as the single-clip modal. See docs/bulk-resolve-walkthrough/.
+function ResolveWalkthrough({ items, onFinished }) {
+  // Same-page clips sit next to each other, so a stale report refreshes once per page.
+  const [list] = useState(() => [...items].sort((a, b) => (a.conflict_report.target_page || "").localeCompare(b.conflict_report.target_page || "")));
+  const [index, setIndex] = useState(0);
+  const [results, setResults] = useState({});   // id -> "done" | "rejected" | "left"
+
+  const count = (status) => Object.values(results).filter(s => s === status).length;
+  const summary = { done: count("done"), rejected: count("rejected"), left: list.length - count("done") - count("rejected") };
+
+  function advance(id, status) {
+    setResults(prev => ({ ...prev, [id]: status }));
+    setIndex(i => i + 1);
+  }
+
+  if (index >= list.length) {
+    return (
+      <div className="fixed inset-0 z-50 bg-black/40 flex items-center justify-center p-4">
+        <div role="dialog" aria-label="Resolve summary" className="bg-white rounded-2xl shadow-xl w-full max-w-md p-5 space-y-3">
+          <div className="text-sm font-semibold text-stone-900">Resolve finished</div>
+          <p className="text-sm text-stone-700">
+            {summary.done} saved, {summary.rejected} rejected, {summary.left} left in the queue.
+          </p>
+          <div className="flex justify-end">
+            <button onClick={() => onFinished(summary, results)} className="px-3.5 py-2 rounded-xl text-sm font-medium bg-stone-900 text-white hover:bg-stone-800">Done</button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  const item = list[index];
+  return (
+    <ConflictReviewModal
+      key={item.id}
+      item={item}
+      progress={{ n: index + 1, total: list.length }}
+      autoRefresh
+      onLater={() => advance(item.id, "left")}
+      onClose={() => onFinished(summary, results)}
+      onResolved={(action) => advance(item.id, action === "skip" ? "rejected" : "done")}
+    />
+  );
+}
+
 function QueueSection({ onApproved, onExtractPreview }) {
   const [items, setItems] = useState([]);
   const [loaded, setLoaded] = useState(false);
@@ -494,6 +569,18 @@ function QueueSection({ onApproved, onExtractPreview }) {
   const [extractError, setExtractError] = useState(null); // { id, message }
   const [lastAction, setLastAction] = useState(null); // { type: 'saved'|'skipped', title, time }
   const [reviewItem, setReviewItem] = useState(null);     // item open in ConflictReviewModal
+  const [walkItems, setWalkItems] = useState(null);       // frozen list for ResolveWalkthrough
+
+  const resolvableSelected = items.filter(item => selectedIds.has(item.id) && !item.pending_extraction && !item.extraction_error && needsReview(item.conflict_report));
+
+  async function finishWalkthrough(summary) {
+    setWalkItems(null);
+    await loadQueue();
+    if (summary.done > 0) onApproved?.();
+    if (summary.done + summary.rejected > 0) {
+      setLastAction({ type: summary.done > 0 ? "saved" : "skipped", title: `${summary.done} resolved, ${summary.rejected} rejected`, time: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) });
+    }
+  }
 
   async function loadQueue() {
     try {
@@ -580,7 +667,7 @@ function QueueSection({ onApproved, onExtractPreview }) {
       return;
     }
     if (approved && selectedItems.some(item => needsReview(item.conflict_report))) {
-      setActionError("Some selected clips overlap or conflict with an existing page. Open each one with Review and choose an action.");
+      setActionError("Some selected clips overlap or conflict with an existing page. Use Resolve selected to choose an action for each one.");
       return;
     }
     const verb = approved ? "approve" : "reject";
@@ -698,6 +785,12 @@ function QueueSection({ onApproved, onExtractPreview }) {
           <button onClick={() => setSelectedIds(new Set())} disabled={batchBusy || selectedIds.size === 0}
             className="text-xs text-stone-400 hover:text-stone-700 disabled:opacity-40">Clear</button>
           <div className="flex-1" />
+          {resolvableSelected.length > 0 && (
+            <button onClick={() => setWalkItems(resolvableSelected)} disabled={batchBusy}
+              className="px-3 py-1.5 border border-stone-900 text-stone-900 rounded-lg text-xs font-semibold hover:bg-stone-100 disabled:opacity-40">
+              Resolve selected ({resolvableSelected.length})
+            </button>
+          )}
           <button onClick={() => handleBatchDecision(false)} disabled={batchBusy || selectedIds.size === 0}
             className="px-3 py-1.5 border border-red-200 text-red-600 rounded-lg text-xs font-medium hover:bg-red-50 disabled:opacity-40">
             Reject selected
@@ -840,6 +933,7 @@ function QueueSection({ onApproved, onExtractPreview }) {
           </div>
         );
       })}
+      {walkItems && <ResolveWalkthrough items={walkItems} onFinished={finishWalkthrough} />}
       {reviewItem && (
         <ConflictReviewModal
           item={reviewItem}
