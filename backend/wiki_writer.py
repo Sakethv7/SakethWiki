@@ -124,7 +124,7 @@ def write_approved(item: dict) -> str:
     target_path = capture_compare.find_page_path(target) if target else None
     forced_type = None
     related_target = None
-    if resolution in ("append", "replace") and target_path:
+    if resolution in ("append", "replace", "merge") and target_path:
         page_name, page_path = target_path.stem, target_path
         if resolution == "append":
             forced_type = _forced_evolution_type(report)
@@ -133,14 +133,25 @@ def write_approved(item: dict) -> str:
         if capture_compare.find_page_path(page_name):  # suffix only if the name is taken
             page_name = _free_slug(page_name)
         page_path = domain_dir / f"{page_name}.md"
-    elif resolution == "replace":
+    elif resolution in ("replace", "merge"):
+        if resolution == "merge":
+            raise ValueError("merge target page not found")
         resolution = None  # target vanished: fall back to a normal write
 
     section = _format_section(item)
     # New pages are titled from their own slug (matters for keep_both's "x-2")
     page_item = {**item, "suggested_page": page_name} if resolution in ("keep_both", "replace") else item
 
-    if resolution == "replace":
+    if resolution == "merge":
+        # The user approved the merged body in the preview. Archive first, then one atomic write.
+        item["_archived"] = str(_archive_page(page_path, vault).relative_to(vault))
+        evolution = {
+            "evolution_type": "refines",
+            "evolution_reason": "clip merged into page by user",
+            "updated_understanding": _distill_insight(item.get("summary", [])),
+        }
+        new_content = _merge_page(page_path.read_text(encoding="utf-8"), item.get("merged_body", ""), item)
+    elif resolution == "replace":
         item["_archived"] = str(_archive_page(page_path, vault).relative_to(vault))
         evolution = {
             "evolution_type": "supersedes",
@@ -272,6 +283,25 @@ Be strict about duplicates — if the core insight is already captured, call it 
             "evolution_reason": "new source added",
             "updated_understanding": _distill_insight(item.get("summary", [])),
         }
+
+
+def _merge_page(existing: str, merged_body: str, item: dict) -> str:
+    """Keep the old frontmatter with updated counters. Use the approved merged body as the page text."""
+    m = re.match(r"\A(---\n.*?\n---\n?)", existing, flags=re.DOTALL)
+    front = m.group(1) if m else ""
+    today = datetime.now().strftime("%Y-%m-%d")
+    front = re.sub(r"(last_updated:\s*)[\d-]+", f"\\g<1>{today}", front)
+    front = re.sub(r"(entry_count:\s*)(\d+)", lambda x: x.group(1) + str(int(x.group(2)) + 1), front)
+    front = re.sub(r"(understanding_version:\s*)(\d+)", lambda x: x.group(1) + str(int(x.group(2)) + 1), front)
+    front = re.sub(r"last_evolution:.*", 'last_evolution: "refines · clip merged into page"', front)
+    url = item.get("url", "")
+    if url and url not in front:
+        front = re.sub(
+            r'(sources:\s*\[)([^\]]*?)(\])',
+            lambda x: x.group(1) + (x.group(2).rstrip() + ', ' if x.group(2).strip() else '') + f'"{url}"' + x.group(3),
+            front, count=1,
+        )
+    return front + ("\n" if front and not front.endswith("\n\n") else "") + merged_body.strip() + "\n"
 
 
 def _evolve_page(existing: str, section: str, item: dict, evolution: dict) -> str:

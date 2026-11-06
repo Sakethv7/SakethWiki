@@ -235,13 +235,13 @@ Explainer: [merge-action-flow.html](../visuals/merge-action-flow.html).
 
 **Options.** (1) No archive. (2) Archive, as Replace does. (3) Archive and run output checks.
 
-**Choice.** Option 3. Checks: not empty, at least 60% of the old length, every old number kept unless a clip claim changes it, first heading unchanged.
+**Choice.** Option 3. Checks: not empty, at least 60% of the old length, no more old numbers dropped than the clip has numbers, first heading unchanged.
 
 **Consequences.** A bad rewrite is rejected or can be undone from the archive. Given up: the checks are crude. A rewrite that drops a fact without a number passes. The preview is the main guard.
 
 ## Open questions for change 3
 
-1. Which model writes the merge? Haiku is cheap and weak at long rewrites. Sonnet costs more per merge. I propose Sonnet and need your call.
+1. Which model writes the merge? Decided: Haiku (2026-11-06). Revisit if merges of long pages come out thin.
 2. The 60% length check and the number check are guesses. They need a few real merges to tune.
 3. Pages over 6000 characters: `capture_compare` caps page text at 6000. A merge of a long page needs the full text, so the cap must not apply here. Cost grows with page size.
 4. There is no undo button. The archive holds the old page, and restoring is manual. A restore action is a separate change.

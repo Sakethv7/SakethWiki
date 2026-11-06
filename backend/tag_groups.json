@@ -42,5 +42,6 @@
   "Startups": "finance",
   "Statistics": "science",
   "Systems": "ops",
-  "Trees": "dsa"
+  "Trees": "dsa",
+  "aws": "ops"
 }

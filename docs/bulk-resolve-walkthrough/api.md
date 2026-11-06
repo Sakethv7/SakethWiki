@@ -82,7 +82,7 @@ Each added pair uses the existing schema: `id`, `how_built`, `clip_title`, `clip
 flowchart TD
     A[Modal] -->|POST merge_preview| B[Backend: model rewrites page]:::new
     B -->|merged_body, target_hash| A
-    A -->|POST approve: resolution merge, merged_body, target_hash| C[Backend: check hash]
+    A -->|POST approve: resolution merge, merged_body, merge_target_hash| C[Backend: check hash]
     C -->|ok| D[Archive, write, dequeue]:::new
     C -->|stale| E[409 report_stale]:::failure
     classDef new fill:#dbeafe,stroke:#2563eb;
@@ -107,10 +107,10 @@ The route writes nothing. The loopback guard applies as for all routes.
 
 ## Changed route
 
-`POST /approve/{id}` accepts `resolution: "merge"`. When it does, `merged_body` and `target_hash` are required. The existing rule stays: an approved clip with a target needs a chosen resolution.
+`POST /approve/{id}` accepts `resolution: "merge"`. When it does, `merged_body` and `merge_target_hash` are required. The existing rule stays: an approved clip with a target needs a chosen resolution.
 
 Invariants:
-- `target_hash` must equal the current hash of the target page, or the route returns 409 `report_stale`.
+- `merge_target_hash` must equal the current hash of the target page, or the route returns 409 `report_stale`.
 - The old page is archived before the write.
 - Frontmatter is never taken from model output.
 
