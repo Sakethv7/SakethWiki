@@ -348,6 +348,8 @@ function ConflictReviewModal({ item, extraBody, onClose, onResolved, progress, o
   const [confirmReplace, setConfirmReplace] = useState(false);
   const [showPage, setShowPage] = useState(false);
   const [pageText, setPageText] = useState(null);
+  const [preview, setPreview] = useState(null);  // merge preview: { old_body, merged_body, target_hash }
+  const [mergeText, setMergeText] = useState("");
   const claims = report.claims || [];
   const counts = claims.reduce((acc, c) => ({ ...acc, [c.verdict]: (acc[c.verdict] || 0) + 1 }), {});
   const meta = BAND_META[report.band] || BAND_META.unknown;
@@ -372,6 +374,27 @@ function ConflictReviewModal({ item, extraBody, onClose, onResolved, progress, o
       if (e.status === 409 && e.detail?.error === "report_stale") setStale(true);
       else setError(e.message || "Action failed");
       setBusy(""); setConfirmReplace(false);
+    }
+  }
+
+  async function openMergePreview() {
+    setBusy("merge"); setError("");
+    try {
+      const data = await api(`/queue/${item.id}/merge_preview`, { method: "POST" });
+      setPreview(data); setMergeText(data.merged_body);
+    } catch (e) { setError(e.detail?.reason || e.message || "Merge preview failed"); }
+    setBusy("");
+  }
+
+  async function approveMerge() {
+    setBusy("merge_approve"); setError("");
+    try {
+      await api(`/approve/${item.id}`, { method: "POST", body: JSON.stringify({ ...extraBody, approved: true, resolution: "merge", merged_body: mergeText, merge_target_hash: preview.target_hash }) });
+      onResolved("merge");
+    } catch (e) {
+      if (e.status === 409 && e.detail?.error === "report_stale") { setStale(true); setPreview(null); }
+      else setError(e.message || "Merge failed");
+      setBusy("");
     }
   }
 
@@ -404,6 +427,7 @@ function ConflictReviewModal({ item, extraBody, onClose, onResolved, progress, o
   const actions = [
     { id: "append", label: `Add to ${report.target_page}`, hint: "Adds a new section. Updates the page summary." },
     { id: "keep_both", label: `Create new page ${newPage}`, hint: "Saves the clip as a new page and links the two. A number is added to the name if it is taken." },
+    { id: "merge", label: `Merge into ${report.target_page}`, hint: "The model rewrites the page so each fact appears once. You read the result before anything is written. The old page is archived first." },
     { id: "replace", label: `Replace ${report.target_page}`, hint: "Old page is archived first (meta/replaced)." },
     { id: "skip", label: "Skip clip", hint: "Rejects the clip. Nothing is written." },
   ];
@@ -437,7 +461,24 @@ function ConflictReviewModal({ item, extraBody, onClose, onResolved, progress, o
           <button onClick={onClose} aria-label="Close" className="text-stone-400 hover:text-stone-700 text-xl leading-none">×</button>
         </div>
 
-        <div className="flex-1 overflow-y-auto px-5 py-4 space-y-3">
+        {preview && (
+          <div className="flex-1 overflow-y-auto px-5 py-4 space-y-2">
+            <p className="text-xs text-stone-600">Merged text for <span className="font-mono">{report.target_page}</span>. Edit it if needed. Nothing is written until you approve. The old page is archived first.</p>
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+              <div>
+                <div className="text-[10px] uppercase tracking-wide text-stone-400 mb-1">Page now</div>
+                <pre className="text-[11px] leading-relaxed whitespace-pre-wrap bg-stone-50 border border-stone-200 rounded-xl p-3 h-80 overflow-y-auto text-stone-700">{preview.old_body}</pre>
+              </div>
+              <div>
+                <div className="text-[10px] uppercase tracking-wide text-stone-400 mb-1">After merge{(preview.notes || [])[0] ? ` · ${preview.notes[0]}` : ""}</div>
+                <textarea aria-label="Merged page text" value={mergeText} onChange={e => setMergeText(e.target.value)}
+                  className="w-full text-[11px] leading-relaxed font-mono bg-white border border-stone-300 rounded-xl p-3 h-80 resize-none" />
+              </div>
+            </div>
+          </div>
+        )}
+
+        {!preview && <div className="flex-1 overflow-y-auto px-5 py-4 space-y-3">
           {stale && (
             <div className="rounded-xl border border-amber-300 bg-amber-50 px-3 py-2 text-xs text-amber-900 flex items-center gap-3">
               <span className="flex-1">The page changed after this was compared. Refresh so you decide on current text.</span>
@@ -484,7 +525,7 @@ function ConflictReviewModal({ item, extraBody, onClose, onResolved, progress, o
               {pageText === null ? "Loading…" : pageText}
             </pre>
           )}
-        </div>
+        </div>}
 
         <div className="px-5 py-3 border-t border-stone-100 space-y-2">
           {error && <p className="text-xs text-red-600">{error}</p>}
@@ -493,6 +534,16 @@ function ConflictReviewModal({ item, extraBody, onClose, onResolved, progress, o
               This overwrites <span className="font-mono">{report.target_page}</span>. The old page is copied to <span className="font-mono">_wiki/meta/replaced/</span> first. Press Replace again to confirm.
             </p>
           )}
+          {preview ? (
+            <div className="flex flex-wrap gap-2 justify-end">
+              <button onClick={() => setPreview(null)} disabled={!!busy}
+                className="px-3.5 py-2 rounded-xl text-sm font-medium text-stone-500 hover:bg-stone-100 disabled:opacity-40 mr-auto">Cancel merge</button>
+              <button onClick={approveMerge} disabled={!!busy || !mergeText.trim()}
+                className="px-3.5 py-2 rounded-xl text-sm font-medium bg-stone-900 text-white hover:bg-stone-800 disabled:opacity-40">
+                {busy === "merge_approve" ? "Working…" : "Approve merge"}
+              </button>
+            </div>
+          ) : (
           <div className="flex flex-wrap gap-2 justify-end">
             {onLater && (
               <button onClick={onLater} disabled={!!busy}
@@ -511,7 +562,7 @@ function ConflictReviewModal({ item, extraBody, onClose, onResolved, progress, o
                 : "border border-stone-300 text-stone-800 hover:bg-stone-100";
               return (
                 <button key={a.id} title={a.hint} disabled={!!busy || stale}
-                  onClick={() => isReplace && !confirmReplace ? setConfirmReplace(true) : resolve(a.id)}
+                  onClick={() => a.id === "merge" ? openMergePreview() : isReplace && !confirmReplace ? setConfirmReplace(true) : resolve(a.id)}
                   className={base + tone}>
                   {busy === a.id ? "Working…" : isReplace && confirmReplace ? "Confirm replace" : a.label}
                   {isRec && busy !== a.id && <span className="ml-1.5 text-[10px] opacity-70">suggested</span>}
@@ -519,6 +570,7 @@ function ConflictReviewModal({ item, extraBody, onClose, onResolved, progress, o
               );
             })}
           </div>
+          )}
           <p className="text-[10px] text-stone-400 text-right">Nothing is written until you pick an action. Esc closes.</p>
         </div>
       </div>
@@ -1310,7 +1362,7 @@ function IngestTab({ onApproved, onSwitchToChat, onOpenPage }) {
 
   function handlePreviewResolved(action) {
     setReviewOpen(false);
-    setDone(action === "skip" ? "Skipped." : `Saved (${{ append: "added to page", replace: "page replaced, old copy archived", keep_both: "kept as a new page" }[action]})`);
+    setDone(action === "skip" ? "Skipped." : `Saved (${{ append: "added to page", replace: "page replaced, old copy archived", keep_both: "kept as a new page", merge: "merged into page, old copy archived" }[action]})`);
     setPreview(null); setEdits(null); setInput(""); setImages([]); setUserNotes(""); setOpenThread(false);
     if (action !== "skip") onApproved?.();
     setQueueKey(k => k + 1);

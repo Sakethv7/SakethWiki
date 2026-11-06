@@ -127,7 +127,7 @@ Blue is new. Red is a failure path.
 2. The backend loads the target page, strips the frontmatter, and sends the body and the clip claims to the model.
 3. The model returns the merged body. The backend checks it (see below). It also records the page hash.
 4. The modal shows old and merged text side by side, with changed lines marked. Conflict lines carry a "CONTRADICTION flagged" marker.
-5. The user clicks Approve. The modal sends `POST /approve/{id}` with `resolution: "merge"`, `merged_body` and `target_hash`.
+5. The user clicks Approve. The modal sends `POST /approve/{id}` with `resolution: "merge"`, `merged_body` and `merge_target_hash`.
 6. The backend compares the hash with the page now on disk. If they differ, it returns 409 `report_stale`.
 7. The backend archives the old page to `_wiki/meta/replaced/`, writes the old frontmatter with updated counters plus the merged body, and removes the clip from the queue.
 
@@ -135,7 +135,7 @@ Blue is new. Red is a failure path.
 
 - The merged body is not empty.
 - The merged body is at least 60% as long as the old body. A large drop means the model deleted content.
-- Every number in the old body appears in the merged body, unless a claim in the clip changes that number.
+- The merged body drops no more numbers from the old body than the clip has numbers (a clip number may replace an old one).
 - The first heading is unchanged.
 
 A failed check returns 422 and the user sees the reason. Nothing is written.
