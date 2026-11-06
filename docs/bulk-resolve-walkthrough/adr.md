@@ -77,3 +77,91 @@ flowchart TD
 2. The writer adds the text "CONTRADICTION flagged" and `maturity` counts `[!warning]` callouts. These two strings differ, so flagged contradictions may not lower the maturity score. Not verified. Out of scope here.
 3. Clips with `conflicts` verdicts have no "resolve the contradiction" action. Only Replace removes old claims. A "mark old claim superseded" action would be a separate change.
 4. The working tree has unrelated uncommitted changes on branch `fix-haiku5-thinking`. Implementation should start on a new branch from `main`.
+
+---
+
+# Change 2: Weak targets and clearer actions
+
+Explainer for ADRs 4 to 6: [weak-target-default-flow.html](../visuals/weak-target-default-flow.html)
+
+## ADR 4: Raise the closest-page cutoff to 0.50
+
+### Visual Level
+
+```mermaid
+flowchart TD
+    A[Closest page found by shared words] --> B{Score at least 0.50?}:::changed
+    B -- no --> C[New topic: write the suggested page]:::changed
+    B -- yes --> D[Compare claims with the page]
+    D --> E{Model says page does not cover them?}
+    E -- yes --> F[Overlap: suggest Add to page]
+    E -- no --> G[Same, changed or conflict as today]
+    classDef changed fill:#dbeafe,stroke:#2563eb;
+```
+
+Blue is changed. Weak matches skip review and become new pages.
+
+**Context.** Live clips matched unrelated pages at 0.37 to 0.43. The cutoff was 0.35, a starting value that was never calibrated. The labeled pairs show distinct clips at 0.29 or less and true overlaps at 0.56 or more.
+
+**Options.**
+1. Raise the cutoff to 0.50, near the middle of the gap.
+2. Keep 0.35 and let the model decide relevance with a new prompt field.
+3. Keep 0.35 and make "Create new page" the default for all-new overlaps.
+
+**Choice.** Option 1. It is one constant, needs no model call, and the pairs support it. Option 2 adds model cost. Option 3 still shows the user a review screen for pages that are not related.
+
+**Consequences.** Unrelated pages no longer attract clips. Given up: a true overlap that scores between 0.35 and 0.50 now becomes a new page and is not offered an Add. No labeled pair sits in that range, so the size of this loss is unknown. The user can still add a clip to a page by hand.
+
+## ADR 5: Name the target page on every action
+
+### Visual Level
+
+```mermaid
+flowchart TD
+    A[Open review screen] --> B[Show target page and match score]:::changed
+    B --> C{Score at least 0.60?}:::changed
+    C -- no --> D[Show weak match note, no dark suggestion]:::changed
+    C -- yes --> E[Dark button on suggested action]
+    D --> F[User picks a labeled action]:::changed
+    E --> F
+    classDef changed fill:#dbeafe,stroke:#2563eb;
+```
+
+**Context.** "Add to page" does not say which page. The dark "suggested" button invites one click.
+
+**Options.** (1) Keep the labels. (2) Put the page name in each label and drop the suggestion when the match is weak.
+
+**Choice.** Option 2. Labels: "Add to {page}", "Create new page {suggested}", "Replace {page}", "Skip clip".
+
+**Consequences.** The user sees where text will go before the click. Given up: longer buttons, which may wrap on narrow windows. The 0.60 line is a first guess.
+
+## ADR 6: Always show Resolve, and a Select all checkbox
+
+### Visual Level
+
+```mermaid
+flowchart TD
+    A[Queue has clips that need review] --> B[Show Resolve all in the bar]:::changed
+    B --> C{Any clip selected?}
+    C -- no --> D[Open walkthrough on all review clips]:::changed
+    C -- yes --> E[Open walkthrough on selected review clips]
+    A --> F[Select all checkbox at left of bar]:::changed
+    classDef changed fill:#dbeafe,stroke:#2563eb;
+```
+
+**Context.** The Resolve button appears only after a selection. "Select all ready" is faint text. The user could not find a way to take all clips together.
+
+**Options.** (1) Keep as is. (2) Always show the button, and replace the text link with a checkbox.
+
+**Choice.** Option 2.
+
+**Consequences.** One click starts the walkthrough on every review clip. Given up: a little more bar width.
+
+## Open questions for change 2
+
+1. The five live clips have no hand label yet. I treat them as `distinct` because their pages are about agents, RAG and security, and the clips are about SEO. Confirm before they enter the pairs.
+2. The 0.50 cutoff is a midpoint guess. There is no labeled pair between 0.29 and 0.56. More pairs in that range would set it better.
+3. Clips already in the queue keep their old reports. They need a rebuild with `POST /queue/{id}/compare`. That writes to your live queue file, so I would ask first.
+4. The result summary does not list where each clip went. A per-clip list with links is a separate small change.
+5. There is still no real merge action. Add to page appends a section. A rewrite-merge is a larger change.
+6. The 0.60 "strong match" line may be too high or low. It needs real use.

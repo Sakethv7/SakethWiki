@@ -27,8 +27,9 @@ import vault_reader
 
 logger = logging.getLogger(__name__)
 
-# Starting value. Calibrate on labeled pairs (backend/calibrate_compare.py).
-CANDIDATE_FLOOR = 0.35         # min containment for a page the extractor did not name
+# Calibrated on labeled pairs (backend/calibrate_compare.py): distinct clips score <= 0.29,
+# true overlaps >= 0.56. 0.35 let unrelated pages in (live SEO clips matched agent pages at 0.37-0.43).
+CANDIDATE_FLOOR = 0.50         # min containment for a page the extractor did not name
 PAGE_CHAR_CAP = 6000
 SAME_SUPPORT_MIN = 0.45        # share of a "same" claim's terms that its page quote must contain
 FLAG_SUPPORT_MIN = 0.15        # a changed/conflicts flag needs a quote that is about the same point

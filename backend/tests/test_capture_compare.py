@@ -95,6 +95,28 @@ def test_no_close_page_is_distinct(isolated_vault, monkeypatch):
     assert cc.build_report(item)["band"] == "distinct"
 
 
+# Clip tokens: parallel scan notes + alpha..hotel = 11. A page holding 5 of them scores 0.45,
+# one holding 6 scores 0.55. The floor is 0.50.
+_WEAK_CLAIM = ["alpha bravo charlie delta echo foxtrot golf hotel"]
+
+
+def test_weak_word_match_is_a_new_topic_not_an_overlap(isolated_vault, monkeypatch):
+    _page(isolated_vault, "other-page", "parallel scan notes alpha bravo")
+    calls = _llm(monkeypatch, [{"verdict": "new", "page_quote": None}])
+    report = cc.build_report(_item(_WEAK_CLAIM, page="not-written-yet"))
+    assert report["band"] == "distinct"
+    assert report["target_page"] is None
+    assert calls == []  # no model call for a page that is not close
+
+
+def test_strong_enough_word_match_still_becomes_the_target(isolated_vault, monkeypatch):
+    _page(isolated_vault, "other-page", "parallel scan notes alpha bravo charlie")
+    _llm(monkeypatch, [{"verdict": "new", "page_quote": None}])
+    report = cc.build_report(_item(_WEAK_CLAIM, page="not-written-yet"))
+    assert report["target_page"] == "other-page"
+    assert report["band"] == "overlap"
+
+
 def test_conflict_keeps_real_quote_and_drops_invented_one(isolated_vault, monkeypatch):
     _page(isolated_vault, "parallel-scan")
     _llm(monkeypatch, [

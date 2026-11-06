@@ -744,6 +744,87 @@
    "reviewed": false,
    "note": "best other containment 0.29 on optimization-algorithms-and-sentence-embeddings",
    "source_file": "2026-05-11-alphaevolve-gemini-powered-evolutionary-coding-agent.md"
+  },
+  {
+   "id": "p41",
+   "how_built": "distinct: live queue clip, own suggested page hidden. Closest page by shared words scored 0.37-0.43 and was unrelated (2026-11-06)",
+   "clip_title": "SEO, AEO, GEO: how buyers find a business now",
+   "clip_claims": [
+    "Search visibility is moving from a ranked page of ten blue links toward a single written answer synthesized by generative systems, which changes what content must do to be surfaced.",
+    "A growing share of buyers either read AI-generated answers instead of clicking through or delegate comparison and booking to autonomous agents, so the consumer of the content may be a model rather than a human.",
+    "The practice of adapting content for these systems is referred to by several overlapping names, and the source treats them as one body of work whose evidence and tactics it evaluates."
+   ],
+   "suggested_page": "generative-engine-optimization",
+   "label": "distinct",
+   "hide_pages": [
+    "generative-engine-optimization"
+   ],
+   "reviewed": true
+  },
+  {
+   "id": "p42",
+   "how_built": "distinct: live queue clip, own suggested page hidden. Closest page by shared words scored 0.37-0.43 and was unrelated (2026-11-06)",
+   "clip_title": "Three names, three goals",
+   "clip_claims": [
+    "SEO, AEO, and GEO differ by target surface and success metric: organic ranking and clicks for SEO, direct answer extraction for AEO, and brand citation share within generative AI answers for GEO.",
+    "AEO and GEO converge in practice, both rewarding concise, structured, machine-readable content, while SEO fundamentals (links, topical depth, technical health) remain the foundation for both.",
+    "Treating GEO as a replacement for SEO is a category error; it extends the existing SEO stack to a new answer surface."
+   ],
+   "suggested_page": "seo-aeo-geo-comparison",
+   "label": "distinct",
+   "hide_pages": [
+    "seo-aeo-geo-comparison"
+   ],
+   "reviewed": true
+  },
+  {
+   "id": "p43",
+   "how_built": "distinct: live queue clip, own suggested page hidden. Closest page by shared words scored 0.37-0.43 and was unrelated (2026-11-06)",
+   "clip_title": "What Google says you do not need",
+   "clip_claims": [
+    "Google's documentation for AI Overviews and AI Mode states no additional requirements, machine-readable files, or AI-specific markup are needed beyond standard search eligibility; this applies to Google's features only, not all AI tools.",
+    "GEO practice is organized around four jobs: making pages readable without JavaScript (many AI crawlers read only server-delivered HTML), being cited by third-party sites, exposing structured agent endpoints via protocols such as MCP, and measuring brand appearance across a fixed prompt set run repeatedly.",
+    "In the cited travel-brand example, AI answers cited third-party sources (Cvent, Wikipedia, TripAdvisor) more often than the brand's homepage, indicating that AI-generated descriptions depend on external corroboration.",
+    "Vendor-reported figures (Similarweb, Sabre) lack independent verification, and a 40% figure cited comes from a single research setup, so these should be treated as provisional."
+   ],
+   "suggested_page": "generative-engine-optimization",
+   "label": "distinct",
+   "hide_pages": [
+    "generative-engine-optimization"
+   ],
+   "reviewed": true
+  },
+  {
+   "id": "p44",
+   "how_built": "distinct: live queue clip, own suggested page hidden. Closest page by shared words scored 0.37-0.43 and was unrelated (2026-11-06)",
+   "clip_title": "Who is reading your website? Interceptors and security in the age of GEO",
+   "clip_claims": [
+    "GEO targets citation inside AI-generated answers, so a site must be readable by AI crawlers and agents to be cited.",
+    "Open access for legitimate agents simultaneously exposes the site to non-compliant scrapers and agents that spoof identity, creating a two-sided edge problem.",
+    "A GEO interceptor sits at the website edge to serve well-behaved agents while classifying each agent's identity and purpose before answering."
+   ],
+   "suggested_page": "geo-interceptor",
+   "label": "distinct",
+   "hide_pages": [
+    "geo-interceptor"
+   ],
+   "reviewed": true
+  },
+  {
+   "id": "p45",
+   "how_built": "distinct: live queue clip, own suggested page hidden. Closest page by shared words scored 0.37-0.43 and was unrelated (2026-11-06)",
+   "clip_title": "Agents arrive in different forms",
+   "clip_claims": [
+    "AI web traffic is commonly partitioned into three classes by function: crawlers/scrapers for training-data collection, retrieval bots for on-demand page fetches during a conversation, and agents/agentic browsers that execute multi-step tasks such as authentication, form completion, and transactions.",
+    "Agentic browsers are the hardest class to detect because they run within the user's own browser context, reusing the user's fingerprints, session states, and network signatures, so they are indistinguishable from manual activity at the request level.",
+    "A user-agent-based detection model may classify such agents as ordinary human traffic, meaning site operators relying on that signal lack visibility into agent actions."
+   ],
+   "suggested_page": "ai-traffic-classes-crawlers-retrieval-agents",
+   "label": "distinct",
+   "hide_pages": [
+    "ai-traffic-classes-crawlers-retrieval-agents"
+   ],
+   "reviewed": true
   }
  ]
 }

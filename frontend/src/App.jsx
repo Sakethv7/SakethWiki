@@ -290,6 +290,13 @@ function needsReview(report) {
   return !!report && ["duplicate", "overlap", "conflict"].includes(report.band) && !!report.target_page;
 }
 
+// Word-overlap score at which a target page counts as a strong match. Below it the review
+// screen warns and suggests nothing. Backend floor for any target is CANDIDATE_FLOOR (0.50).
+const STRONG_MATCH = 0.6;
+function isStrongMatch(report) {
+  return (report?.match_score ?? 0) >= STRONG_MATCH;
+}
+
 // Riskiest claims first, so a reviewer sees what changes before what repeats.
 const VERDICT_ORDER = { conflicts: 0, changed: 1, new: 2, same: 3 };
 function sortClaims(claims) {
@@ -391,11 +398,13 @@ function ConflictReviewModal({ item, extraBody, onClose, onResolved, progress, o
     return () => window.removeEventListener("keydown", onKey);
   }, [onClose]);
 
-  const rec = report.recommended;
+  // A weak page match gets no dark "suggested" button: one click would write to a page that may be unrelated.
+  const rec = isStrongMatch(report) ? report.recommended : null;
+  const newPage = item.suggested_page || "a new page";
   const actions = [
-    { id: "append", label: "Add to page", hint: "Adds a new section. Updates the page summary." },
-    { id: "keep_both", label: "Keep both", hint: "Saves the clip as a new page and links the two." },
-    { id: "replace", label: "Replace page", hint: "Old page is archived first (meta/replaced)." },
+    { id: "append", label: `Add to ${report.target_page}`, hint: "Adds a new section. Updates the page summary." },
+    { id: "keep_both", label: `Create new page ${newPage}`, hint: "Saves the clip as a new page and links the two. A number is added to the name if it is taken." },
+    { id: "replace", label: `Replace ${report.target_page}`, hint: "Old page is archived first (meta/replaced)." },
     { id: "skip", label: "Skip clip", hint: "Rejects the clip. Nothing is written." },
   ];
 
@@ -412,6 +421,13 @@ function ConflictReviewModal({ item, extraBody, onClose, onResolved, progress, o
             </div>
             <p className="text-xs text-stone-500 mt-1">{report.reason}</p>
             {claims.length > 0 && <p className="text-xs font-medium text-stone-800 mt-1">{summaryLine(claims)}</p>}
+            {report.target_page && (
+              <p className={`text-xs mt-1 ${isStrongMatch(report) ? "text-stone-400" : "text-amber-700"}`}>
+                {isStrongMatch(report)
+                  ? `Page match ${(report.match_score ?? 0).toFixed(2)}.`
+                  : `Weak match (${(report.match_score ?? 0).toFixed(2)}). The page may not be about this clip. Check the target before you add.`}
+              </p>
+            )}
             <div className="flex flex-wrap gap-1.5 mt-2">
               {Object.entries(counts).map(([v, n]) => (
                 <span key={v} className={`text-[10px] px-1.5 py-0.5 rounded border ${VERDICT_META[v]?.cls || ""}`}>{n} {VERDICT_META[v]?.label || v}</span>
@@ -571,7 +587,10 @@ function QueueSection({ onApproved, onExtractPreview }) {
   const [reviewItem, setReviewItem] = useState(null);     // item open in ConflictReviewModal
   const [walkItems, setWalkItems] = useState(null);       // frozen list for ResolveWalkthrough
 
-  const resolvableSelected = items.filter(item => selectedIds.has(item.id) && !item.pending_extraction && !item.extraction_error && needsReview(item.conflict_report));
+  const readyIds = items.filter(item => !item.pending_extraction && !item.extraction_error).map(item => item.id);
+  const allReadySelected = readyIds.length > 0 && readyIds.every(id => selectedIds.has(id));
+  const reviewableItems = items.filter(item => !item.pending_extraction && !item.extraction_error && needsReview(item.conflict_report));
+  const resolvableSelected = reviewableItems.filter(item => selectedIds.has(item.id));
 
   async function finishWalkthrough(summary) {
     setWalkItems(null);
@@ -780,15 +799,20 @@ function QueueSection({ onApproved, onExtractPreview }) {
       {items.length > 0 && (
         <div className="sticky top-2 z-10 flex flex-wrap items-center gap-2 rounded-xl border border-stone-200 bg-white/95 px-3 py-2 shadow-sm backdrop-blur">
           <span className="text-xs font-medium text-stone-600">{selectedIds.size} selected</span>
-          <button onClick={() => setSelectedIds(new Set(items.filter(item => !item.pending_extraction && !item.extraction_error).map(item => item.id)))} disabled={batchBusy}
-            className="text-xs text-stone-500 hover:text-stone-800 disabled:opacity-40">Select all ready</button>
+          <label className="flex items-center gap-1.5 text-xs text-stone-600 cursor-pointer">
+            <input type="checkbox" checked={allReadySelected} disabled={batchBusy || readyIds.length === 0}
+              onChange={() => setSelectedIds(allReadySelected ? new Set() : new Set(readyIds))}
+              aria-label="Select all ready clips"
+              className="h-4 w-4 rounded border-stone-300 accent-orange-500 disabled:opacity-40" />
+            All ready
+          </label>
           <button onClick={() => setSelectedIds(new Set())} disabled={batchBusy || selectedIds.size === 0}
             className="text-xs text-stone-400 hover:text-stone-700 disabled:opacity-40">Clear</button>
           <div className="flex-1" />
-          {resolvableSelected.length > 0 && (
-            <button onClick={() => setWalkItems(resolvableSelected)} disabled={batchBusy}
+          {reviewableItems.length > 0 && (
+            <button onClick={() => setWalkItems(resolvableSelected.length > 0 ? resolvableSelected : reviewableItems)} disabled={batchBusy}
               className="px-3 py-1.5 border border-stone-900 text-stone-900 rounded-lg text-xs font-semibold hover:bg-stone-100 disabled:opacity-40">
-              Resolve selected ({resolvableSelected.length})
+              {resolvableSelected.length > 0 ? `Resolve selected (${resolvableSelected.length})` : `Resolve all (${reviewableItems.length})`}
             </button>
           )}
           <button onClick={() => handleBatchDecision(false)} disabled={batchBusy || selectedIds.size === 0}
