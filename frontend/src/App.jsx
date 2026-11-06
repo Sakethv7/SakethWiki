@@ -599,7 +599,7 @@ function ResolveWalkthrough({ items, onFinished }) {
     const target = item.conflict_report.target_page;
     if (r?.status === "rejected") return "Rejected";
     if (r?.status === "done") {
-      return { append: `Added to ${target}`, replace: `Replaced ${target}`, keep_both: `Created new page ${item.suggested_page || ""}`.trim() }[r.action] || "Saved";
+      return { append: `Added to ${target}`, replace: `Replaced ${target}`, keep_both: `Created new page ${item.suggested_page || ""}`.trim(), merge: `Merged into ${target}` }[r.action] || "Saved";
     }
     return "Left in the queue";
   }
