@@ -113,3 +113,50 @@ The 40 labeled pairs in `calibration_pairs.json` show a gap. Distinct pairs scor
 ## Open questions
 
 See `adr.md`, section "Open questions for change 2".
+
+# Change 3: A true merge action
+
+## Visual Level
+
+```mermaid
+flowchart TD
+    A[User opens a clip with a target page] --> B[User clicks Merge into page]:::new
+    B --> C[Backend asks the model to rewrite the page with the clip]:::new
+    C --> D{Model returned valid text?}:::new
+    D -- no --> E[Show the error, keep the clip in the queue]:::failure
+    D -- yes --> F[Show old and merged text side by side]:::new
+    F --> G{User approves?}:::new
+    G -- no --> H[Back to the action buttons]
+    G -- yes --> I{Page unchanged since the preview?}
+    I -- no --> J[Ask the user to refresh the preview]:::failure
+    I -- yes --> K[Archive the old page, write the merged page]:::new
+    classDef new fill:#dbeafe,stroke:#2563eb;
+    classDef failure fill:#fee2e2,stroke:#dc2626;
+```
+
+Blue is new. Red is a failure path. The user sees the merged text before anything is written. The old page is archived first, so the user can undo.
+
+## Complexity tier
+
+Single-process tool. One new backend route, one new resolution value, and one new modal state. No new storage and no new service. A larger tier is not needed.
+
+## Problem
+
+Today a clip that overlaps a page has two paths. "Add to page" appends a new section and leaves the page text as it was. "Replace" removes the old text. Neither gives one clean page that holds both the old facts and the new ones. After several appends, a page repeats itself.
+
+## What merge means
+
+Merge rewrites the page body so that it states every fact from the page and from the clip once. Where the clip changes or contradicts a page claim, the merged text keeps both statements and marks the conflict. The model does not pick a winner. The user decides in the preview.
+
+## Components
+
+| Component | Status | Role |
+|---|---|---|
+| `POST /queue/{id}/merge_preview` | new | Returns merged body text. Writes nothing. |
+| `resolution: "merge"` on `/approve` | new | Writes the merged text the user approved |
+| `wiki_writer` merge branch | new | Archives the old page, then writes frontmatter plus merged body |
+| `ConflictReviewModal` merge state | new | Shows a preview and Approve / Cancel |
+
+## Open questions
+
+See `adr.md`, section "Open questions for change 3".

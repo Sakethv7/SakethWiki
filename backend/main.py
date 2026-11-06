@@ -48,6 +48,7 @@ import active_review
 import revision
 import consolidation
 import capture_compare
+import merge_page
 import diagram_fit
 import identity
 import llm_client
@@ -248,7 +249,10 @@ class ApproveRequest(BaseModel):
     edits: Optional[dict] = None
     open_thread: bool = False  # if True, add deep-dive tag to the concept page
     # Chosen in the conflict review. None keeps the approve-time classifier (items with no report).
-    resolution: Optional[Literal["append", "replace", "keep_both"]] = None
+    resolution: Optional[Literal["append", "replace", "keep_both", "merge"]] = None
+    # Only for resolution "merge": the body the user approved in the preview, and the page hash it was built from.
+    merged_body: Optional[str] = None
+    merge_target_hash: Optional[str] = None
 
 
 class BatchDecisionRequest(BaseModel):
@@ -2548,6 +2552,12 @@ async def _decide_queue_item(item_id: str, req: ApproveRequest):
         target = report.get("target_page")
         if target and capture_compare.page_hash(target) != report.get("target_hash"):
             raise HTTPException(409, {"error": "report_stale", "target_page": target})
+        if req.resolution == "merge":
+            if not target or not req.merged_body or not req.merged_body.strip():
+                raise HTTPException(422, {"error": "merge_incomplete", "detail": "merge needs a target page and merged_body"})
+            if capture_compare.page_hash(target) != req.merge_target_hash:
+                raise HTTPException(409, {"error": "report_stale", "target_page": target})
+            item["merged_body"] = req.merged_body
 
     # Write to vault (atomic — either fully succeeds or raises, queue untouched)
     try:
@@ -2636,6 +2646,20 @@ async def _decide_queue_item(item_id: str, req: ApproveRequest):
         **({"archived": item["_archived"]} if item.get("_archived") else {}),
         **({"deep_dive_tagged": True} if deep_dive_tagged else {}),
     }
+
+
+@app.post("/queue/{item_id}/merge_preview")
+async def merge_preview(item_id: str):
+    """Build the merged page text for one queued item. Writes nothing."""
+    item = queue_manager.get_by_id(item_id)
+    if not item:
+        raise HTTPException(404, f"Item {item_id} not found in queue")
+    loop = asyncio.get_running_loop()
+    try:
+        return await loop.run_in_executor(None, merge_page.build_merge, item)
+    except merge_page.MergeError as e:
+        status = {"no_target": 409, "too_long": 422, "merge_rejected": 422}.get(e.kind, 502)
+        raise HTTPException(status, {"error": e.kind, "reason": e.reason})
 
 
 @app.post("/queue/{item_id}/compare")

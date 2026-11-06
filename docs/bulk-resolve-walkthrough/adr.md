@@ -165,3 +165,84 @@ flowchart TD
 4. The result summary does not list where each clip went. A per-clip list with links is a separate small change.
 5. There is still no real merge action. Add to page appends a section. A rewrite-merge is a larger change.
 6. The 0.60 "strong match" line may be too high or low. It needs real use.
+
+# Change 3: A true merge action
+
+## ADR 7: Merge shows a preview before it writes
+
+### Visual Level
+
+```mermaid
+flowchart TD
+    A[Click Merge] --> B[Model builds merged text]:::new
+    B --> C[User reads preview]:::new
+    C --> D{Approve?}
+    D -- yes --> E[Archive old page, write merged page]:::new
+    D -- no --> F[Nothing written]
+    classDef new fill:#dbeafe,stroke:#2563eb;
+```
+
+Explainer: [merge-action-flow.html](../visuals/merge-action-flow.html).
+
+**Context.** A model rewrite of a page can drop facts or invent text. A one-click rewrite would hide that.
+
+**Options.** (1) One click: rewrite and write. (2) Preview, then write on approval. (3) Write, then offer undo.
+
+**Choice.** Option 2.
+
+**Consequences.** The user sees every change before it lands. Given up: one extra click and one extra model call before the write. The preview text may be stale if the page changes, so the hash check stays.
+
+## ADR 8: Merge keeps both sides of a conflict
+
+### Visual Level
+
+```mermaid
+flowchart TD
+    A[Clip claim differs from page claim] --> B{Which rule?}
+    B -- model picks newer --> C[Old fact is lost]:::failure
+    B -- keep both and mark --> D[Both statements stay, marked CONTRADICTION]:::new
+    classDef new fill:#dbeafe,stroke:#2563eb;
+    classDef failure fill:#fee2e2,stroke:#dc2626;
+```
+
+Explainer: [merge-action-flow.html](../visuals/merge-action-flow.html).
+
+**Context.** Append already flags contradictions and keeps old text. Merge must not be worse.
+
+**Options.** (1) The model picks the newer claim. (2) The model keeps both and marks the conflict. (3) Ask the user per claim.
+
+**Choice.** Option 2. The user edits the preview if they want a winner.
+
+**Consequences.** No fact is lost without the user seeing it. Given up: the merged page may carry conflict markers until the user resolves them by hand. Option 3 is a later change.
+
+## ADR 9: Archive the old page and check the model output
+
+### Visual Level
+
+```mermaid
+flowchart TD
+    A[User approves merged text] --> B{Output checks passed at preview?}:::new
+    B -- no --> C[Reject, write nothing]:::failure
+    B -- yes --> D[Archive old page]:::new
+    D --> E[Atomic write of merged page]
+    classDef new fill:#dbeafe,stroke:#2563eb;
+    classDef failure fill:#fee2e2,stroke:#dc2626;
+```
+
+Explainer: [merge-action-flow.html](../visuals/merge-action-flow.html).
+
+**Context.** Replace already archives to `_wiki/meta/replaced/`. Merge is a rewrite and has the same risk.
+
+**Options.** (1) No archive. (2) Archive, as Replace does. (3) Archive and run output checks.
+
+**Choice.** Option 3. Checks: not empty, at least 60% of the old length, no more old numbers dropped than the clip has numbers, first heading unchanged.
+
+**Consequences.** A bad rewrite is rejected or can be undone from the archive. Given up: the checks are crude. A rewrite that drops a fact without a number passes. The preview is the main guard.
+
+## Open questions for change 3
+
+1. Which model writes the merge? Decided: Haiku (2026-11-06). Revisit if merges of long pages come out thin.
+2. The 60% length check and the number check are guesses. They need a few real merges to tune.
+3. Pages over 6000 characters: `capture_compare` caps page text at 6000. A merge of a long page needs the full text, so the cap must not apply here. Cost grows with page size.
+4. There is no undo button. The archive holds the old page, and restoring is manual. A restore action is a separate change.
+5. The merged page keeps conflict markers until the user edits them. Per-claim choice (option 3 in ADR 8) is deferred.
