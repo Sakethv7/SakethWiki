@@ -532,14 +532,24 @@ function ResolveWalkthrough({ items, onFinished }) {
   // Same-page clips sit next to each other, so a stale report refreshes once per page.
   const [list] = useState(() => [...items].sort((a, b) => (a.conflict_report.target_page || "").localeCompare(b.conflict_report.target_page || "")));
   const [index, setIndex] = useState(0);
-  const [results, setResults] = useState({});   // id -> "done" | "rejected" | "left"
+  const [results, setResults] = useState({});   // id -> { status: "done" | "rejected" | "left", action }
 
-  const count = (status) => Object.values(results).filter(s => s === status).length;
+  const count = (status) => Object.values(results).filter(r => r.status === status).length;
   const summary = { done: count("done"), rejected: count("rejected"), left: list.length - count("done") - count("rejected") };
 
-  function advance(id, status) {
-    setResults(prev => ({ ...prev, [id]: status }));
+  function advance(id, status, action) {
+    setResults(prev => ({ ...prev, [id]: { status, action } }));
     setIndex(i => i + 1);
+  }
+
+  function outcome(item) {
+    const r = results[item.id];
+    const target = item.conflict_report.target_page;
+    if (r?.status === "rejected") return "Rejected";
+    if (r?.status === "done") {
+      return { append: `Added to ${target}`, replace: `Replaced ${target}`, keep_both: `Created new page ${item.suggested_page || ""}`.trim() }[r.action] || "Saved";
+    }
+    return "Left in the queue";
   }
 
   if (index >= list.length) {
@@ -550,6 +560,14 @@ function ResolveWalkthrough({ items, onFinished }) {
           <p className="text-sm text-stone-700">
             {summary.done} saved, {summary.rejected} rejected, {summary.left} left in the queue.
           </p>
+          <ul aria-label="Result for each clip" className="max-h-64 overflow-y-auto divide-y divide-stone-100 border border-stone-200 rounded-xl">
+            {list.map(item => (
+              <li key={item.id} className="px-3 py-2 text-xs">
+                <div className="font-medium text-stone-800 truncate">{item.title}</div>
+                <div className={results[item.id]?.status === "done" ? "text-emerald-700" : "text-stone-500"}>{outcome(item)}</div>
+              </li>
+            ))}
+          </ul>
           <div className="flex justify-end">
             <button onClick={() => onFinished(summary, results)} className="px-3.5 py-2 rounded-xl text-sm font-medium bg-stone-900 text-white hover:bg-stone-800">Done</button>
           </div>
@@ -567,7 +585,7 @@ function ResolveWalkthrough({ items, onFinished }) {
       autoRefresh
       onLater={() => advance(item.id, "left")}
       onClose={() => onFinished(summary, results)}
-      onResolved={(action) => advance(item.id, action === "skip" ? "rejected" : "done")}
+      onResolved={(action) => advance(item.id, action === "skip" ? "rejected" : "done", action)}
     />
   );
 }
