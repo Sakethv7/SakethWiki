@@ -96,3 +96,55 @@ Blue is new or changed. A weak match now ends at "new topic" with no review step
 | Old queued clip has an old report | It keeps the old target until its report is rebuilt. See open questions |
 | Two new clips suggest the same new page | The first creates it. The second finds the page and appends through the normal evolution path |
 | Model call fails during compare | Band is `unknown`, as today. No target, no review |
+
+# Change 3: A true merge action
+
+## Visual Level
+
+```mermaid
+flowchart TD
+    A[Click Merge into page] --> B[POST merge_preview]:::new
+    B --> C{Model call worked?}
+    C -- no --> D[Show error, stay on action buttons]:::failure
+    C -- yes --> E{Merged text passes checks?}:::new
+    E -- no --> F[Show error: model output rejected]:::failure
+    E -- yes --> G[Show preview]:::new
+    G --> H{Approve?}
+    H -- no --> I[Close preview]
+    H -- yes --> J[POST approve with merged text]:::new
+    J --> K{Page hash still matches?}
+    K -- no --> L[409 stale: refresh preview]:::failure
+    K -- yes --> M[Archive old page, write merged page]:::new
+    classDef new fill:#dbeafe,stroke:#2563eb;
+    classDef failure fill:#fee2e2,stroke:#dc2626;
+```
+
+Blue is new. Red is a failure path.
+
+## Steps
+
+1. The user clicks "Merge into {page}". The modal sends `POST /queue/{id}/merge_preview`.
+2. The backend loads the target page, strips the frontmatter, and sends the body and the clip claims to the model.
+3. The model returns the merged body. The backend checks it (see below). It also records the page hash.
+4. The modal shows old and merged text side by side, with changed lines marked. Conflict lines carry a "CONTRADICTION flagged" marker.
+5. The user clicks Approve. The modal sends `POST /approve/{id}` with `resolution: "merge"`, `merged_body` and `target_hash`.
+6. The backend compares the hash with the page now on disk. If they differ, it returns 409 `report_stale`.
+7. The backend archives the old page to `_wiki/meta/replaced/`, writes the old frontmatter with updated counters plus the merged body, and removes the clip from the queue.
+
+## Checks on the model output (step 3)
+
+- The merged body is not empty.
+- The merged body is at least 60% as long as the old body. A large drop means the model deleted content.
+- Every number in the old body appears in the merged body, unless a claim in the clip changes that number.
+- The first heading is unchanged.
+
+A failed check returns 422 and the user sees the reason. Nothing is written.
+
+## Failure behavior
+
+| Failure | Result |
+|---|---|
+| Model call fails or times out | 502 from preview. The clip stays in the queue. |
+| Output fails a check | 422 from preview. The clip stays in the queue. |
+| Page changed after the preview | 409 `report_stale`. The user refreshes the preview. |
+| Write fails after archive | 500. The archive copy exists. The old page is untouched until the atomic write. |
